@@ -9,11 +9,10 @@ Conductor: a single Rust binary that runs autonomous work-routing cycles over th
 ## Now / Next / Later
 
 ### Now
-- [ ] User reviews `phases/conductor-v1-spec.md` (approved in-session 2026-07-01; written spec awaiting read-through)
-- [ ] Decompose spec into beads (`bd init --stealth` this repo first) with tier_floor/complexity/verify_cmd metadata — Lead task
+- [ ] Work the beads backlog via `bd ready` (18 items seeded 2026-07-01, IDs `conductor-m0a`…`conductor-m6` + `conductor-prompt`/`conductor-rev1`/`conductor-bdro`). Unblocked roots: `conductor-m0a` (senior), `conductor-prompt` (lead), `conductor-bdro` (junior). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
 
 ### Next
-- [ ] M0 bootstrap → M1 scan/status → M2 triage core (see spec Milestones)
+- [ ] M3 dry-run cycle has a human-verify tail (report renders on dashboard) — see `conductor-m3b` notes
 
 ### Later
 - [ ] M3 dry-run cycle → M4 dispatch+verify → M5 triage backfill → M6 ratchet
