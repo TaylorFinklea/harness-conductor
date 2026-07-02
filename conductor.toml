@@ -1,0 +1,92 @@
+# Conductor fleet cycle runner — configuration.
+#
+# The roster is the closed set of models that may receive work (invariant 1:
+# closed roster; fail closed, never default). `conductor roster drift` diffs
+# this against ~/.claude/model-scorecard.md and warns, never auto-edits.
+#
+# Defaults are shown explicitly; every knob is overridable.
+
+autonomy = "propose"
+
+[scan]
+# Fleet root. The scanner walks this for .beads/metadata.json.
+root = "~/git"
+# Config-driven exclusions (repo directory names). NOTE: chezmoi-config is
+# ALSO hard-denied in code (config.rs HARDCODED_EXCLUDE), independent of this
+# list — never scan/dispatch chezmoi-config (invariant 5).
+exclude = []
+
+[budgets]
+# Ceilings, not targets (invariant 7). Hitting any budget stops the cycle.
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+# Combined cap for metered external backends (pi + agy).
+max_external_dispatches = 4
+item_wall_clock_mins = 45
+cycle_wall_clock_mins = 90
+
+[verify]
+# orchestra judge model — always passed explicitly (never trust the default).
+judge = "opencode-go/qwen3.7-max"
+# Force orchestra verification for every item, not just adversarial ones.
+always_orchestra = false
+
+# Initial roster from scorecard 2026-07-01.
+# (sonnet-5's scorecard "XL via decomposition" is capped to L here because
+# decomposition is out of scope v1; XL lead items route to opus-4.8 or flag.)
+
+[[roster]]
+name = "sonnet-5"
+tier = "lead"
+ceiling = "L"
+efficiency = "std"
+backend = "claude"
+dispatch_id = "claude-sonnet-5"
+
+[[roster]]
+name = "opus-4.8"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "claude"
+dispatch_id = "claude-opus-4-8"
+
+[[roster]]
+name = "gpt-5.5"
+tier = "senior"
+ceiling = "M"
+efficiency = "std"
+backend = "pi"
+dispatch_id = "openai-codex/gpt-5.5"
+
+[[roster]]
+name = "minimax-m3"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/minimax-m3"
+
+[[roster]]
+name = "qwen3.7-max"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/qwen3.7-max"
+
+[[roster]]
+name = "glm-5.2"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/glm-5.2"
+
+[[roster]]
+name = "gemini-3.5-flash"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "agy"
+dispatch_id = "Gemini 3.5 Flash (High)"
