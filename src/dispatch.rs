@@ -105,6 +105,14 @@ impl ProcessStatus {
             success: false,
         }
     }
+
+    pub(crate) const fn exit_code(self) -> Option<i32> {
+        self.code
+    }
+
+    pub(crate) const fn success(self) -> bool {
+        self.success
+    }
 }
 
 impl From<ExitStatus> for ProcessStatus {
