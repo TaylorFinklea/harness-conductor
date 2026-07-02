@@ -1,1 +1,1369 @@
 //! routing algorithm + gates + budgets (pure — the invariant test suite lives here)
+//!
+//! Pinned rules (conductor-v1-spec.md, "Routing algorithm" + "Invariants" — encoded
+//! exactly, not reinterpreted).
+//!
+//! Orders: complexity `S<M<L<XL`; tier `junior<senior<lead`; efficiency `lean<std<heavy`.
+//!
+//! ### Routing algorithm
+//! 1. Drop repos: excluded, any `in_progress` bead present, or repo already used
+//!    this cycle (enforced here via a per-repo dispatch counter checked against
+//!    `budgets.max_active_per_repo`).
+//! 2. For each ready item with complete fields: candidate models = roster where
+//!    `tier ≥ tier_floor` and `ceiling ≥ complexity`, grouped by tier; take the
+//!    lowest qualifying tier, then most efficient; tie → fewer dispatches so far
+//!    this cycle; then roster order.
+//! 3. No candidate → flag `over-ceiling`.
+//! 4. Apply budgets in priority order (bd priority asc, then oldest `created_at`):
+//!    stop at any ceiling; excess → `skipped(budget)`.
+//! 5. Lead-floor items are ALWAYS propose-only (never auto-dispatched by ratchet).
+//!
+//! ### The nine invariants this module's test suite encodes
+//! 1. Closed roster — only roster models ever appear in a dispatch/proposal.
+//! 2. `tier_floor` is a hard gate — unknown/unparseable floor flags, never guesses.
+//! 3. Fail closed — no runnable `verify_cmd` ⇒ not dispatchable (falls back to proposal).
+//! 4. One writer per repo — a pre-existing `in_progress` bead skips the whole
+//!    repo; `budgets.max_active_per_repo` caps auto-dispatches per repo per cycle.
+//! 5. Never dispatch an excluded repo (chezmoi-config's hard-coded deny, in depth).
+//! 6. Close only verified — every dispatch carries the `verify_cmd` precondition
+//!    that downstream verification requires before any `bd close`.
+//! 7. Budgets are ceilings, not targets — excess is `skipped(budget)`.
+//! 8. No silent drops — every ready item lands in exactly one output bucket.
+//! 9. Ratchet failure re-locks — a locked repo always proposes, never auto-dispatches.
+
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+
+use crate::bd::Issue;
+use crate::config::{Backend, Budgets, Ceiling, Efficiency, RosterEntry, Tier};
+use crate::fields::{extract, MissingField, RoutingFields, Triage};
+use crate::scan::{RepoSnapshot, SkipReason};
+
+// ---------------------------------------------------------------------------
+// Ratchet input (ratchet.rs owns the persisted counters and their mutation;
+// this module only reads the current unlock/lock decision as a pure input).
+// ---------------------------------------------------------------------------
+
+/// Per-repo ratchet unlock state. Repos absent from the input map are treated
+/// as `Locked` (fail closed — a repo must *earn* unlock; see invariant 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RatchetState {
+    Locked,
+    Unlocked,
+}
+
+// ---------------------------------------------------------------------------
+// Output types
+// ---------------------------------------------------------------------------
+
+/// An item auto-executed this cycle without waiting for human approval.
+/// Only reachable when `tier_floor` is senior/junior, a runnable `verify_cmd`
+/// exists, the repo's ratchet is unlocked, and every budget still has room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Dispatch {
+    pub(crate) repo: String,
+    pub(crate) issue_id: String,
+    pub(crate) model: String,
+    pub(crate) verify_cmd: String,
+}
+
+/// An item with a valid candidate model that requires human approval before
+/// it can run (lead-floor items, locked-ratchet repos, or missing `verify_cmd`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Proposal {
+    pub(crate) repo: String,
+    pub(crate) issue_id: String,
+    pub(crate) model: String,
+}
+
+/// Why an item couldn't be routed to any candidate model, or a fleet-level
+/// escalation the user must resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Flag {
+    /// Missing/unparseable `tier_floor` and/or `complexity` (invariant 2).
+    Untriaged {
+        repo: String,
+        issue_id: String,
+        missing: Vec<MissingField>,
+    },
+    /// `complexity` exceeds every roster ceiling for a qualifying tier.
+    OverCeiling {
+        repo: String,
+        issue_id: String,
+        complexity: Ceiling,
+    },
+    /// Reserved for `conductor roster drift` (scorecard-vs-`conductor.toml`
+    /// comparison) — a separate check outside this module's pure algorithm;
+    /// never constructed here.
+    RosterDrift,
+}
+
+/// Why an item that would otherwise route was not dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipCode {
+    Excluded,
+    InProgress,
+    NotBeadsRepo,
+    NotGitRepo,
+    Budget,
+}
+
+/// An item this cycle saw but did not act on, with an accounted reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Skip {
+    pub(crate) repo: String,
+    pub(crate) issue_id: String,
+    pub(crate) reason: SkipCode,
+}
+
+/// The full triage output for one cycle. Invariant 8 (no silent drops):
+/// every ready item the cycle saw appears in exactly one of these buckets.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Plan {
+    pub(crate) dispatches: Vec<Dispatch>,
+    pub(crate) proposals: Vec<Proposal>,
+    pub(crate) flags: Vec<Flag>,
+    pub(crate) skips: Vec<Skip>,
+}
+
+// ---------------------------------------------------------------------------
+// Order helpers (complexity S<M<L<XL; tier junior<senior<lead; efficiency lean<std<heavy)
+// ---------------------------------------------------------------------------
+
+const fn tier_rank(t: Tier) -> u8 {
+    match t {
+        Tier::Junior => 0,
+        Tier::Senior => 1,
+        Tier::Lead => 2,
+    }
+}
+
+const fn ceiling_rank(c: Ceiling) -> u8 {
+    match c {
+        Ceiling::S => 0,
+        Ceiling::M => 1,
+        Ceiling::L => 2,
+        Ceiling::Xl => 3,
+    }
+}
+
+const fn efficiency_rank(e: Efficiency) -> u8 {
+    match e {
+        Efficiency::Lean => 0,
+        Efficiency::Std => 1,
+        Efficiency::Heavy => 2,
+    }
+}
+
+fn skip_code_for(reason: &SkipReason) -> SkipCode {
+    match reason {
+        SkipReason::Excluded => SkipCode::Excluded,
+        SkipReason::InProgress => SkipCode::InProgress,
+        SkipReason::NotBeadsRepo => SkipCode::NotBeadsRepo,
+        SkipReason::NotGitRepo => SkipCode::NotGitRepo,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Candidate selection (Routing algorithm, step 2)
+// ---------------------------------------------------------------------------
+
+/// Selects the routing target for one triaged item: roster entries with
+/// `tier ≥ tier_floor` and `ceiling ≥ complexity`, narrowed to the lowest
+/// qualifying tier, then the most efficient, then fewest dispatches so far
+/// this cycle, then roster order. `None` means over-ceiling (no candidate).
+fn select_candidate<'a>(
+    roster: &'a [RosterEntry],
+    routing: &RoutingFields,
+    dispatch_count_by_model: &HashMap<String, u32>,
+) -> Option<&'a RosterEntry> {
+    let mut qualifying: Vec<(usize, &RosterEntry)> = roster
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            tier_rank(r.tier) >= tier_rank(routing.tier_floor)
+                && ceiling_rank(r.ceiling) >= ceiling_rank(routing.complexity)
+        })
+        .collect();
+    if qualifying.is_empty() {
+        return None;
+    }
+
+    let min_tier = qualifying.iter().map(|(_, r)| tier_rank(r.tier)).min()?;
+    qualifying.retain(|(_, r)| tier_rank(r.tier) == min_tier);
+
+    let min_efficiency = qualifying
+        .iter()
+        .map(|(_, r)| efficiency_rank(r.efficiency))
+        .min()?;
+    qualifying.retain(|(_, r)| efficiency_rank(r.efficiency) == min_efficiency);
+
+    let min_dispatches = qualifying
+        .iter()
+        .map(|(_, r)| *dispatch_count_by_model.get(&r.name).unwrap_or(&0))
+        .min()?;
+    qualifying.retain(|(_, r)| *dispatch_count_by_model.get(&r.name).unwrap_or(&0) == min_dispatches);
+
+    qualifying.sort_by_key(|(i, _)| *i);
+    qualifying.first().map(|(_, r)| *r)
+}
+
+// ---------------------------------------------------------------------------
+// Routing entry point
+// ---------------------------------------------------------------------------
+
+/// Runs the pure triage core over one cycle's fleet snapshot, producing a
+/// `Plan`. No IO: all inputs are already-gathered data.
+pub(crate) fn route(
+    repos: &[RepoSnapshot],
+    roster: &[RosterEntry],
+    budgets: &Budgets,
+    ratchet: &HashMap<String, RatchetState>,
+) -> Plan {
+    let mut plan = Plan::default();
+
+    // Step 1: drop excluded / in_progress / not-a-beads-repo / not-a-git-repo
+    // repos entirely — every ready item they carry is accounted as skipped,
+    // never silently lost (invariant 8). Everything else joins the priority
+    // queue for per-item routing.
+    let mut queue: Vec<(&str, &Issue)> = Vec::new();
+    for repo in repos {
+        if let Some(reason) = &repo.skip_reason {
+            let code = skip_code_for(reason);
+            for issue in &repo.ready {
+                plan.skips.push(Skip {
+                    repo: repo.name.clone(),
+                    issue_id: issue.id.clone(),
+                    reason: code,
+                });
+            }
+            continue;
+        }
+        for issue in &repo.ready {
+            queue.push((repo.name.as_str(), issue));
+        }
+    }
+
+    // Ordering: bd priority asc, then created_at asc (oldest first).
+    queue.sort_by(|a, b| {
+        a.1.priority
+            .cmp(&b.1.priority)
+            .then_with(|| a.1.created_at.cmp(&b.1.created_at))
+    });
+
+    let mut dispatch_count_by_model: HashMap<String, u32> = HashMap::new();
+    let mut dispatch_count_by_repo: HashMap<&str, u32> = HashMap::new();
+    let mut global_dispatch_count: u32 = 0;
+    let mut global_external_count: u32 = 0;
+
+    for (repo_name, issue) in queue {
+        match extract(issue) {
+            Triage::Untriaged { missing } => {
+                // Invariant 2: unknown/unparseable tier_floor/complexity flags,
+                // never guesses.
+                plan.flags.push(Flag::Untriaged {
+                    repo: repo_name.to_string(),
+                    issue_id: issue.id.clone(),
+                    missing,
+                });
+            }
+            Triage::Triaged(routing) => {
+                let Some(chosen) = select_candidate(roster, &routing, &dispatch_count_by_model)
+                else {
+                    // Step 3: no candidate qualifies (complexity above every
+                    // qualifying ceiling) -> over-ceiling flag.
+                    plan.flags.push(Flag::OverCeiling {
+                        repo: repo_name.to_string(),
+                        issue_id: issue.id.clone(),
+                        complexity: routing.complexity,
+                    });
+                    continue;
+                };
+
+                // Step 5 + invariants 3/9: lead-floor items always propose;
+                // a missing verify_cmd or a locked ratchet also forces a
+                // proposal instead of an auto-dispatch.
+                let unlocked = matches!(ratchet.get(repo_name), Some(RatchetState::Unlocked));
+                let auto_dispatch_eligible =
+                    routing.tier_floor != Tier::Lead && routing.verify_cmd.is_some() && unlocked;
+
+                if !auto_dispatch_eligible {
+                    plan.proposals.push(Proposal {
+                        repo: repo_name.to_string(),
+                        issue_id: issue.id.clone(),
+                        model: chosen.name.clone(),
+                    });
+                    continue;
+                }
+
+                // Step 4 + invariant 4/7: apply every budget as a hard
+                // ceiling; excess is skipped(budget), never silently dropped.
+                let is_external = matches!(chosen.backend, Backend::Pi | Backend::Agy);
+                let repo_count = *dispatch_count_by_repo.get(repo_name).unwrap_or(&0);
+                let over_cycle_ceiling = global_dispatch_count >= budgets.max_dispatches_per_cycle;
+                let over_repo_ceiling = repo_count >= budgets.max_active_per_repo;
+                let over_external_ceiling =
+                    is_external && global_external_count >= budgets.max_external_dispatches;
+
+                if over_cycle_ceiling || over_repo_ceiling || over_external_ceiling {
+                    plan.skips.push(Skip {
+                        repo: repo_name.to_string(),
+                        issue_id: issue.id.clone(),
+                        reason: SkipCode::Budget,
+                    });
+                    continue;
+                }
+
+                let verify_cmd = routing
+                    .verify_cmd
+                    .clone()
+                    .expect("auto_dispatch_eligible requires Some(verify_cmd)");
+                plan.dispatches.push(Dispatch {
+                    repo: repo_name.to_string(),
+                    issue_id: issue.id.clone(),
+                    model: chosen.name.clone(),
+                    verify_cmd,
+                });
+                global_dispatch_count += 1;
+                *dispatch_count_by_repo.entry(repo_name).or_insert(0) += 1;
+                if is_external {
+                    global_external_count += 1;
+                }
+                *dispatch_count_by_model
+                    .entry(chosen.name.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    plan
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{Freshness, ZeroState};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    // --- fixture builders ---
+
+    fn issue(
+        id: &str,
+        priority: u32,
+        created_at: &str,
+        tier_floor: &str,
+        complexity: &str,
+        verify_cmd: Option<&str>,
+    ) -> Issue {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("tier_floor".to_string(), json!(tier_floor));
+        metadata.insert("complexity".to_string(), json!(complexity));
+        if let Some(cmd) = verify_cmd {
+            metadata.insert("verify_cmd".to_string(), json!(cmd));
+        }
+        Issue {
+            id: id.to_string(),
+            title: format!("issue {id}"),
+            description: String::new(),
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            status: "open".to_string(),
+            priority,
+            issue_type: "task".to_string(),
+            assignee: None,
+            owner: "fixture".to_string(),
+            created_at: created_at.to_string(),
+            created_by: "fixture".to_string(),
+            updated_at: created_at.to_string(),
+            started_at: None,
+            labels: None,
+            estimated_minutes: None,
+            metadata: Some(metadata),
+            parent: None,
+            dependencies: None,
+            dependency_count: None,
+            dependent_count: None,
+            comment_count: None,
+        }
+    }
+
+    fn untriaged_issue(id: &str, priority: u32, created_at: &str) -> Issue {
+        let mut i = issue(id, priority, created_at, "junior", "S", None);
+        i.metadata = None;
+        i.notes = "no routing fields anywhere in here".to_string();
+        i
+    }
+
+    fn issue_with_invalid_tier_floor(id: &str, priority: u32, created_at: &str) -> Issue {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("tier_floor".to_string(), json!("boss"));
+        metadata.insert("complexity".to_string(), json!("M"));
+        let mut i = issue(id, priority, created_at, "senior", "M", None);
+        i.metadata = Some(metadata);
+        i
+    }
+
+    fn roster_entry(
+        name: &str,
+        tier: Tier,
+        ceiling: Ceiling,
+        efficiency: Efficiency,
+        backend: Backend,
+    ) -> RosterEntry {
+        RosterEntry {
+            name: name.to_string(),
+            tier,
+            ceiling,
+            efficiency,
+            backend,
+            dispatch_id: format!("dispatch-{name}"),
+        }
+    }
+
+    fn active_repo(name: &str, ready: Vec<Issue>) -> RepoSnapshot {
+        RepoSnapshot {
+            path: PathBuf::from(format!("/fixtures/{name}")),
+            name: name.to_string(),
+            is_beads_repo: true,
+            skip_reason: None,
+            ready,
+            count: 0,
+            blocked: Vec::new(),
+            zero_state: ZeroState::NotApplicable,
+            freshness: Freshness::Unknown,
+        }
+    }
+
+    fn skipped_repo(name: &str, reason: SkipReason, ready: Vec<Issue>) -> RepoSnapshot {
+        RepoSnapshot {
+            path: PathBuf::from(format!("/fixtures/{name}")),
+            name: name.to_string(),
+            is_beads_repo: true,
+            skip_reason: Some(reason),
+            ready,
+            count: 0,
+            blocked: Vec::new(),
+            zero_state: ZeroState::NotApplicable,
+            freshness: Freshness::Unknown,
+        }
+    }
+
+    fn budgets(max_cycle: u32, max_repo: u32, max_external: u32) -> Budgets {
+        Budgets {
+            max_dispatches_per_cycle: max_cycle,
+            max_active_per_repo: max_repo,
+            max_external_dispatches: max_external,
+            item_wall_clock_mins: 45,
+            cycle_wall_clock_mins: 90,
+        }
+    }
+
+    fn generous_budgets() -> Budgets {
+        budgets(100, 100, 100)
+    }
+
+    fn ratchet_unlocked(names: &[&str]) -> HashMap<String, RatchetState> {
+        names
+            .iter()
+            .map(|n| ((*n).to_string(), RatchetState::Unlocked))
+            .collect()
+    }
+
+    fn ratchet_none() -> HashMap<String, RatchetState> {
+        HashMap::new()
+    }
+
+    // --- invariant 1: closed roster ---
+
+    #[test]
+    fn invariant_1_closed_roster_dispatch_and_proposal_models_are_always_from_roster() {
+        let roster = vec![
+            roster_entry(
+                "model-a",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "model-b",
+                Tier::Lead,
+                Ceiling::L,
+                Efficiency::Std,
+                Backend::Claude,
+            ),
+        ];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![
+                issue(
+                    "senior-item",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test"),
+                ),
+                issue("lead-item", 2, "2026-01-02T00:00:00Z", "lead", "L", None),
+            ],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        let known: Vec<&str> = roster.iter().map(|r| r.name.as_str()).collect();
+        for d in &plan.dispatches {
+            assert!(known.contains(&d.model.as_str()));
+        }
+        for p in &plan.proposals {
+            assert!(known.contains(&p.model.as_str()));
+        }
+        assert!(!plan.dispatches.is_empty() || !plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn invariant_1_empty_roster_flags_every_triaged_item_over_ceiling_never_fallback() {
+        let roster: Vec<RosterEntry> = Vec::new();
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue(
+                "i1",
+                1,
+                "2026-01-01T00:00:00Z",
+                "junior",
+                "S",
+                Some("cargo test"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        assert!(plan.dispatches.is_empty());
+        assert!(plan.proposals.is_empty());
+        assert_eq!(plan.flags.len(), 1);
+        assert!(matches!(plan.flags[0], Flag::OverCeiling { .. }));
+    }
+
+    // --- invariant 2: tier_floor is a hard gate ---
+
+    #[test]
+    fn invariant_2_tier_floor_is_a_hard_gate_never_routes_below_floor() {
+        let roster = vec![
+            roster_entry(
+                "junior-model",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Agy,
+            ),
+            roster_entry(
+                "senior-model",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+        ];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue("i1", 1, "2026-01-01T00:00:00Z", "senior", "S", None)],
+        )];
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(plan.proposals[0].model, "senior-model");
+    }
+
+    #[test]
+    fn invariant_2_unparseable_tier_floor_flags_not_guesses() {
+        let roster = vec![roster_entry(
+            "any-model",
+            Tier::Lead,
+            Ceiling::Xl,
+            Efficiency::Heavy,
+            Backend::Claude,
+        )];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue_with_invalid_tier_floor(
+                "bad-floor",
+                1,
+                "2026-01-01T00:00:00Z",
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        assert!(plan.dispatches.is_empty());
+        assert!(plan.proposals.is_empty());
+        assert_eq!(plan.flags.len(), 1);
+        match &plan.flags[0] {
+            Flag::Untriaged { missing, .. } => {
+                assert_eq!(missing, &vec![MissingField::TierFloor]);
+            }
+            other => panic!("expected Untriaged flag, got {other:?}"),
+        }
+    }
+
+    // --- invariant 3: fail closed everywhere ---
+
+    #[test]
+    fn invariant_3_missing_verify_cmd_is_not_dispatchable_falls_back_to_proposal() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue("i1", 1, "2026-01-01T00:00:00Z", "senior", "M", None)],
+        )];
+        // Fully qualified otherwise: senior tier_floor, ratchet unlocked, wide budgets.
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        assert!(
+            plan.dispatches.is_empty(),
+            "missing verify_cmd must never dispatch"
+        );
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(plan.proposals[0].model, "senior-model");
+    }
+
+    // --- invariant 4: one writer per repo ---
+
+    #[test]
+    fn invariant_4_in_progress_repo_is_skipped_entirely() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        let repos = vec![skipped_repo(
+            "busy-repo",
+            SkipReason::InProgress,
+            vec![
+                issue(
+                    "i1",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test"),
+                ),
+                issue(
+                    "i2",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    "junior",
+                    "S",
+                    Some("cargo test"),
+                ),
+            ],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["busy-repo"]),
+        );
+        assert!(plan.dispatches.is_empty());
+        assert!(plan.proposals.is_empty());
+        assert!(plan.flags.is_empty());
+        assert_eq!(plan.skips.len(), 2);
+        for s in &plan.skips {
+            assert_eq!(s.reason, SkipCode::InProgress);
+        }
+    }
+
+    #[test]
+    fn invariant_4_max_one_active_dispatch_per_repo_per_cycle() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![
+                issue(
+                    "i1",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test 1"),
+                ),
+                issue(
+                    "i2",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test 2"),
+                ),
+            ],
+        )];
+        let b = budgets(100, 1, 100); // max_active_per_repo = 1 (spec default)
+        let plan = route(&repos, &roster, &b, &ratchet_unlocked(&["repo1"]));
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].issue_id, "i1");
+        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips[0].issue_id, "i2");
+        assert_eq!(plan.skips[0].reason, SkipCode::Budget);
+    }
+
+    // --- invariant 5: never dispatch chezmoi-config (excluded, defense in depth) ---
+
+    #[test]
+    fn invariant_5_excluded_repo_like_chezmoi_config_is_never_dispatched() {
+        let roster = vec![roster_entry(
+            "any-model",
+            Tier::Lead,
+            Ceiling::Xl,
+            Efficiency::Heavy,
+            Backend::Claude,
+        )];
+        let repos = vec![skipped_repo(
+            "chezmoi-config",
+            SkipReason::Excluded,
+            vec![issue(
+                "sneaky",
+                1,
+                "2026-01-01T00:00:00Z",
+                "lead",
+                "XL",
+                Some("cargo test"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["chezmoi-config"]),
+        );
+        assert!(plan.dispatches.is_empty());
+        assert!(plan.proposals.is_empty());
+        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips[0].reason, SkipCode::Excluded);
+    }
+
+    // --- invariant 6: close only verified (dispatch always carries verify_cmd) ---
+
+    #[test]
+    fn invariant_6_every_dispatch_carries_the_verify_cmd_precondition_for_close_only_verified() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue(
+                "i1",
+                1,
+                "2026-01-01T00:00:00Z",
+                "senior",
+                "M",
+                Some("cargo test triage"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].verify_cmd, "cargo test triage");
+    }
+
+    // --- invariant 7: budgets are ceilings, not targets ---
+
+    #[test]
+    fn invariant_7_budgets_are_hard_ceilings_excess_is_skipped_with_reason() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        let repos = vec![
+            active_repo(
+                "repo1",
+                vec![issue(
+                    "i1",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test"),
+                )],
+            ),
+            active_repo(
+                "repo2",
+                vec![issue(
+                    "i2",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test"),
+                )],
+            ),
+            active_repo(
+                "repo3",
+                vec![issue(
+                    "i3",
+                    3,
+                    "2026-01-03T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test"),
+                )],
+            ),
+        ];
+        let b = budgets(2, 100, 100); // exactly-at-ceiling boundary = 2
+        let ratchet = ratchet_unlocked(&["repo1", "repo2", "repo3"]);
+        let plan = route(&repos, &roster, &b, &ratchet);
+        assert_eq!(plan.dispatches.len(), 2, "exactly at ceiling must be allowed");
+        assert_eq!(plan.skips.len(), 1, "excess beyond ceiling must be skipped");
+        assert_eq!(plan.skips[0].issue_id, "i3");
+        assert_eq!(plan.skips[0].reason, SkipCode::Budget);
+    }
+
+    #[test]
+    fn invariant_7_max_external_dispatches_ceiling_caps_pi_and_agy_combined() {
+        let roster = vec![
+            roster_entry(
+                "pi-model",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "agy-model",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Agy,
+            ),
+        ];
+        let repos = vec![
+            active_repo(
+                "repo1",
+                vec![issue(
+                    "i1",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("t"),
+                )],
+            ),
+            active_repo(
+                "repo2",
+                vec![issue(
+                    "i2",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    "junior",
+                    "S",
+                    Some("t"),
+                )],
+            ),
+        ];
+        let b = budgets(100, 100, 1); // max_external_dispatches = 1 (pi + agy combined)
+        let plan = route(&repos, &roster, &b, &ratchet_unlocked(&["repo1", "repo2"]));
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips[0].reason, SkipCode::Budget);
+    }
+
+    // --- invariant 8: no silent drops ---
+
+    #[test]
+    fn invariant_8_no_silent_drops_every_ready_item_lands_in_exactly_one_bucket() {
+        let roster = vec![
+            roster_entry(
+                "junior-model",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Agy,
+            ),
+            roster_entry(
+                "senior-model",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "lead-model",
+                Tier::Lead,
+                Ceiling::L,
+                Efficiency::Std,
+                Backend::Claude,
+            ),
+        ];
+        let repos = vec![
+            active_repo(
+                "repo1",
+                vec![
+                    issue(
+                        "dispatched",
+                        1,
+                        "2026-01-01T00:00:00Z",
+                        "senior",
+                        "M",
+                        Some("cargo test"),
+                    ),
+                    issue(
+                        "proposed-lead",
+                        2,
+                        "2026-01-02T00:00:00Z",
+                        "lead",
+                        "L",
+                        Some("cargo test"),
+                    ),
+                    untriaged_issue("untriaged", 3, "2026-01-03T00:00:00Z"),
+                    issue(
+                        "over-ceiling",
+                        4,
+                        "2026-01-04T00:00:00Z",
+                        "junior",
+                        "XL",
+                        Some("cargo test"),
+                    ),
+                ],
+            ),
+            active_repo(
+                "repo2",
+                vec![issue(
+                    "budget-excess",
+                    5,
+                    "2026-01-05T00:00:00Z",
+                    "junior",
+                    "S",
+                    Some("cargo test"),
+                )],
+            ),
+            skipped_repo(
+                "repo3-busy",
+                SkipReason::InProgress,
+                vec![issue(
+                    "in-progress-1",
+                    6,
+                    "2026-01-06T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test"),
+                )],
+            ),
+            skipped_repo("chezmoi-config", SkipReason::Excluded, vec![]),
+        ];
+        let b = budgets(1, 100, 100); // only 1 global dispatch allowed this cycle
+        let ratchet = ratchet_unlocked(&["repo1", "repo2", "repo3-busy"]);
+
+        let plan = route(&repos, &roster, &b, &ratchet);
+
+        let mut all_ids: Vec<String> = Vec::new();
+        for r in &repos {
+            for i in &r.ready {
+                all_ids.push(i.id.clone());
+            }
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        for d in &plan.dispatches {
+            seen.push(d.issue_id.clone());
+        }
+        for p in &plan.proposals {
+            seen.push(p.issue_id.clone());
+        }
+        for f in &plan.flags {
+            match f {
+                Flag::Untriaged { issue_id, .. } | Flag::OverCeiling { issue_id, .. } => {
+                    seen.push(issue_id.clone());
+                }
+                Flag::RosterDrift => {}
+            }
+        }
+        for s in &plan.skips {
+            seen.push(s.issue_id.clone());
+        }
+
+        all_ids.sort();
+        seen.sort();
+        assert_eq!(
+            all_ids, seen,
+            "every ready item must land in exactly one output bucket, exactly once"
+        );
+    }
+
+    // --- invariant 9: ratchet failure re-locks (locked repo always proposes) ---
+
+    #[test]
+    fn invariant_9_locked_ratchet_forces_proposal_never_auto_dispatch() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue(
+                "i1",
+                1,
+                "2026-01-01T00:00:00Z",
+                "senior",
+                "M",
+                Some("cargo test"),
+            )],
+        )];
+        // Fully qualified otherwise (senior tier, verify_cmd present, wide
+        // budgets) but the repo's ratchet has not earned unlock (e.g.
+        // re-locked to 0 after a prior rejected proposal or failed verify,
+        // per invariant 9) -> must propose only.
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        assert!(plan.dispatches.is_empty());
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(plan.proposals[0].model, "senior-model");
+    }
+
+    #[test]
+    fn invariant_9_unlocked_ratchet_permits_auto_dispatch_once_fully_qualified() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue(
+                "i1",
+                1,
+                "2026-01-01T00:00:00Z",
+                "senior",
+                "M",
+                Some("cargo test"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        assert_eq!(plan.dispatches.len(), 1);
+        assert!(plan.proposals.is_empty());
+    }
+
+    // --- candidate-selection shape: lowest qualifying tier, then efficiency, then tie-breaks ---
+
+    #[test]
+    fn lowest_qualifying_tier_is_preferred_over_higher_tiers() {
+        let roster = vec![
+            roster_entry(
+                "lead-model",
+                Tier::Lead,
+                Ceiling::Xl,
+                Efficiency::Heavy,
+                Backend::Claude,
+            ),
+            roster_entry(
+                "senior-model",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Std,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "junior-model",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Agy,
+            ),
+        ];
+        // tier_floor junior, complexity S: all three roster entries qualify on
+        // ceiling, but the lowest qualifying tier (junior) must win even
+        // though it's listed last in the roster.
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue("i1", 1, "2026-01-01T00:00:00Z", "junior", "S", None)],
+        )];
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(plan.proposals[0].model, "junior-model");
+    }
+
+    #[test]
+    fn most_efficient_model_is_preferred_within_the_same_qualifying_tier() {
+        let roster = vec![
+            roster_entry(
+                "heavy-senior",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Heavy,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "lean-senior",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+        ];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue("i1", 1, "2026-01-01T00:00:00Z", "senior", "M", None)],
+        )];
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        assert_eq!(plan.proposals[0].model, "lean-senior");
+    }
+
+    #[test]
+    fn tie_break_equal_efficiency_and_equal_dispatch_count_falls_back_to_roster_order() {
+        let roster = vec![
+            roster_entry(
+                "first-listed",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "second-listed",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+        ];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue("i1", 1, "2026-01-01T00:00:00Z", "senior", "M", None)],
+        )];
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        assert_eq!(plan.proposals[0].model, "first-listed");
+    }
+
+    #[test]
+    fn tie_break_prefers_fewest_dispatches_so_far_this_cycle_over_roster_order() {
+        let roster = vec![
+            roster_entry(
+                "first-listed",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "second-listed",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+        ];
+        // Two items in two different unlocked repos so each independently
+        // dispatches; after "first-listed" gets the first dispatch, the
+        // second item's tie-break must prefer "second-listed" (fewer
+        // dispatches so far), even though "first-listed" is roster-first.
+        let repos = vec![
+            active_repo(
+                "repo1",
+                vec![issue(
+                    "i1",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("t"),
+                )],
+            ),
+            active_repo(
+                "repo2",
+                vec![issue(
+                    "i2",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("t"),
+                )],
+            ),
+        ];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1", "repo2"]),
+        );
+        assert_eq!(plan.dispatches.len(), 2);
+        assert_eq!(plan.dispatches[0].model, "first-listed");
+        assert_eq!(plan.dispatches[1].model, "second-listed");
+    }
+
+    #[test]
+    fn over_ceiling_flag_when_complexity_exceeds_every_qualifying_ceiling() {
+        let roster = vec![
+            roster_entry(
+                "senior-model",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "lead-model",
+                Tier::Lead,
+                Ceiling::L,
+                Efficiency::Std,
+                Backend::Claude,
+            ),
+        ];
+        // complexity XL, but the highest ceiling anywhere in the roster is L.
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue(
+                "i1",
+                1,
+                "2026-01-01T00:00:00Z",
+                "senior",
+                "XL",
+                Some("t"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        assert!(plan.dispatches.is_empty());
+        assert!(plan.proposals.is_empty());
+        assert_eq!(plan.flags.len(), 1);
+        match &plan.flags[0] {
+            Flag::OverCeiling { complexity, .. } => assert_eq!(*complexity, Ceiling::Xl),
+            other => panic!("expected OverCeiling flag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn priority_then_created_at_ordering_determines_processing_order_for_budget_ceilings() {
+        let roster = vec![roster_entry(
+            "senior-model",
+            Tier::Senior,
+            Ceiling::M,
+            Efficiency::Lean,
+            Backend::Pi,
+        )];
+        // Same priority; ordering must fall back to created_at ascending
+        // (oldest first).
+        let repos = vec![
+            active_repo(
+                "repo-newer",
+                vec![issue(
+                    "newer",
+                    1,
+                    "2026-01-02T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("t"),
+                )],
+            ),
+            active_repo(
+                "repo-older",
+                vec![issue(
+                    "older",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("t"),
+                )],
+            ),
+        ];
+        let b = budgets(1, 100, 100);
+        let plan = route(
+            &repos,
+            &roster,
+            &b,
+            &ratchet_unlocked(&["repo-newer", "repo-older"]),
+        );
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(
+            plan.dispatches[0].issue_id, "older",
+            "oldest created_at must be processed first under a tight budget"
+        );
+        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips[0].issue_id, "newer");
+    }
+
+    // --- real roster sanity check (guards against roster drift silently changing routing) ---
+
+    #[test]
+    fn real_roster_routes_the_specs_tesela_headline_fixture_to_a_lean_senior_model() {
+        let cfg = crate::config::parse_str(include_str!("../conductor.toml"))
+            .expect("checked-in config parses");
+        let notes = "tier_floor: senior · complexity: S-M · verify_type: wrangler dev + cargo test";
+        let mut i = issue(
+            "tesela-headline",
+            1,
+            "2026-01-01T00:00:00Z",
+            "senior",
+            "M",
+            None,
+        );
+        i.metadata = None;
+        i.notes = notes.to_string();
+        let repos = vec![active_repo("tesela", vec![i])];
+        let plan = route(&repos, &cfg.roster, &generous_budgets(), &ratchet_none());
+        // No runnable verify_cmd (verify_type is prose, not a command) and a
+        // locked ratchet -> proposal, not dispatch.
+        assert_eq!(plan.proposals.len(), 1);
+        let model = &plan.proposals[0].model;
+        let entry = cfg
+            .roster
+            .iter()
+            .find(|r| &r.name == model)
+            .expect("chosen model must be in the roster");
+        assert_eq!(entry.tier, Tier::Senior);
+        assert_eq!(entry.efficiency, Efficiency::Lean);
+    }
+}
