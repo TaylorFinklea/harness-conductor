@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [scan [--json]] [status]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -19,6 +19,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("config") => run_config(&mut it),
+        Some("roster") => run_roster(&mut it),
         Some("scan") => run_scan(&mut it),
         Some("status") => run_status(&mut it),
         Some(cmd) => {
@@ -241,6 +242,78 @@ fn home_state_dir() -> Option<PathBuf> {
             .join("state")
             .join("conductor"),
     )
+}
+
+fn run_roster(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    match it.next().as_deref() {
+        None => {
+            eprintln!("usage: conductor roster drift [--config <path>]");
+            ExitCode::from(2)
+        }
+        Some("drift") => run_roster_drift(it),
+        Some(sub) => {
+            eprintln!("unknown roster subcommand: {sub}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_roster_drift(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let mut config_path = PathBuf::from("conductor.toml");
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => {
+                let Some(p) = it.next() else {
+                    eprintln!("--config requires a path argument");
+                    return ExitCode::from(2);
+                };
+                config_path = PathBuf::from(p);
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let cfg = match config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config: invalid — {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => {
+            eprintln!("roster drift: HOME not set; cannot locate ~/.claude/model-scorecard.md");
+            return ExitCode::from(1);
+        }
+    };
+    let scorecard_path = PathBuf::from(home)
+        .join(".claude")
+        .join("model-scorecard.md");
+
+    let content = match std::fs::read_to_string(&scorecard_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("roster drift: cannot read scorecard: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let scorecard_entries = match crate::roster_drift::parse_scorecard(&content) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("roster drift: cannot parse scorecard: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let report = crate::roster_drift::diff(&scorecard_entries, &cfg.roster);
+    crate::roster_drift::print_report(&report);
+    ExitCode::SUCCESS
 }
 
 fn run_scan(it: &mut std::vec::IntoIter<String>) -> ExitCode {

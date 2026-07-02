@@ -1,0 +1,16 @@
+# Model Scorecard — Test Fixture (Extra in Config)
+
+This scorecard is missing a model that's in conductor.toml.
+
+## Live Roster
+
+| Model | Dispatch ID | Tier (owns) | Ceiling | Reliability | Notes |
+|---|---|---|---|---|---|
+| **opus-4.8** | claude-opus-4-8 | **Lead** | XL | high | Test fixture |
+| **sonnet-5** | claude-sonnet-5 | **Lead** | L | high | Test fixture |
+| **gpt-5.5** | openai-codex/gpt-5.5 | **Senior** | M | high | Test fixture |
+| **minimax-m3** | opencode-go/minimax-m3 | **Senior** | M | high | Test fixture |
+| **qwen3.7-max** | opencode-go/qwen3.7-max | **Senior** | M | high | Test fixture |
+| **glm-5.2** | opencode-go/glm-5.2 | **Senior** | M | good | Test fixture |
+
+Note: gemini-3.5-flash is missing (it's in conductor.toml but not here)

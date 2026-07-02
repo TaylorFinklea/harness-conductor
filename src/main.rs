@@ -9,6 +9,7 @@ mod fields;
 mod ledger;
 mod plan;
 mod ratchet;
+mod roster_drift;
 mod scan;
 mod state;
 mod triage;
