@@ -33,3 +33,12 @@
 **Context**: User asked whether harness-voice/hermes-voice or larkline belong in Conductor.
 **Decision**: Neither is a v1 component. hermes-voice (mid-rebrand to "Harness Voice") is a shipped personal voice UX surface — future (v2+) consumer of conductor events via a thin webhook, never a dispatch backend. larkline is precedent + free display: publishing harness-deck reports with live heartbeats makes conductor state visible in lark-plug-hdeck's "In Flight" view with zero larkline-specific code (its liveness window is 60s — heartbeat faster than that).
 **Rationale**: Recon showed neither has any orchestration surface; integration seams are events/reports they already consume.
+
+## [2026-07-01] Conductor joins the Guildhall suite; two reconciliation additions
+
+**Context**: Conductor is the "master of works" member of the Guildhall suite (charter: `~/git/guildhall`). Two suite-level decisions (rationale in `guildhall/.docs/ai/decisions.md`) add scope to Conductor's backlog.
+**Decision**:
+1. **Tiered qualitative-review stage** (`conductor-review` bead) — an optional, config-gated pipeline stage after mechanical verify: junior-tier work gets a senior read-only review, senior work optionally a lead review, returning ship|revise + findings. Mirrors what the Lead session did by hand in cycle 1 (caught the `.gitignore` landmine, the agy no-op, evidence quality — none catchable by `verify_cmd`). Enforces `~/AGENTS.md`'s "review only by an equal-or-higher tier" inside the orchestrator. Config `review.enabled` (default true) + `review.min_tier_gap`; one extra dispatch per lower-tier completion, budget-counted.
+2. **Bursar budget interface** (`conductor-bursar` bead) — consume `bursar status --json` before metered external dispatch; near-exhausted or "unknown" provider windows down-weight/defer (fail-closed: unknown = spend-cautiously). Retires the static-cap limitation; gives orchestra's dormant `ThrottleState`/`routeBoundary` a real data source via Bursar.
+**Alternatives considered**: bake review into the existing m4b verify pipeline (rejected — keep mechanical vs qualitative separable/testable); leave budgets static (rejected — cycle 1 showed real quota exhaustion, agy gemini-flash down ~4.6 days).
+**Rationale**: Cycle 1 was Conductor's own design run by hand; both additions crystallize what the manual Lead loop actually did. Cross-member dependency (Bursar must ship first) is noted in bead prose — bd has no cross-repo dep primitive.
