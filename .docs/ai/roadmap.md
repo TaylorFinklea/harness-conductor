@@ -9,13 +9,14 @@ Conductor: a single Rust binary that runs autonomous work-routing cycles over th
 ## Now / Next / Later
 
 ### Now
-- [ ] Work the beads backlog via `bd ready` (18 items seeded 2026-07-01, IDs `conductor-m0a`…`conductor-m6` + `conductor-prompt`/`conductor-rev1`/`conductor-bdro`). Unblocked roots: `conductor-m0a` (senior), `conductor-prompt` (lead), `conductor-bdro` (junior). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
+- [ ] Cycle 1 COMPLETE (9 beads closed: m0a, m0b, m1a, m1b, m2a, m2b, prompt, bdro, rev1); `cargo test` passes 84 tests. Live ready queue (`bd ready`, 6 items): `conductor-m4a`/`conductor-m3a` (P1), `conductor-agy`/`conductor-m1c`/`conductor-m0c` (P2), `conductor-cov1` (P3). Routing fields are in bd metadata; every bead's Verify is its `verify_cmd`.
 
 ### Next
-- [ ] M3 dry-run cycle has a human-verify tail (report renders on dashboard) — see `conductor-m3b` notes
+- [ ] M3 dry-run cycle has a human-verify tail (report renders on dashboard) — see `conductor-m3b` notes. `conductor-guildhall-dogfood` (lead, v1 integration proof) is now bd-blocked on `conductor-m3b` and carries its own human-verify tail (dry-run over 3+ real repos + dashboard spot-check; verify_cmd alone under-covers).
 
 ### Later
-- [ ] M3 dry-run cycle → M4 dispatch+verify → M5 triage backfill → M6 ratchet
+- [ ] M3 dry-run cycle → M4 dispatch+verify (m4a→m4b→m4c) → `conductor-review` → M5 triage backfill → M6 ratchet. `conductor-review` bumped P2→P1 and now GATES v1-done (user decision 2026-07-02, ADR in guildhall decisions.md); still bd-blocked on m4c + m4b.
+- [ ] `conductor-warden` set to deferred (self-labeled v1.5; not in the v1-done clause) — un-defer after conductor-m4c + warden m3/m4/m6.
 - [ ] Post-v1 spikes: bd swarm/gate/mol evaluation; hermes-voice notification channel; SSE response push
 
 ## Milestones
