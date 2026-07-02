@@ -1091,6 +1091,51 @@ mod tests {
         assert!(plan.proposals.is_empty());
     }
 
+    // --- routing step 5: lead-floor items are ALWAYS propose-only ---
+
+    #[test]
+    fn lead_floor_item_never_auto_dispatches_even_when_fully_qualified() {
+        // Routing algorithm step 5 (and the ratchet safety property): a
+        // lead-floor item is ALWAYS a proposal, never an auto-dispatch — even
+        // with a runnable verify_cmd, an unlocked ratchet, and budget room.
+        // Regression test for the `routing.tier_floor != Tier::Lead` guard in
+        // `route`; no other test isolates it (removing that clause leaves the
+        // entire suite green — verified by mutation).
+        let roster = vec![roster_entry(
+            "lead-model",
+            Tier::Lead,
+            Ceiling::L,
+            Efficiency::Std,
+            Backend::Claude,
+        )];
+        let repos = vec![active_repo(
+            "repo1",
+            vec![issue(
+                "lead-item",
+                1,
+                "2026-01-01T00:00:00Z",
+                "lead",
+                "L",
+                Some("cargo test"),
+            )],
+        )];
+        // Fully auto-dispatch-qualified in every respect EXCEPT the lead floor.
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["repo1"]),
+        );
+        assert!(
+            plan.dispatches.is_empty(),
+            "lead-floor items must never auto-dispatch (routing step 5)"
+        );
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(plan.proposals[0].model, "lead-model");
+        assert!(plan.skips.is_empty());
+        assert!(plan.flags.is_empty());
+    }
+
     // --- candidate-selection shape: lowest qualifying tier, then efficiency, then tie-breaks ---
 
     #[test]
