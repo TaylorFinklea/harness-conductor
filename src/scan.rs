@@ -24,7 +24,7 @@ use crate::config::ScanConfig;
 /// - `Recent`: touched within the last 7 days
 /// - `Stale`: touched more than 7 days ago
 /// - `Unknown`: no `.beads/last-touched` file or mtime unavailable
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Freshness {
     Fresh,
     Recent,
@@ -36,7 +36,7 @@ const FRESH_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const RECENT_THRESHOLD: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
 
 /// Why a repo was skipped from enumeration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum SkipReason {
     /// Repo has at least one `in_progress` issue (a human/agent may be mid-work).
     InProgress,
@@ -49,7 +49,7 @@ pub(crate) enum SkipReason {
 }
 
 /// Zero-state distinction for repos with no ready work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum ZeroState {
     /// No open issues at all (drained).
     Drained,
@@ -60,7 +60,7 @@ pub(crate) enum ZeroState {
 }
 
 /// Snapshot of a single repo's state during fleet enumeration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct RepoSnapshot {
     /// Absolute path to the repo.
     pub(crate) path: PathBuf,

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [scan [--json]] [status]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -19,6 +19,8 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("config") => run_config(&mut it),
+        Some("scan") => run_scan(&mut it),
+        Some("status") => run_status(&mut it),
         Some(cmd) => {
             eprintln!("unknown subcommand: {cmd}");
             print_usage();
@@ -86,6 +88,148 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{Freshness, RepoSnapshot, SkipReason, ZeroState};
+    use std::path::PathBuf;
+
+    fn make_snapshot(name: &str, ready_count: usize, skip: Option<SkipReason>) -> RepoSnapshot {
+        let is_beads_repo = skip != Some(SkipReason::NotBeadsRepo) && skip != Some(SkipReason::Excluded);
+        let zero_state = if ready_count == 0 && skip.is_none() {
+            ZeroState::Drained
+        } else {
+            ZeroState::NotApplicable
+        };
+        let freshness = if skip.is_some() {
+            Freshness::Unknown
+        } else {
+            Freshness::Fresh
+        };
+
+        let mut ready = Vec::new();
+        for i in 0..ready_count {
+            ready.push(crate::bd::Issue {
+                id: format!("{name}-{i}"),
+                title: format!("Issue {i}"),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                notes: String::new(),
+                status: "open".to_string(),
+                priority: 1,
+                issue_type: "task".to_string(),
+                assignee: None,
+                owner: "test".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_by: "test".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                started_at: None,
+                labels: None,
+                estimated_minutes: None,
+                metadata: None,
+                parent: None,
+                dependencies: None,
+                dependency_count: None,
+                dependent_count: None,
+                comment_count: None,
+            });
+        }
+
+        RepoSnapshot {
+            path: PathBuf::from(format!("/test/{name}")),
+            name: name.to_string(),
+            is_beads_repo,
+            skip_reason: skip,
+            ready,
+            count: ready_count as u64,
+            blocked: Vec::new(),
+            zero_state,
+            freshness,
+        }
+    }
+
+    #[test]
+    fn scan_subcommand_json_outputs_snapshots() {
+        let snapshots = vec![
+            make_snapshot("repo-a", 3, None),
+            make_snapshot("repo-b", 0, Some(SkipReason::Excluded)),
+        ];
+
+        let json = serde_json::to_string(&snapshots).expect("serialize");
+        assert!(json.contains("repo-a"));
+        assert!(json.contains("repo-b"));
+        assert!(json.contains("Excluded"));
+    }
+
+    #[test]
+    fn scan_table_formats_columns() {
+        let snapshots = vec![
+            make_snapshot("alpha", 5, None),
+            make_snapshot("beta-long-name", 12, None),
+            make_snapshot("gamma", 0, Some(SkipReason::InProgress)),
+        ];
+
+        // Capture output by calling the function and checking it doesn't panic
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_handles_empty_list() {
+        let snapshots: Vec<RepoSnapshot> = vec![];
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_zero_states() {
+        let mut snap = make_snapshot("drained", 0, None);
+        snap.zero_state = ZeroState::Drained;
+        snap.freshness = Freshness::Stale;
+
+        let snapshots = vec![snap];
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_blocked_zero_state() {
+        let mut snap = make_snapshot("blocked", 0, None);
+        snap.zero_state = ZeroState::Blocked;
+        snap.freshness = Freshness::Recent;
+
+        let snapshots = vec![snap];
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_all_skip_reasons() {
+        let snapshots = vec![
+            make_snapshot("a", 0, Some(SkipReason::InProgress)),
+            make_snapshot("b", 0, Some(SkipReason::Excluded)),
+            make_snapshot("c", 0, Some(SkipReason::NotBeadsRepo)),
+            make_snapshot("d", 0, Some(SkipReason::NotGitRepo)),
+        ];
+
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_all_freshness_levels() {
+        let mut s1 = make_snapshot("fresh", 1, None);
+        s1.freshness = Freshness::Fresh;
+
+        let mut s2 = make_snapshot("recent", 1, None);
+        s2.freshness = Freshness::Recent;
+
+        let mut s3 = make_snapshot("stale", 1, None);
+        s3.freshness = Freshness::Stale;
+
+        let mut s4 = make_snapshot("unknown", 1, None);
+        s4.freshness = Freshness::Unknown;
+
+        let snapshots = vec![s1, s2, s3, s4];
+        print_scan_table(&snapshots);
+    }
+}
+
 fn home_state_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     if home.is_empty() {
@@ -97,6 +241,196 @@ fn home_state_dir() -> Option<PathBuf> {
             .join("state")
             .join("conductor"),
     )
+}
+
+fn run_scan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let mut json_output = false;
+    let mut config_path = PathBuf::from("conductor.toml");
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" => json_output = true,
+            "--config" => {
+                let Some(p) = it.next() else {
+                    eprintln!("--config requires a path argument");
+                    return ExitCode::from(2);
+                };
+                config_path = PathBuf::from(p);
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let cfg = match config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config: invalid — {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let client = crate::bd::CommandBdClient::new();
+    let snapshots = match crate::scan::scan(&cfg.scan, &client) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("scan: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if json_output {
+        match serde_json::to_string_pretty(&snapshots) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("json: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        print_scan_table(&snapshots);
+    }
+
+    let has_flags = snapshots.iter().any(|s| s.skip_reason.is_some());
+    if has_flags {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_scan_table(snapshots: &[crate::scan::RepoSnapshot]) {
+    use crate::scan::{Freshness, SkipReason, ZeroState};
+
+    let headers = ["REPO", "READY", "ZERO-STATE", "FRESH", "FLAGS"];
+
+    let rows: Vec<[String; 5]> = snapshots
+        .iter()
+        .map(|s| {
+            let ready = if s.is_beads_repo && s.skip_reason.is_none() {
+                s.ready.len().to_string()
+            } else {
+                "-".to_string()
+            };
+
+            let zero_state = match s.zero_state {
+                ZeroState::Drained => "drained".to_string(),
+                ZeroState::Blocked => "blocked".to_string(),
+                ZeroState::NotApplicable => "-".to_string(),
+            };
+
+            let freshness = if s.is_beads_repo {
+                match s.freshness {
+                    Freshness::Fresh => "fresh".to_string(),
+                    Freshness::Recent => "recent".to_string(),
+                    Freshness::Stale => "stale".to_string(),
+                    Freshness::Unknown => "unknown".to_string(),
+                }
+            } else {
+                "-".to_string()
+            };
+
+            let flags = match &s.skip_reason {
+                Some(SkipReason::InProgress) => "in-progress".to_string(),
+                Some(SkipReason::Excluded) => "excluded".to_string(),
+                Some(SkipReason::NotBeadsRepo) => "not-beads".to_string(),
+                Some(SkipReason::NotGitRepo) => "not-git".to_string(),
+                None => "-".to_string(),
+            };
+
+            [s.name.clone(), ready, zero_state, freshness, flags]
+        })
+        .collect();
+
+    let mut widths = [0usize; 5];
+    for (i, h) in headers.iter().enumerate() {
+        widths[i] = h.len();
+    }
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let header_line: Vec<String> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| format!("{:<width$}", h, width = widths[i]))
+        .collect();
+    println!("{}", header_line.join("  "));
+
+    for row in &rows {
+        let line: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| format!("{:<width$}", cell, width = widths[i]))
+            .collect();
+        println!("{}", line.join("  "));
+    }
+}
+
+fn run_status(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    // Reject unknown arguments
+    if let Some(arg) = it.next() {
+        eprintln!("unknown argument: {arg}");
+        return ExitCode::from(2);
+    }
+
+    let state_dir = match home_state_dir() {
+        Some(dir) => dir,
+        None => {
+            eprintln!("status: HOME not set; cannot locate state directory");
+            return ExitCode::from(2);
+        }
+    };
+
+    let journal_path = state_dir.join("journal.json");
+    if !journal_path.is_file() {
+        println!("no cycles recorded yet");
+        println!();
+        println!("state directory: {}", state_dir.display());
+        return ExitCode::SUCCESS;
+    }
+
+    let content = match std::fs::read_to_string(&journal_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("status: cannot read journal: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let journal: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("status: invalid journal: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if let Some(last_cycle) = journal.get("last_cycle") {
+        if let Some(id) = last_cycle.get("id").and_then(|v| v.as_str()) {
+            println!("last cycle: {id}");
+        }
+        if let Some(ts) = last_cycle.get("completed_at").and_then(|v| v.as_str()) {
+            println!("completed:  {ts}");
+        }
+        if let Some(summary) = last_cycle.get("summary").and_then(|v| v.as_object()) {
+            let scanned = summary.get("scanned").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ready = summary.get("ready").and_then(|v| v.as_u64()).unwrap_or(0);
+            let dispatched = summary.get("dispatched").and_then(|v| v.as_u64()).unwrap_or(0);
+            let verified = summary.get("verified").and_then(|v| v.as_u64()).unwrap_or(0);
+            let flagged = summary.get("flagged").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("summary:    scanned={scanned} ready={ready} dispatched={dispatched} verified={verified} flagged={flagged}");
+        }
+    } else {
+        println!("no cycles recorded yet");
+    }
+
+    println!();
+    println!("state directory: {}", state_dir.display());
+    ExitCode::SUCCESS
 }
 
 fn print_usage() {

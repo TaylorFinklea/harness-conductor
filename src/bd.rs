@@ -60,7 +60,7 @@ impl fmt::Display for BdError {
 
 impl std::error::Error for BdError {}
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, serde::Serialize)]
 pub(crate) struct Issue {
     pub(crate) id: String,
     pub(crate) title: String,
@@ -103,7 +103,7 @@ pub(crate) struct Issue {
     pub(crate) comment_count: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, serde::Serialize)]
 pub(crate) struct Comment {
     pub(crate) id: String,
     pub(crate) issue_id: String,
