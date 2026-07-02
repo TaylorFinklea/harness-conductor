@@ -907,6 +907,80 @@ mod tests {
         assert_eq!(plan.skips[0].reason, SkipCode::Budget);
     }
 
+    #[test]
+    fn invariant_7_external_cap_does_not_block_subsequent_internal_backend_dispatch() {
+        // With max_external_dispatches exhausted by pi/agy (external) items, a
+        // subsequent claude-backend (internal) item that is still within the
+        // per-cycle/per-repo budgets STILL dispatches — the external cap gates
+        // only external backends, per-item, not a global halt on dispatching.
+        let roster = vec![
+            roster_entry(
+                "pi-senior",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+            ),
+            roster_entry(
+                "claude-senior",
+                Tier::Senior,
+                Ceiling::L,
+                Efficiency::Std,
+                Backend::Claude,
+            ),
+        ];
+        let repos = vec![
+            // Processed first (priority 1): senior-M routes to the lean
+            // pi-senior model (external), exhausting max_external_dispatches.
+            active_repo(
+                "repo-ext",
+                vec![issue(
+                    "ext-item",
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("cargo test"),
+                )],
+            ),
+            // Processed second (priority 2): senior-L routes to claude-senior
+            // (internal — pi-senior's M ceiling can't cover complexity L).
+            // Despite the external cap being hit, this internal item must
+            // still dispatch.
+            active_repo(
+                "repo-int",
+                vec![issue(
+                    "int-item",
+                    2,
+                    "2026-01-02T00:00:00Z",
+                    "senior",
+                    "L",
+                    Some("cargo test"),
+                )],
+            ),
+        ];
+        let b = budgets(100, 100, 1); // external cap = 1, exhausted by ext-item
+        let plan = route(
+            &repos,
+            &roster,
+            &b,
+            &ratchet_unlocked(&["repo-ext", "repo-int"]),
+        );
+        assert_eq!(
+            plan.dispatches.len(),
+            2,
+            "internal item must dispatch despite an exhausted external cap"
+        );
+        assert_eq!(plan.dispatches[0].issue_id, "ext-item");
+        assert_eq!(plan.dispatches[0].model, "pi-senior");
+        assert_eq!(plan.dispatches[1].issue_id, "int-item");
+        assert_eq!(plan.dispatches[1].model, "claude-senior");
+        assert!(
+            plan.skips.is_empty(),
+            "no skip expected — both items are within their relevant budgets"
+        );
+    }
+
     // --- invariant 8: no silent drops ---
 
     #[test]

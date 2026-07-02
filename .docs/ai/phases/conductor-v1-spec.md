@@ -71,7 +71,7 @@ No daemon, no new database, no network listener.
 4. **One writer per repo.** Max one active dispatch per repo per cycle; a repo with ANY pre-existing `in_progress` bead is skipped entirely (a human/agent may be mid-work).
 5. **Never push. Never `chezmoi apply`. Never scan/dispatch chezmoi-config** (hard-coded deny in addition to config `exclude`).
 6. **Close only verified.** `bd close` fires only after ALL of: worker process exited on its own (not timeout-killed) AND ≥1 new commit exists in the repo AND `verify_cmd` exits 0 AND (when configured) `orchestra verify` passes.
-7. **Budgets are ceilings, not targets.** Hitting any budget stops planning/dispatching; remainder is reported as skipped-with-reason.
+7. **Budgets are ceilings, not targets.** Hitting any budget stops planning/dispatching; remainder is reported as skipped-with-reason. Each budget gates only the items that would breach it — the external cap skips external (pi/agy) backends only, so an internal (claude) item still dispatches after the external cap is hit.
 8. **No silent drops.** Every ready item the cycle saw appears in the report as dispatched / proposed / flagged / skipped(reason).
 9. **Ratchet failure re-locks.** Any rejected proposal or failed verify resets that repo's counter to 0 and returns it to propose-only.
 
