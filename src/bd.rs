@@ -93,8 +93,15 @@ pub(crate) struct Issue {
     pub(crate) metadata: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     pub(crate) parent: Option<String>,
+    // Real `bd ready --json` output emits an array of dependency-edge objects
+    // (issue_id/depends_on_id/type/created_at/created_by/metadata), not plain
+    // issue-id strings; a `Vec<String>` typing made the whole array — and thus
+    // the whole `bd ready` parse — fail for any issue with populated deps,
+    // silently emptying that repo's ready list (conductor-guildhall-dogfood
+    // fix, 2026-07-02). This field is otherwise unused by triage/scan logic,
+    // so `Value` avoids over-modeling a shape nothing consumes.
     #[serde(default)]
-    pub(crate) dependencies: Option<Vec<String>>,
+    pub(crate) dependencies: Option<Vec<Value>>,
     #[serde(default)]
     pub(crate) dependency_count: Option<u32>,
     #[serde(default)]
