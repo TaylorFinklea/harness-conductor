@@ -1,0 +1,20 @@
+[
+  {
+    "id": "fixture-blocked",
+    "title": "blocked without metadata",
+    "description": "blocked issue description",
+    "acceptance_criteria": "blocked acceptance",
+    "notes": "plain notes",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "feature",
+    "owner": "taylor.finklea@gmail.com",
+    "created_at": "2026-07-02T00:33:49Z",
+    "created_by": "Taylor Finklea",
+    "updated_at": "2026-07-01T19:33:48Z",
+    "blocked_by_count": 1,
+    "blocked_by": [
+      "fixture-ready-meta"
+    ]
+  }
+]

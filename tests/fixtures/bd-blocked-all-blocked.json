@@ -1,0 +1,19 @@
+[
+  {
+    "id": "fixture-only-blocked",
+    "title": "blocked by in progress",
+    "description": "blocked",
+    "acceptance_criteria": "blocked acceptance",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "taylor.finklea@gmail.com",
+    "created_at": "2026-07-02T00:35:17Z",
+    "created_by": "Taylor Finklea",
+    "updated_at": "2026-07-01T19:35:16Z",
+    "blocked_by_count": 1,
+    "blocked_by": [
+      "fixture-blocker"
+    ]
+  }
+]

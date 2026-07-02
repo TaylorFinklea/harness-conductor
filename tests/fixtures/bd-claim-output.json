@@ -1,0 +1,18 @@
+[
+  {
+    "id": "fixture-claimed",
+    "title": "claimed issue",
+    "description": "claimed issue description",
+    "acceptance_criteria": "claimed acceptance",
+    "notes": "claimed notes",
+    "status": "in_progress",
+    "priority": 3,
+    "issue_type": "chore",
+    "assignee": "fixture-agent",
+    "owner": "taylor.finklea@gmail.com",
+    "created_at": "2026-07-02T00:33:53Z",
+    "created_by": "Taylor Finklea",
+    "updated_at": "2026-07-02T00:34:01Z",
+    "started_at": "2026-07-02T00:34:01Z"
+  }
+]

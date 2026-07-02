@@ -1,0 +1,22 @@
+[
+  {
+    "id": "fixture-claimed",
+    "title": "claimed issue",
+    "description": "claimed issue description",
+    "acceptance_criteria": "claimed acceptance",
+    "notes": "claimed notes",
+    "status": "closed",
+    "priority": 3,
+    "issue_type": "chore",
+    "owner": "taylor.finklea@gmail.com",
+    "created_at": "2026-07-02T00:33:53Z",
+    "created_by": "Taylor Finklea",
+    "updated_at": "2026-07-02T00:35:58Z",
+    "started_at": "2026-07-02T00:34:01Z",
+    "closed_at": "2026-07-02T00:35:58Z",
+    "close_reason": "fixture close",
+    "metadata": {
+      "verify_cmd": "cargo test bd_client"
+    }
+  }
+]

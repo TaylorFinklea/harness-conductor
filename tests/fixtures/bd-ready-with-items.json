@@ -1,0 +1,29 @@
+[
+  {
+    "id": "fixture-ready-meta",
+    "title": "ready with metadata",
+    "description": "ready issue description",
+    "acceptance_criteria": "ready acceptance",
+    "notes": "tier_floor: senior · complexity: S-M · verify_type: cargo",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "taylor.finklea@gmail.com",
+    "estimated_minutes": 30,
+    "created_at": "2026-07-02T00:33:43Z",
+    "created_by": "Taylor Finklea",
+    "updated_at": "2026-07-02T00:33:43Z",
+    "metadata": {
+      "complexity": "M",
+      "tier_floor": "senior",
+      "verify_cmd": "cargo test bd_client"
+    },
+    "labels": [
+      "alpha",
+      "beta"
+    ],
+    "dependency_count": 0,
+    "dependent_count": 1,
+    "comment_count": 0
+  }
+]
