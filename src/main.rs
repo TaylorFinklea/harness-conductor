@@ -3,6 +3,7 @@
 mod bd;
 mod cli;
 mod config;
+mod cycle;
 mod deck;
 mod dispatch;
 mod fields;

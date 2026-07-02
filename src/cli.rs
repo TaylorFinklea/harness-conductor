@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status] [cycle --dry-run [--config <path>]]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -19,6 +19,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("config") => run_config(&mut it),
+        Some("cycle") => run_cycle(&mut it),
         Some("roster") => run_roster(&mut it),
         Some("scan") => run_scan(&mut it),
         Some("status") => run_status(&mut it),
@@ -504,6 +505,70 @@ fn run_status(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     println!();
     println!("state directory: {}", state_dir.display());
     ExitCode::SUCCESS
+}
+
+fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let mut dry_run = false;
+    let mut config_path = PathBuf::from("conductor.toml");
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--config" => {
+                let Some(p) = it.next() else {
+                    eprintln!("--config requires a path argument");
+                    return ExitCode::from(2);
+                };
+                config_path = PathBuf::from(p);
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    if !dry_run {
+        eprintln!("cycle: only --dry-run is supported in this version");
+        return ExitCode::from(2);
+    }
+
+    let cfg = match config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config: invalid — {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let reports_home = std::env::var("CONDUCTOR_REPORTS_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home)
+        });
+
+    let state_dir = std::env::var("CONDUCTOR_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("conductor")
+        });
+
+    let client = crate::bd::CommandBdClient::new();
+    match crate::cycle::run_dry_run(&cfg, &client, &reports_home, &state_dir) {
+        Ok(result) => {
+            println!("cycle {}: dry-run complete", result.cycle_id);
+            println!("report: {}", result.report_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("cycle: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn print_usage() {
