@@ -123,11 +123,9 @@ fn build_report(
     let ready_items: usize = snapshots.iter().map(|s| s.ready.len()).sum();
     let triaged_count = plan.proposals.len() + plan.dispatches.len();
     let flagged_count = plan.flags.len();
-    let triaged_pct = if ready_items > 0 {
-        (triaged_count * 100) / ready_items
-    } else {
-        0
-    };
+    let triaged_pct = (triaged_count * 100)
+        .checked_div(ready_items)
+        .unwrap_or(0);
 
     blocks.push(Block::metrics(
         "Cycle Metrics",
@@ -141,7 +139,7 @@ fn build_report(
         ],
         vec![Bar::new(
             "triaged",
-            triaged_pct.min(100) as u8,
+            u8::try_from(triaged_pct.min(100)).expect("triaged_pct bounded via min(100)"),
             "cyan",
         )],
     ));
@@ -165,6 +163,21 @@ fn build_report(
     // --- Approval block (informational in dry-run) ---
     let dispatch_summary = format_dispatch_plan(plan);
     blocks.push(Block::approval("dispatch-plan", dispatch_summary));
+
+    blocks.extend(build_callouts(plan));
+
+    Report::new(
+        cycle_id,
+        format!("Conductor dry-run: {cycle_id}"),
+        created_at,
+        ReportStatus::AwaitingReview,
+        blocks,
+    )
+    .map_err(|e| CycleError::new(format!("report: {e}")))
+}
+
+fn build_callouts(plan: &Plan) -> Vec<Block> {
+    let mut callouts = Vec::new();
 
     // --- Callout blocks for flags ---
     let untriaged: Vec<String> = plan
@@ -190,7 +203,7 @@ fn build_report(
         })
         .collect();
     if !untriaged.is_empty() {
-        blocks.push(Block::callout(
+        callouts.push(Block::callout(
             CalloutLevel::Warn,
             "UNTRIAGED",
             format!(
@@ -214,7 +227,7 @@ fn build_report(
         })
         .collect();
     if !over_ceiling.is_empty() {
-        blocks.push(Block::callout(
+        callouts.push(Block::callout(
             CalloutLevel::Warn,
             "OVER-CEILING",
             format!(
@@ -231,7 +244,7 @@ fn build_report(
         .filter(|s| s.reason == SkipCode::Budget)
         .collect();
     if !budget_skips.is_empty() {
-        blocks.push(Block::callout(
+        callouts.push(Block::callout(
             CalloutLevel::Info,
             "BUDGET",
             format!(
@@ -246,14 +259,7 @@ fn build_report(
         ));
     }
 
-    Report::new(
-        cycle_id,
-        format!("Conductor dry-run: {cycle_id}"),
-        created_at,
-        ReportStatus::AwaitingReview,
-        blocks,
-    )
-    .map_err(|e| CycleError::new(format!("report: {e}")))
+    callouts
 }
 
 fn repo_state_str(s: &RepoSnapshot) -> String {
@@ -523,6 +529,60 @@ mod tests {
 
     // --- The test ---
 
+    fn assert_dry_run_report(result: &CycleResult, cycle_id: &str) {
+        // --- Verify cycle-id ---
+        assert_eq!(result.cycle_id, cycle_id);
+        assert!(result.cycle_id.starts_with("cycle-"));
+        assert_eq!(result.cycle_id.len(), 21);
+
+        // --- Verify report file ---
+        assert!(result.report_path.is_file());
+        let report_bytes = std::fs::read(&result.report_path).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&report_bytes).unwrap();
+
+        assert_eq!(report["schema"], "harness-deck/report@1");
+        assert_eq!(report["project"], "conductor");
+        assert_eq!(report["harness"], "conductor");
+        assert_eq!(report["id"], cycle_id);
+        assert_eq!(report["status"], "awaiting-review");
+
+        // --- Verify report blocks ---
+        let blocks = report["blocks"].as_array().unwrap();
+        let types: Vec<&str> = blocks
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+
+        assert!(types.contains(&"metrics"), "missing metrics block");
+        assert!(types.contains(&"table"), "missing table block");
+        assert!(types.contains(&"approval"), "missing approval block");
+        assert!(types.contains(&"callout"), "missing callout block");
+
+        // Verify approval block has id "dispatch-plan"
+        let approval = blocks.iter().find(|b| b["type"] == "approval").unwrap();
+        assert_eq!(approval["id"], "dispatch-plan");
+
+        // Verify metrics values
+        let metrics = blocks.iter().find(|b| b["type"] == "metrics").unwrap();
+        let metric_items = metrics["metrics"].as_array().unwrap();
+        let scanned = metric_items
+            .iter()
+            .find(|m| m["label"] == "Repos scanned")
+            .unwrap();
+        assert_eq!(scanned["value"], "3");
+
+        let ready = metric_items
+            .iter()
+            .find(|m| m["label"] == "Ready items")
+            .unwrap();
+        assert_eq!(ready["value"], "4"); // 3 from alpha + 1 from beta
+
+        // Verify table has all repos
+        let table = blocks.iter().find(|b| b["type"] == "table").unwrap();
+        let table_rows = table["rows"].as_array().unwrap();
+        assert_eq!(table_rows.len(), 3); // alpha, beta, gamma
+    }
+
     #[test]
     fn cycle_dry_run() {
         let fleet = TempDir::new("fleet");
@@ -614,57 +674,7 @@ dispatch_id = "test/junior"
         )
         .unwrap();
 
-        // --- Verify cycle-id ---
-        assert_eq!(result.cycle_id, cycle_id);
-        assert!(result.cycle_id.starts_with("cycle-"));
-        assert_eq!(result.cycle_id.len(), 21);
-
-        // --- Verify report file ---
-        assert!(result.report_path.is_file());
-        let report_bytes = std::fs::read(&result.report_path).unwrap();
-        let report: serde_json::Value = serde_json::from_slice(&report_bytes).unwrap();
-
-        assert_eq!(report["schema"], "harness-deck/report@1");
-        assert_eq!(report["project"], "conductor");
-        assert_eq!(report["harness"], "conductor");
-        assert_eq!(report["id"], cycle_id);
-        assert_eq!(report["status"], "awaiting-review");
-
-        // --- Verify report blocks ---
-        let blocks = report["blocks"].as_array().unwrap();
-        let types: Vec<&str> = blocks
-            .iter()
-            .map(|b| b["type"].as_str().unwrap())
-            .collect();
-
-        assert!(types.contains(&"metrics"), "missing metrics block");
-        assert!(types.contains(&"table"), "missing table block");
-        assert!(types.contains(&"approval"), "missing approval block");
-        assert!(types.contains(&"callout"), "missing callout block");
-
-        // Verify approval block has id "dispatch-plan"
-        let approval = blocks.iter().find(|b| b["type"] == "approval").unwrap();
-        assert_eq!(approval["id"], "dispatch-plan");
-
-        // Verify metrics values
-        let metrics = blocks.iter().find(|b| b["type"] == "metrics").unwrap();
-        let metric_items = metrics["metrics"].as_array().unwrap();
-        let scanned = metric_items
-            .iter()
-            .find(|m| m["label"] == "Repos scanned")
-            .unwrap();
-        assert_eq!(scanned["value"], "3");
-
-        let ready = metric_items
-            .iter()
-            .find(|m| m["label"] == "Ready items")
-            .unwrap();
-        assert_eq!(ready["value"], "4"); // 3 from alpha + 1 from beta
-
-        // Verify table has all repos
-        let table = blocks.iter().find(|b| b["type"] == "table").unwrap();
-        let table_rows = table["rows"].as_array().unwrap();
-        assert_eq!(table_rows.len(), 3); // alpha, beta, gamma
+        assert_dry_run_report(&result, cycle_id);
 
         // --- Verify journal ---
         let journal_path = state.path().join("journal.json");

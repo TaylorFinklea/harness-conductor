@@ -106,7 +106,7 @@ fn run_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Si
         );
     }
 
-    let verify_run = run_spawn(exec, verify_spawn(request)?)?;
+    let verify_run = run_spawn(exec, &verify_spawn(request)?)?;
     if !verify_run.status.success() {
         return fail(
             bd,
@@ -216,9 +216,9 @@ struct CommandRun {
     stderr_path: PathBuf,
 }
 
-fn run_spawn<E: Exec + ?Sized>(exec: &E, spawn: SpawnRequest) -> Result<CommandRun> {
+fn run_spawn<E: Exec + ?Sized>(exec: &E, spawn: &SpawnRequest) -> Result<CommandRun> {
     let stderr_path = spawn.stderr_path.clone();
-    let mut child = exec.spawn(&spawn)?;
+    let mut child = exec.spawn(spawn)?;
     let status = child.wait()?;
     Ok(CommandRun {
         status,
@@ -330,11 +330,11 @@ fn run_orchestra_attempt<E: Exec + ?Sized>(
     request: &VerifyRequest,
     suffix: &str,
 ) -> Result<OrchestraAttempt> {
-    let run = run_spawn(exec, orchestra_spawn(request, suffix)?)?;
-    classify_orchestra(run)
+    let run = run_spawn(exec, &orchestra_spawn(request, suffix)?)?;
+    classify_orchestra(&run)
 }
 
-fn classify_orchestra(run: CommandRun) -> Result<OrchestraAttempt> {
+fn classify_orchestra(run: &CommandRun) -> Result<OrchestraAttempt> {
     if run.status.success() {
         return Ok(OrchestraAttempt::Passed);
     }

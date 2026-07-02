@@ -983,6 +983,41 @@ mod tests {
 
     // --- invariant 8: no silent drops ---
 
+    fn assert_every_ready_item_lands_in_one_bucket(repos: &[RepoSnapshot], plan: &Plan) {
+        let mut all_ids: Vec<String> = Vec::new();
+        for r in repos {
+            for i in &r.ready {
+                all_ids.push(i.id.clone());
+            }
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        for d in &plan.dispatches {
+            seen.push(d.issue_id.clone());
+        }
+        for p in &plan.proposals {
+            seen.push(p.issue_id.clone());
+        }
+        for f in &plan.flags {
+            match f {
+                Flag::Untriaged { issue_id, .. } | Flag::OverCeiling { issue_id, .. } => {
+                    seen.push(issue_id.clone());
+                }
+                Flag::RosterDrift => {}
+            }
+        }
+        for s in &plan.skips {
+            seen.push(s.issue_id.clone());
+        }
+
+        all_ids.sort();
+        seen.sort();
+        assert_eq!(
+            all_ids, seen,
+            "every ready item must land in exactly one output bucket, exactly once"
+        );
+    }
+
     #[test]
     fn invariant_8_no_silent_drops_every_ready_item_lands_in_exactly_one_bucket() {
         let roster = vec![
@@ -1069,38 +1104,7 @@ mod tests {
 
         let plan = route(&repos, &roster, &b, &ratchet);
 
-        let mut all_ids: Vec<String> = Vec::new();
-        for r in &repos {
-            for i in &r.ready {
-                all_ids.push(i.id.clone());
-            }
-        }
-
-        let mut seen: Vec<String> = Vec::new();
-        for d in &plan.dispatches {
-            seen.push(d.issue_id.clone());
-        }
-        for p in &plan.proposals {
-            seen.push(p.issue_id.clone());
-        }
-        for f in &plan.flags {
-            match f {
-                Flag::Untriaged { issue_id, .. } | Flag::OverCeiling { issue_id, .. } => {
-                    seen.push(issue_id.clone());
-                }
-                Flag::RosterDrift => {}
-            }
-        }
-        for s in &plan.skips {
-            seen.push(s.issue_id.clone());
-        }
-
-        all_ids.sort();
-        seen.sort();
-        assert_eq!(
-            all_ids, seen,
-            "every ready item must land in exactly one output bucket, exactly once"
-        );
+        assert_every_ready_item_lands_in_one_bucket(&repos, &plan);
     }
 
     // --- invariant 9: ratchet failure re-locks (locked repo always proposes) ---

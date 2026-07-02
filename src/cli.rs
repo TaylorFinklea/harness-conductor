@@ -90,148 +90,6 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scan::{Freshness, RepoSnapshot, SkipReason, ZeroState};
-    use std::path::PathBuf;
-
-    fn make_snapshot(name: &str, ready_count: usize, skip: Option<SkipReason>) -> RepoSnapshot {
-        let is_beads_repo = skip != Some(SkipReason::NotBeadsRepo) && skip != Some(SkipReason::Excluded);
-        let zero_state = if ready_count == 0 && skip.is_none() {
-            ZeroState::Drained
-        } else {
-            ZeroState::NotApplicable
-        };
-        let freshness = if skip.is_some() {
-            Freshness::Unknown
-        } else {
-            Freshness::Fresh
-        };
-
-        let mut ready = Vec::new();
-        for i in 0..ready_count {
-            ready.push(crate::bd::Issue {
-                id: format!("{name}-{i}"),
-                title: format!("Issue {i}"),
-                description: String::new(),
-                acceptance_criteria: String::new(),
-                notes: String::new(),
-                status: "open".to_string(),
-                priority: 1,
-                issue_type: "task".to_string(),
-                assignee: None,
-                owner: "test".to_string(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                created_by: "test".to_string(),
-                updated_at: "2026-01-01T00:00:00Z".to_string(),
-                started_at: None,
-                labels: None,
-                estimated_minutes: None,
-                metadata: None,
-                parent: None,
-                dependencies: None,
-                dependency_count: None,
-                dependent_count: None,
-                comment_count: None,
-            });
-        }
-
-        RepoSnapshot {
-            path: PathBuf::from(format!("/test/{name}")),
-            name: name.to_string(),
-            is_beads_repo,
-            skip_reason: skip,
-            ready,
-            count: ready_count as u64,
-            blocked: Vec::new(),
-            zero_state,
-            freshness,
-        }
-    }
-
-    #[test]
-    fn scan_subcommand_json_outputs_snapshots() {
-        let snapshots = vec![
-            make_snapshot("repo-a", 3, None),
-            make_snapshot("repo-b", 0, Some(SkipReason::Excluded)),
-        ];
-
-        let json = serde_json::to_string(&snapshots).expect("serialize");
-        assert!(json.contains("repo-a"));
-        assert!(json.contains("repo-b"));
-        assert!(json.contains("Excluded"));
-    }
-
-    #[test]
-    fn scan_table_formats_columns() {
-        let snapshots = vec![
-            make_snapshot("alpha", 5, None),
-            make_snapshot("beta-long-name", 12, None),
-            make_snapshot("gamma", 0, Some(SkipReason::InProgress)),
-        ];
-
-        // Capture output by calling the function and checking it doesn't panic
-        print_scan_table(&snapshots);
-    }
-
-    #[test]
-    fn scan_table_handles_empty_list() {
-        let snapshots: Vec<RepoSnapshot> = vec![];
-        print_scan_table(&snapshots);
-    }
-
-    #[test]
-    fn scan_table_shows_zero_states() {
-        let mut snap = make_snapshot("drained", 0, None);
-        snap.zero_state = ZeroState::Drained;
-        snap.freshness = Freshness::Stale;
-
-        let snapshots = vec![snap];
-        print_scan_table(&snapshots);
-    }
-
-    #[test]
-    fn scan_table_shows_blocked_zero_state() {
-        let mut snap = make_snapshot("blocked", 0, None);
-        snap.zero_state = ZeroState::Blocked;
-        snap.freshness = Freshness::Recent;
-
-        let snapshots = vec![snap];
-        print_scan_table(&snapshots);
-    }
-
-    #[test]
-    fn scan_table_shows_all_skip_reasons() {
-        let snapshots = vec![
-            make_snapshot("a", 0, Some(SkipReason::InProgress)),
-            make_snapshot("b", 0, Some(SkipReason::Excluded)),
-            make_snapshot("c", 0, Some(SkipReason::NotBeadsRepo)),
-            make_snapshot("d", 0, Some(SkipReason::NotGitRepo)),
-        ];
-
-        print_scan_table(&snapshots);
-    }
-
-    #[test]
-    fn scan_table_shows_all_freshness_levels() {
-        let mut s1 = make_snapshot("fresh", 1, None);
-        s1.freshness = Freshness::Fresh;
-
-        let mut s2 = make_snapshot("recent", 1, None);
-        s2.freshness = Freshness::Recent;
-
-        let mut s3 = make_snapshot("stale", 1, None);
-        s3.freshness = Freshness::Stale;
-
-        let mut s4 = make_snapshot("unknown", 1, None);
-        s4.freshness = Freshness::Unknown;
-
-        let snapshots = vec![s1, s2, s3, s4];
-        print_scan_table(&snapshots);
-    }
-}
-
 fn home_state_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     if home.is_empty() {
@@ -451,12 +309,9 @@ fn run_status(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let state_dir = match home_state_dir() {
-        Some(dir) => dir,
-        None => {
-            eprintln!("status: HOME not set; cannot locate state directory");
-            return ExitCode::from(2);
-        }
+    let Some(state_dir) = home_state_dir() else {
+        eprintln!("status: HOME not set; cannot locate state directory");
+        return ExitCode::from(2);
     };
 
     let journal_path = state_dir.join("journal.json");
@@ -491,11 +346,11 @@ fn run_status(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             println!("completed:  {ts}");
         }
         if let Some(summary) = last_cycle.get("summary").and_then(|v| v.as_object()) {
-            let scanned = summary.get("scanned").and_then(|v| v.as_u64()).unwrap_or(0);
-            let ready = summary.get("ready").and_then(|v| v.as_u64()).unwrap_or(0);
-            let dispatched = summary.get("dispatched").and_then(|v| v.as_u64()).unwrap_or(0);
-            let verified = summary.get("verified").and_then(|v| v.as_u64()).unwrap_or(0);
-            let flagged = summary.get("flagged").and_then(|v| v.as_u64()).unwrap_or(0);
+            let scanned = summary.get("scanned").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let ready = summary.get("ready").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let dispatched = summary.get("dispatched").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let verified = summary.get("verified").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let flagged = summary.get("flagged").and_then(serde_json::Value::as_u64).unwrap_or(0);
             println!("summary:    scanned={scanned} ready={ready} dispatched={dispatched} verified={verified} flagged={flagged}");
         }
     } else {
@@ -540,22 +395,24 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         }
     };
 
-    let reports_home = std::env::var("CONDUCTOR_REPORTS_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+    let reports_home = std::env::var("CONDUCTOR_REPORTS_HOME").map_or_else(
+        |_| {
             let home = std::env::var("HOME").unwrap_or_default();
             PathBuf::from(home)
-        });
+        },
+        PathBuf::from,
+    );
 
-    let state_dir = std::env::var("CONDUCTOR_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+    let state_dir = std::env::var("CONDUCTOR_STATE_DIR").map_or_else(
+        |_| {
             let home = std::env::var("HOME").unwrap_or_default();
             PathBuf::from(home)
                 .join(".local")
                 .join("state")
                 .join("conductor")
-        });
+        },
+        PathBuf::from,
+    );
 
     let client = crate::bd::CommandBdClient::new();
     match crate::cycle::run_dry_run(&cfg, &client, &reports_home, &state_dir) {
@@ -573,4 +430,146 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 
 fn print_usage() {
     eprintln!("{USAGE}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{Freshness, RepoSnapshot, SkipReason, ZeroState};
+    use std::path::PathBuf;
+
+    fn make_snapshot(name: &str, ready_count: usize, skip: Option<SkipReason>) -> RepoSnapshot {
+        let is_beads_repo = skip != Some(SkipReason::NotBeadsRepo) && skip != Some(SkipReason::Excluded);
+        let zero_state = if ready_count == 0 && skip.is_none() {
+            ZeroState::Drained
+        } else {
+            ZeroState::NotApplicable
+        };
+        let freshness = if skip.is_some() {
+            Freshness::Unknown
+        } else {
+            Freshness::Fresh
+        };
+
+        let mut ready = Vec::new();
+        for i in 0..ready_count {
+            ready.push(crate::bd::Issue {
+                id: format!("{name}-{i}"),
+                title: format!("Issue {i}"),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                notes: String::new(),
+                status: "open".to_string(),
+                priority: 1,
+                issue_type: "task".to_string(),
+                assignee: None,
+                owner: "test".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_by: "test".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                started_at: None,
+                labels: None,
+                estimated_minutes: None,
+                metadata: None,
+                parent: None,
+                dependencies: None,
+                dependency_count: None,
+                dependent_count: None,
+                comment_count: None,
+            });
+        }
+
+        RepoSnapshot {
+            path: PathBuf::from(format!("/test/{name}")),
+            name: name.to_string(),
+            is_beads_repo,
+            skip_reason: skip,
+            ready,
+            count: ready_count as u64,
+            blocked: Vec::new(),
+            zero_state,
+            freshness,
+        }
+    }
+
+    #[test]
+    fn scan_subcommand_json_outputs_snapshots() {
+        let snapshots = vec![
+            make_snapshot("repo-a", 3, None),
+            make_snapshot("repo-b", 0, Some(SkipReason::Excluded)),
+        ];
+
+        let json = serde_json::to_string(&snapshots).expect("serialize");
+        assert!(json.contains("repo-a"));
+        assert!(json.contains("repo-b"));
+        assert!(json.contains("Excluded"));
+    }
+
+    #[test]
+    fn scan_table_formats_columns() {
+        let snapshots = vec![
+            make_snapshot("alpha", 5, None),
+            make_snapshot("beta-long-name", 12, None),
+            make_snapshot("gamma", 0, Some(SkipReason::InProgress)),
+        ];
+
+        // Capture output by calling the function and checking it doesn't panic
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_handles_empty_list() {
+        let snapshots: Vec<RepoSnapshot> = vec![];
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_zero_states() {
+        let mut snap = make_snapshot("drained", 0, None);
+        snap.zero_state = ZeroState::Drained;
+        snap.freshness = Freshness::Stale;
+
+        let snapshots = vec![snap];
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_blocked_zero_state() {
+        let mut snap = make_snapshot("blocked", 0, None);
+        snap.zero_state = ZeroState::Blocked;
+        snap.freshness = Freshness::Recent;
+
+        let snapshots = vec![snap];
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_all_skip_reasons() {
+        let snapshots = vec![
+            make_snapshot("a", 0, Some(SkipReason::InProgress)),
+            make_snapshot("b", 0, Some(SkipReason::Excluded)),
+            make_snapshot("c", 0, Some(SkipReason::NotBeadsRepo)),
+            make_snapshot("d", 0, Some(SkipReason::NotGitRepo)),
+        ];
+
+        print_scan_table(&snapshots);
+    }
+
+    #[test]
+    fn scan_table_shows_all_freshness_levels() {
+        let mut s1 = make_snapshot("fresh", 1, None);
+        s1.freshness = Freshness::Fresh;
+
+        let mut s2 = make_snapshot("recent", 1, None);
+        s2.freshness = Freshness::Recent;
+
+        let mut s3 = make_snapshot("stale", 1, None);
+        s3.freshness = Freshness::Stale;
+
+        let mut s4 = make_snapshot("unknown", 1, None);
+        s4.freshness = Freshness::Unknown;
+
+        let snapshots = vec![s1, s2, s3, s4];
+        print_scan_table(&snapshots);
+    }
 }

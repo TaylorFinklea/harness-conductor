@@ -901,6 +901,7 @@ fn check_state_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -921,7 +922,7 @@ mod tests {
             ("dispatch_id", "opencode-go/x"),
         ] {
             let val = if k == field { value } else { v };
-            s.push_str(&format!("{k} = \"{val}\"\n"));
+            let _ = writeln!(s, "{k} = \"{val}\"");
         }
         s
     }
@@ -937,7 +938,7 @@ mod tests {
             ("dispatch_id", "opencode-go/x"),
         ] {
             if k != omit {
-                s.push_str(&format!("{k} = \"{v}\"\n"));
+                let _ = writeln!(s, "{k} = \"{v}\"");
             }
         }
         s

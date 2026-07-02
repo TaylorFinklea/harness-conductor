@@ -450,6 +450,65 @@ mod tests {
         assert_eq!(err.schema_version, Some(1));
     }
 
+    fn assert_bd_round_trip(temp: &Path) {
+        let client = CommandBdClient::new();
+        let ready = client.ready(temp).expect("ready works");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(client.count(temp).expect("count works"), 2);
+        assert_eq!(client.blocked(temp).expect("blocked works").len(), 1);
+        assert_eq!(
+            client
+                .show(temp, "fixture-round-ready")
+                .expect("show works")
+                .id,
+            "fixture-round-ready"
+        );
+        assert_eq!(
+            client
+                .claim(temp, "fixture-round-ready", "fixture-agent")
+                .expect("claim works")
+                .assignee
+                .as_deref(),
+            Some("fixture-agent")
+        );
+        assert_eq!(
+            client
+                .release(temp, "fixture-round-ready")
+                .expect("release works")
+                .status,
+            "open"
+        );
+        assert_eq!(
+            client
+                .set_metadata(
+                    temp,
+                    "fixture-round-ready",
+                    "verify_cmd",
+                    "cargo test bd_client"
+                )
+                .expect("set metadata works")
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("verify_cmd"))
+                .and_then(serde_json::Value::as_str),
+            Some("cargo test bd_client")
+        );
+        assert_eq!(
+            client
+                .comment(temp, "fixture-round-ready", "round comment")
+                .expect("comment works")
+                .text,
+            "round comment"
+        );
+        assert_eq!(
+            client
+                .close(temp, "fixture-round-ready", "round close")
+                .expect("close works")
+                .status,
+            "closed"
+        );
+    }
+
     #[test]
     fn bd_client_real_subprocess_round_trip_against_throwaway_repo() {
         if !bd_on_path() {
@@ -499,62 +558,7 @@ mod tests {
             ],
         );
 
-        let client = CommandBdClient::new();
-        let ready = client.ready(temp.path()).expect("ready works");
-        assert_eq!(ready.len(), 1);
-        assert_eq!(client.count(temp.path()).expect("count works"), 2);
-        assert_eq!(client.blocked(temp.path()).expect("blocked works").len(), 1);
-        assert_eq!(
-            client
-                .show(temp.path(), "fixture-round-ready")
-                .expect("show works")
-                .id,
-            "fixture-round-ready"
-        );
-        assert_eq!(
-            client
-                .claim(temp.path(), "fixture-round-ready", "fixture-agent")
-                .expect("claim works")
-                .assignee
-                .as_deref(),
-            Some("fixture-agent")
-        );
-        assert_eq!(
-            client
-                .release(temp.path(), "fixture-round-ready")
-                .expect("release works")
-                .status,
-            "open"
-        );
-        assert_eq!(
-            client
-                .set_metadata(
-                    temp.path(),
-                    "fixture-round-ready",
-                    "verify_cmd",
-                    "cargo test bd_client"
-                )
-                .expect("set metadata works")
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("verify_cmd"))
-                .and_then(serde_json::Value::as_str),
-            Some("cargo test bd_client")
-        );
-        assert_eq!(
-            client
-                .comment(temp.path(), "fixture-round-ready", "round comment")
-                .expect("comment works")
-                .text,
-            "round comment"
-        );
-        assert_eq!(
-            client
-                .close(temp.path(), "fixture-round-ready", "round close")
-                .expect("close works")
-                .status,
-            "closed"
-        );
+        assert_bd_round_trip(temp.path());
     }
 
     struct TempDir(PathBuf);

@@ -98,7 +98,7 @@ impl CyclePlan {
         std::fs::create_dir_all(&plans_dir)?;
         let path = plans_dir.join(format!("{}.json", self.cycle_id));
         let json = serde_json::to_vec_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         std::fs::write(&path, json)?;
         Ok(path)
     }

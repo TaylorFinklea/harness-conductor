@@ -301,9 +301,7 @@ fn skip_separator(lines: &[&str], idx: usize) -> Option<usize> {
 fn split_table_row(line: &str) -> Vec<&str> {
     let trimmed = line.trim();
     let inner = match (trimmed.strip_prefix('|'), trimmed.strip_suffix('|')) {
-        (Some(s), Some(_)) => s,
-        (Some(s), None) => s,
-        (None, Some(s)) => s,
+        (Some(s), Some(_) | None) | (None, Some(s)) => s,
         (None, None) => trimmed,
     };
     inner.split('|').collect()
@@ -699,8 +697,8 @@ Just some prose, no table at all.
 
     // Fixture-based tests
     fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(format!("tests/fixtures/{}", name))
-            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", name, e))
+        std::fs::read_to_string(format!("tests/fixtures/{name}"))
+            .unwrap_or_else(|e| panic!("Failed to read fixture {name}: {e}"))
     }
 
     #[test]
