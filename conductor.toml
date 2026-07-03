@@ -31,6 +31,11 @@ judge = "opencode-go/qwen3.7-max"
 # Force orchestra verification for every item, not just adversarial ones.
 always_orchestra = false
 
+[review]
+# Tiered qualitative review after mechanical verify passes.
+enabled = true
+min_tier_gap = 1
+
 # Initial roster from scorecard 2026-07-01.
 # (sonnet-5's scorecard "XL via decomposition" is capped to L here because
 # decomposition is out of scope v1; XL lead items route to opus-4.8 or flag.)

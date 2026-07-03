@@ -226,7 +226,12 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
     })
 }
 
-fn argv_for_backend(backend: Backend, dispatch_id: &str, prompt: &str, repo: &Path) -> Vec<String> {
+pub(crate) fn argv_for_backend(
+    backend: Backend,
+    dispatch_id: &str,
+    prompt: &str,
+    repo: &Path,
+) -> Vec<String> {
     match backend {
         Backend::Pi => strings([
             "pi",

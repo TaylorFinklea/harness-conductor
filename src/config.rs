@@ -212,11 +212,27 @@ impl Default for VerifyConfig {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ReviewConfig {
+    pub(crate) enabled: bool,
+    pub(crate) min_tier_gap: u32,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_tier_gap: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) autonomy: Autonomy,
     pub(crate) scan: ScanConfig,
     pub(crate) budgets: Budgets,
     pub(crate) verify: VerifyConfig,
+    pub(crate) review: ReviewConfig,
     pub(crate) roster: Vec<RosterEntry>,
 }
 
@@ -633,7 +649,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     for key in doc.keys() {
         if !matches!(
             key.as_str(),
-            "autonomy" | "scan" | "budgets" | "verify" | "roster"
+            "autonomy" | "scan" | "budgets" | "verify" | "review" | "roster"
         ) {
             return Err(ConfigError::new(format!("unknown config key: {key}")));
         }
@@ -646,12 +662,14 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     let scan = parse_scan(doc.get("scan"))?;
     let budgets = parse_budgets(doc.get("budgets"))?;
     let verify = parse_verify(doc.get("verify"))?;
+    let review = parse_review(doc.get("review"))?;
     let roster = parse_roster(doc.get("roster"))?;
     Ok(Config {
         autonomy,
         scan,
         budgets,
         verify,
+        review,
         roster,
     })
 }
@@ -718,6 +736,23 @@ fn parse_verify(node: Option<&Node>) -> Result<VerifyConfig> {
         }
     }
     Ok(v)
+}
+
+fn parse_review(node: Option<&Node>) -> Result<ReviewConfig> {
+    let t = match node {
+        None => return Ok(ReviewConfig::default()),
+        Some(Node::Table(t)) => t,
+        Some(_) => return Err(ConfigError::new("review must be a table")),
+    };
+    let mut r = ReviewConfig::default();
+    for (key, val) in t {
+        match key.as_str() {
+            "enabled" => r.enabled = expect_bool("review.enabled", val)?,
+            "min_tier_gap" => r.min_tier_gap = expect_u32("review.min_tier_gap", val)?,
+            other => return Err(ConfigError::new(format!("unknown review key: {other}"))),
+        }
+    }
+    Ok(r)
 }
 
 fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
@@ -1024,6 +1059,8 @@ mod tests {
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 90);
         assert_eq!(cfg.verify.judge, "opencode-go/qwen3.7-max");
         assert!(!cfg.verify.always_orchestra);
+        assert!(cfg.review.enabled);
+        assert_eq!(cfg.review.min_tier_gap, 1);
     }
 
     // --- valid configs ---
@@ -1048,6 +1085,10 @@ cycle_wall_clock_mins = 60
 judge = \"opencode-go/kimi-k2.7-code\"
 always_orchestra = true
 
+[review]
+enabled = false
+min_tier_gap = 2
+
 [[roster]]
 name = \"sonnet-5\"
 tier = \"lead\"
@@ -1070,6 +1111,8 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 60);
         assert_eq!(cfg.verify.judge, "opencode-go/kimi-k2.7-code");
         assert!(cfg.verify.always_orchestra);
+        assert!(!cfg.review.enabled);
+        assert_eq!(cfg.review.min_tier_gap, 2);
         assert_eq!(cfg.roster.len(), 1);
         assert_eq!(cfg.roster[0].tier, Tier::Lead);
     }
@@ -1087,6 +1130,8 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 90);
         assert_eq!(cfg.verify.judge, "opencode-go/qwen3.7-max");
         assert!(!cfg.verify.always_orchestra);
+        assert!(cfg.review.enabled);
+        assert_eq!(cfg.review.min_tier_gap, 1);
         assert_eq!(cfg.roster.len(), 1);
     }
 
@@ -1179,6 +1224,7 @@ dispatch_id = \"claude-sonnet-5\"
             ("unknown scan key", "[scan]\nfoo = \"bar\"\n".to_string()),
             ("unknown budgets key", "[budgets]\nfoo = 1\n".to_string()),
             ("unknown verify key", "[verify]\nfoo = \"x\"\n".to_string()),
+            ("unknown review key", "[review]\nfoo = 1\n".to_string()),
             (
                 "unknown roster key",
                 format!("{}extra = \"x\"\n", full_entry()),
@@ -1192,6 +1238,14 @@ dispatch_id = \"claude-sonnet-5\"
             (
                 "wrong type always_orchestra",
                 "[verify]\nalways_orchestra = \"yes\"\n".to_string(),
+            ),
+            (
+                "wrong type review enabled",
+                "[review]\nenabled = \"yes\"\n".to_string(),
+            ),
+            (
+                "wrong type review min_tier_gap",
+                "[review]\nmin_tier_gap = \"one\"\n".to_string(),
             ),
             ("wrong type autonomy", "autonomy = 1\n".to_string()),
             ("wrong type exclude", "[scan]\nexclude = \"x\"\n".to_string()),

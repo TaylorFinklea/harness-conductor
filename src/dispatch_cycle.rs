@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 
 use crate::bd::{BdClient, Issue};
-use crate::config::{Ceiling, Config, RosterEntry};
+use crate::config::{Ceiling, Config, RosterEntry, Tier};
 use crate::deck::{self, LiveUpdate, ReportStatus};
 use crate::dispatch::{self, CommitProbe, DispatchRequest, Exec};
 use crate::fields::{self, Triage};
 use crate::ledger::{self, LedgerRow};
 use crate::plan::CyclePlan;
-use crate::verify::{self, VerifyDecision, VerifyRequest};
+use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
 
 const WORKER_TEMPLATE: &str = include_str!("../templates/worker-prompt.md");
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -160,8 +160,7 @@ pub(crate) fn run_dispatch_cycle<
     let mut failed = 0_u64;
 
     for item in &items {
-        dispatched += 1;
-        match dispatch_one(
+        let attempt = dispatch_one(
             cfg,
             bd,
             exec,
@@ -175,7 +174,9 @@ pub(crate) fn run_dispatch_cycle<
             cycle_start,
             item,
             None,
-        )? {
+        )?;
+        dispatched += attempt.dispatches;
+        match attempt.decision {
             VerifyDecision::Passed => verified += 1,
             VerifyDecision::Failed | VerifyDecision::HardError => failed += 1,
         }
@@ -230,6 +231,11 @@ fn planned_items(plan: &CyclePlan) -> Vec<PlannedItem> {
     items
 }
 
+struct DispatchOneResult {
+    decision: VerifyDecision,
+    dispatches: u64,
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -254,7 +260,7 @@ fn dispatch_one<
     cycle_start: Instant,
     item: &PlannedItem,
     progress: Option<f64>,
-) -> std::result::Result<VerifyDecision, DispatchCycleError> {
+) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
     let repo_path = repo_path(cfg, &item.repo)?;
     let roster = cfg
         .roster
@@ -331,6 +337,7 @@ fn dispatch_one<
             &item.repo,
             &claimed,
             &extracted,
+            "implement",
             false,
             cycle_id,
             &format!("worker spawn failed: {e}"),
@@ -355,24 +362,58 @@ fn dispatch_one<
         worker_status: dispatch_result.status.clone(),
         before_head,
     };
-    let outcome = verify::run(bd, exec, commits, &verify_request)
+    let review = ReviewSettings {
+        config: cfg.review.clone(),
+        roster: cfg.roster.clone(),
+        dispatched_model: roster.clone(),
+        item_tier_floor: extracted.tier_floor,
+    };
+    let outcome = verify::run_with_review(bd, exec, commits, &verify_request, &review)
         .map_err(|e| DispatchCycleError::message(format!("verify: {e}")))?;
+    if let Some(review) = &outcome.review {
+        let reviewer = cfg
+            .roster
+            .iter()
+            .find(|entry| entry.name == review.model)
+            .ok_or_else(|| {
+                DispatchCycleError::message(format!(
+                    "review referenced unknown model {}",
+                    review.model
+                ))
+            })?;
+        append_ledger(
+            ledger_path,
+            reviewer,
+            &item.repo,
+            &claimed,
+            &extracted,
+            "review",
+            review.verify_passed,
+            cycle_id,
+            &review.summary,
+        )?;
+    }
     append_ledger(
         ledger_path,
         roster,
         &item.repo,
         &claimed,
         &extracted,
+        "implement",
         outcome.verify_passed,
         cycle_id,
         &outcome.summary,
     )?;
-    Ok(outcome.decision)
+    Ok(DispatchOneResult {
+        decision: outcome.decision,
+        dispatches: 1 + outcome.review_dispatches,
+    })
 }
 
 struct ExtractedFields {
     verify_cmd: String,
     complexity: String,
+    tier_floor: Tier,
 }
 
 fn extract_dispatch_fields(
@@ -397,6 +438,7 @@ fn extract_dispatch_fields(
     Ok(ExtractedFields {
         verify_cmd,
         complexity: ceiling_label(routing.complexity).to_string(),
+        tier_floor: routing.tier_floor,
     })
 }
 
@@ -410,6 +452,7 @@ fn append_ledger(
     repo: &str,
     issue: &Issue,
     fields: &ExtractedFields,
+    role: &str,
     verify_passed: bool,
     cycle_id: &str,
     summary: &str,
@@ -417,7 +460,7 @@ fn append_ledger(
     let row = LedgerRow {
         date: Utc::now().format("%Y-%m-%d").to_string(),
         model: roster.name.clone(),
-        role: "implement".to_string(),
+        role: role.to_string(),
         task: issue.id.clone(),
         verify_passed,
         complexity: fields.complexity.clone(),
@@ -544,6 +587,7 @@ fn ceiling_label(ceiling: Ceiling) -> &'static str {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::rc::Rc;
@@ -551,7 +595,7 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::bd::{BdClient, CommandBdClient};
+    use crate::bd::{BdClient, BdError, CommandBdClient, Comment, Issue};
     use crate::config;
     use crate::deck::{Block, Report, ReportStatus};
     use crate::dispatch::{
@@ -631,11 +675,9 @@ mod tests {
         )
         .expect_err("missing approval refuses");
         assert!(absent.is_not_answered());
-        assert!(
-            absent
-                .to_string()
-                .contains("dispatch-plan not yet answered")
-        );
+        assert!(absent
+            .to_string()
+            .contains("dispatch-plan not yet answered"));
     }
 
     #[test]
@@ -661,6 +703,10 @@ cycle_wall_clock_mins = 1
 [verify]
 judge = "opencode-go/qwen3.7-max"
 always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
 
 [[roster]]
 name = "fake-worker"
@@ -735,21 +781,108 @@ dispatch_id = "fake-worker"
             heartbeats.len() >= 2,
             "expected multiple live patches, got {heartbeats:?}"
         );
-        assert!(
-            heartbeats
-                .iter()
-                .any(|step| step.contains("worker sandbox-repo/sandbox-1"))
-        );
+        assert!(heartbeats
+            .iter()
+            .any(|step| step.contains("worker sandbox-repo/sandbox-1")));
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(report_path(&reports, cycle_id)).unwrap())
                 .unwrap();
         assert_eq!(report["status"], "done");
-        assert!(
-            report["live"]["step"]
-                .as_str()
-                .unwrap()
-                .contains("complete")
+        assert!(report["live"]["step"]
+            .as_str()
+            .unwrap()
+            .contains("complete"));
+    }
+
+    #[test]
+    fn review_e2e_sandbox_junior_tier_dispatch_gets_senior_review_and_counts_budget() {
+        let temp = TempDir::new("review-e2e-sandbox");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = true
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+
+[[roster]]
+name = "senior-reviewer"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "senior-reviewer"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-20260702-review";
+        write_plan_with_proposal(&state, cycle_id, "sandbox-repo", "sandbox-1", "fake-worker");
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = SandboxExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+
+        let result = run_dispatch_cycle(
+            &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+        )
+        .expect("approved sandbox dispatch with review succeeds");
+
+        assert_eq!(result.gate, ApprovalGate::Approved);
+        assert_eq!(
+            result.dispatched, 2,
+            "worker + review dispatch are budget-counted"
         );
+        assert_eq!(result.verified, 1);
+        assert_eq!(bd.close_count(), 1);
+
+        let spawns = exec.spawns();
+        assert_eq!(spawns.len(), 3, "worker + verify_cmd + review");
+        assert!(prompt_arg(&spawns[2]).contains("READ-ONLY qualitative review"));
+        assert!(spawns[2].argv.contains(&"senior-reviewer".to_string()));
+
+        let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
+        let rows: Vec<serde_json::Value> = ledger_line
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("ledger line json"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["role"], "review");
+        assert_eq!(rows[0]["model"], "senior-reviewer");
+        assert_eq!(rows[1]["role"], "implement");
+        assert_eq!(rows[1]["model"], "fake-worker");
     }
 
     fn fixture_config(root: &Path) -> &str {
@@ -845,6 +978,11 @@ dispatch_id = "fake-worker"
     }
 
     fn init_sandbox_repo(repo: &Path) {
+        init_sandbox_repo_without_bd(repo);
+        run(repo, "bd", &["init", "--non-interactive", "-p", "sandbox"]);
+    }
+
+    fn init_sandbox_repo_without_bd(repo: &Path) {
         std::fs::create_dir_all(repo).expect("mkdir repo");
         run(repo, "git", &["init", "-b", "main"]);
         run(
@@ -856,7 +994,6 @@ dispatch_id = "fake-worker"
         std::fs::write(repo.join("README.md"), "sandbox\n").expect("write readme");
         run(repo, "git", &["add", "README.md"]);
         run(repo, "git", &["commit", "-m", "initial"]);
-        run(repo, "bd", &["init", "--non-interactive", "-p", "sandbox"]);
     }
 
     fn create_sandbox_bead(repo: &Path) {
@@ -882,6 +1019,37 @@ dispatch_id = "fake-worker"
                 r#"{"tier_floor":"junior","complexity":"S","verify_cmd":"test -f worker.txt"}"#,
             ],
         );
+    }
+
+    fn sandbox_issue() -> Issue {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("tier_floor".to_string(), json!("junior"));
+        metadata.insert("complexity".to_string(), json!("S"));
+        metadata.insert("verify_cmd".to_string(), json!("test -f worker.txt"));
+        Issue {
+            id: "sandbox-1".to_string(),
+            title: "Synthetic sandbox bead".to_string(),
+            description: "sandbox description".to_string(),
+            acceptance_criteria: "worker.txt exists".to_string(),
+            notes: "tier_floor: junior · complexity: S · verify_type: file".to_string(),
+            status: "open".to_string(),
+            priority: 1,
+            issue_type: "task".to_string(),
+            assignee: None,
+            owner: "test".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            created_by: "test".to_string(),
+            updated_at: "2026-07-02T00:00:00Z".to_string(),
+            started_at: None,
+            labels: None,
+            estimated_minutes: None,
+            metadata: Some(metadata),
+            parent: None,
+            dependencies: None,
+            dependency_count: None,
+            dependent_count: None,
+            comment_count: None,
+        }
     }
 
     fn run(cwd: &Path, program: &str, args: &[&str]) {
@@ -1049,6 +1217,109 @@ dispatch_id = "fake-worker"
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum BdEvent {
+        Claim { id: String },
+        Release { id: String },
+        Close { id: String, reason: String },
+        Comment { id: String, text: String },
+    }
+
+    struct RecordingBdClient {
+        issue: RefCell<Issue>,
+        events: RefCell<Vec<BdEvent>>,
+    }
+
+    impl RecordingBdClient {
+        fn new(issue: Issue) -> Self {
+            Self {
+                issue: RefCell::new(issue),
+                events: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn close_count(&self) -> usize {
+            self.events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, BdEvent::Close { .. }))
+                .count()
+        }
+    }
+
+    impl BdClient for RecordingBdClient {
+        fn ready(&self, _repo: &Path) -> crate::bd::Result<Vec<Issue>> {
+            Err(BdError::new("ready not implemented in fake"))
+        }
+
+        fn show(&self, _repo: &Path, _id: &str) -> crate::bd::Result<Issue> {
+            Ok(self.issue.borrow().clone())
+        }
+
+        fn count(&self, _repo: &Path) -> crate::bd::Result<u64> {
+            Err(BdError::new("count not implemented in fake"))
+        }
+
+        fn blocked(&self, _repo: &Path) -> crate::bd::Result<Vec<Issue>> {
+            Err(BdError::new("blocked not implemented in fake"))
+        }
+
+        fn claim(&self, _repo: &Path, id: &str, actor: &str) -> crate::bd::Result<Issue> {
+            self.events
+                .borrow_mut()
+                .push(BdEvent::Claim { id: id.to_string() });
+            let mut issue = self.issue.borrow_mut();
+            issue.status = "in_progress".to_string();
+            issue.assignee = Some(actor.to_string());
+            Ok(issue.clone())
+        }
+
+        fn release(&self, _repo: &Path, id: &str) -> crate::bd::Result<Issue> {
+            self.events
+                .borrow_mut()
+                .push(BdEvent::Release { id: id.to_string() });
+            let mut issue = self.issue.borrow_mut();
+            issue.status = "open".to_string();
+            issue.assignee = None;
+            Ok(issue.clone())
+        }
+
+        fn close(&self, _repo: &Path, id: &str, reason: &str) -> crate::bd::Result<Issue> {
+            self.events.borrow_mut().push(BdEvent::Close {
+                id: id.to_string(),
+                reason: reason.to_string(),
+            });
+            let mut issue = self.issue.borrow_mut();
+            issue.status = "closed".to_string();
+            Ok(issue.clone())
+        }
+
+        fn comment(&self, _repo: &Path, id: &str, text: &str) -> crate::bd::Result<Comment> {
+            self.events.borrow_mut().push(BdEvent::Comment {
+                id: id.to_string(),
+                text: text.to_string(),
+            });
+            Ok(Comment {
+                id: "comment-1".to_string(),
+                issue_id: id.to_string(),
+                text: text.to_string(),
+                author: "conductor".to_string(),
+                created_at: "2026-07-02T00:00:00Z".to_string(),
+                schema_version: Some(1),
+            })
+        }
+
+        fn set_metadata(
+            &self,
+            _repo: &Path,
+            _id: &str,
+            _key: &str,
+            _value: &str,
+        ) -> crate::bd::Result<Issue> {
+            Err(BdError::new("set_metadata not implemented in fake"))
+        }
+    }
+
     struct SandboxExec {
         spawns: RefCell<Vec<SpawnRequest>>,
     }
@@ -1068,6 +1339,12 @@ dispatch_id = "fake-worker"
     impl Exec for SandboxExec {
         fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
             self.spawns.borrow_mut().push(request.clone());
+            if request.argv.iter().any(|arg| arg == "senior-reviewer") {
+                std::fs::write(&request.stdout_path, br#"{"verdict":"ship","findings":[]}"#)
+                    .expect("write review stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write review stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(0))));
+            }
             if request.argv.first().map(String::as_str) == Some("pi") {
                 std::fs::write(&request.stdout_path, b"worker ran\n").expect("write worker stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write worker stderr");

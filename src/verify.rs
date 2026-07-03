@@ -7,8 +7,10 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::bd::BdClient;
-use crate::config::VerifyConfig;
+use crate::config::{Efficiency, ReviewConfig, RosterEntry, Tier, VerifyConfig};
 use crate::dispatch::{
     CommitProbe, DispatchFailure, DispatchStatus, Exec, ProcessStatus, SpawnRequest, StdinMode,
 };
@@ -62,11 +64,28 @@ pub(crate) struct VerifyRequest {
     pub(crate) before_head: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewSettings {
+    pub(crate) config: ReviewConfig,
+    pub(crate) roster: Vec<RosterEntry>,
+    pub(crate) dispatched_model: RosterEntry,
+    pub(crate) item_tier_floor: Tier,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewRecord {
+    pub(crate) model: String,
+    pub(crate) verify_passed: bool,
+    pub(crate) summary: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifyOutcome {
     pub(crate) decision: VerifyDecision,
     pub(crate) verify_passed: bool,
     pub(crate) summary: String,
+    pub(crate) review_dispatches: u64,
+    pub(crate) review: Option<ReviewRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +101,24 @@ pub(crate) fn run<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Size
     commits: &C,
     request: &VerifyRequest,
 ) -> Result<VerifyOutcome> {
-    run_with_backoff(bd, exec, commits, request, ORCHESTRA_RETRY_BACKOFF)
+    run_with_optional_review_backoff(bd, exec, commits, request, None, ORCHESTRA_RETRY_BACKOFF)
+}
+
+pub(crate) fn run_with_review<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Sized>(
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    request: &VerifyRequest,
+    review: &ReviewSettings,
+) -> Result<VerifyOutcome> {
+    run_with_optional_review_backoff(
+        bd,
+        exec,
+        commits,
+        request,
+        Some(review),
+        ORCHESTRA_RETRY_BACKOFF,
+    )
 }
 
 fn run_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Sized>(
@@ -90,6 +126,32 @@ fn run_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Si
     exec: &E,
     commits: &C,
     request: &VerifyRequest,
+    retry_backoff: Duration,
+) -> Result<VerifyOutcome> {
+    run_with_optional_review_backoff(bd, exec, commits, request, None, retry_backoff)
+}
+
+fn run_with_review_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Sized>(
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    request: &VerifyRequest,
+    review: &ReviewSettings,
+    retry_backoff: Duration,
+) -> Result<VerifyOutcome> {
+    run_with_optional_review_backoff(bd, exec, commits, request, Some(review), retry_backoff)
+}
+
+fn run_with_optional_review_backoff<
+    B: BdClient + ?Sized,
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+>(
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    request: &VerifyRequest,
+    review: Option<&ReviewSettings>,
     retry_backoff: Duration,
 ) -> Result<VerifyOutcome> {
     if let Some(summary) = worker_failure_summary(&request.worker_status) {
@@ -121,7 +183,7 @@ fn run_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Si
 
     if should_run_orchestra(request) {
         match run_orchestra_with_retry(exec, request, retry_backoff)? {
-            OrchestraDecision::Passed => pass(bd, request),
+            OrchestraDecision::Passed => review_or_pass(bd, exec, request, review),
             OrchestraDecision::Failed(summary) => {
                 fail(bd, request, VerifyDecision::Failed, summary)
             }
@@ -130,7 +192,7 @@ fn run_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Si
             }
         }
     } else {
-        pass(bd, request)
+        review_or_pass(bd, exec, request, review)
     }
 }
 
@@ -179,6 +241,15 @@ fn adversarial_metadata(issue: &crate::bd::Issue) -> bool {
 }
 
 fn pass<B: BdClient + ?Sized>(bd: &B, request: &VerifyRequest) -> Result<VerifyOutcome> {
+    pass_with_review(bd, request, 0, None)
+}
+
+fn pass_with_review<B: BdClient + ?Sized>(
+    bd: &B,
+    request: &VerifyRequest,
+    review_dispatches: u64,
+    review: Option<ReviewRecord>,
+) -> Result<VerifyOutcome> {
     let reason = format!(
         "conductor {}: verified via {}",
         request.cycle_id, request.verify_cmd
@@ -188,6 +259,8 @@ fn pass<B: BdClient + ?Sized>(bd: &B, request: &VerifyRequest) -> Result<VerifyO
         decision: VerifyDecision::Passed,
         verify_passed: true,
         summary: reason,
+        review_dispatches,
+        review,
     })
 }
 
@@ -196,6 +269,17 @@ fn fail<B: BdClient + ?Sized>(
     request: &VerifyRequest,
     decision: VerifyDecision,
     summary: String,
+) -> Result<VerifyOutcome> {
+    fail_with_review(bd, request, decision, summary, 0, None)
+}
+
+fn fail_with_review<B: BdClient + ?Sized>(
+    bd: &B,
+    request: &VerifyRequest,
+    decision: VerifyDecision,
+    summary: String,
+    review_dispatches: u64,
+    review: Option<ReviewRecord>,
 ) -> Result<VerifyOutcome> {
     bd.release(&request.repo, &request.issue.id)?;
     let comment = format!(
@@ -207,21 +291,26 @@ fn fail<B: BdClient + ?Sized>(
         decision,
         verify_passed: false,
         summary,
+        review_dispatches,
+        review,
     })
 }
 
 #[derive(Debug, Clone)]
 struct CommandRun {
     status: ProcessStatus,
+    stdout_path: PathBuf,
     stderr_path: PathBuf,
 }
 
 fn run_spawn<E: Exec + ?Sized>(exec: &E, spawn: &SpawnRequest) -> Result<CommandRun> {
+    let stdout_path = spawn.stdout_path.clone();
     let stderr_path = spawn.stderr_path.clone();
     let mut child = exec.spawn(spawn)?;
     let status = child.wait()?;
     Ok(CommandRun {
         status,
+        stdout_path,
         stderr_path,
     })
 }
@@ -260,6 +349,23 @@ fn orchestra_spawn(request: &VerifyRequest, suffix: &str) -> Result<SpawnRequest
     )
 }
 
+fn review_spawn(
+    request: &VerifyRequest,
+    reviewer: &RosterEntry,
+    prompt: &str,
+) -> Result<SpawnRequest> {
+    spawn_request(
+        request,
+        "review",
+        crate::dispatch::argv_for_backend(
+            reviewer.backend,
+            &reviewer.dispatch_id,
+            prompt,
+            &request.repo,
+        ),
+    )
+}
+
 fn spawn_request(request: &VerifyRequest, suffix: &str, argv: Vec<String>) -> Result<SpawnRequest> {
     let log_dir = request.state_dir.join("logs").join(&request.cycle_id);
     fs::create_dir_all(&log_dir).map_err(|e| {
@@ -285,6 +391,298 @@ fn touch(path: &Path) -> Result<()> {
     File::create(path)
         .map(|_| ())
         .map_err(|e| VerifyError::new(format!("failed to create log {}: {e}", path.display())))
+}
+
+enum ReviewDecision {
+    NotNeeded,
+    Ship(ReviewRecord),
+    Revise {
+        record: ReviewRecord,
+        findings: Vec<String>,
+    },
+    Failed {
+        dispatches: u64,
+        record: Option<ReviewRecord>,
+        summary: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewVerdict {
+    verdict: ReviewVerdictKind,
+    findings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReviewVerdictKind {
+    Ship,
+    Revise,
+}
+
+fn review_or_pass<B: BdClient + ?Sized, E: Exec + ?Sized>(
+    bd: &B,
+    exec: &E,
+    request: &VerifyRequest,
+    review: Option<&ReviewSettings>,
+) -> Result<VerifyOutcome> {
+    let Some(settings) = review else {
+        return pass(bd, request);
+    };
+
+    match run_review(exec, request, settings)? {
+        ReviewDecision::NotNeeded => pass(bd, request),
+        ReviewDecision::Ship(record) => pass_with_review(bd, request, 1, Some(record)),
+        ReviewDecision::Revise { record, findings } => {
+            review_revise(bd, request, record, &findings)
+        }
+        ReviewDecision::Failed {
+            dispatches,
+            record,
+            summary,
+        } => fail_with_review(
+            bd,
+            request,
+            VerifyDecision::Failed,
+            summary,
+            dispatches,
+            record,
+        ),
+    }
+}
+
+fn review_revise<B: BdClient + ?Sized>(
+    bd: &B,
+    request: &VerifyRequest,
+    record: ReviewRecord,
+    findings: &[String],
+) -> Result<VerifyOutcome> {
+    bd.release(&request.repo, &request.issue.id)?;
+    let summary = review_findings_summary(findings);
+    let comment = format!(
+        "conductor: {} {} qualitative review requested revisions:\n{}",
+        request.cycle_id,
+        request.issue.id,
+        review_findings_bullets(findings)
+    );
+    bd.comment(&request.repo, &request.issue.id, &comment)?;
+    Ok(VerifyOutcome {
+        decision: VerifyDecision::Failed,
+        verify_passed: false,
+        summary,
+        review_dispatches: 1,
+        review: Some(record),
+    })
+}
+
+fn run_review<E: Exec + ?Sized>(
+    exec: &E,
+    request: &VerifyRequest,
+    settings: &ReviewSettings,
+) -> Result<ReviewDecision> {
+    let reviewer = match reviewer_for(settings) {
+        ReviewerSelection::NotNeeded => return Ok(ReviewDecision::NotNeeded),
+        ReviewerSelection::Reviewer(reviewer) => reviewer,
+        ReviewerSelection::MissingReviewer(floor) => {
+            return Ok(ReviewDecision::Failed {
+                dispatches: 0,
+                record: None,
+                summary: format!(
+                    "qualitative review required but no {floor:?}-or-higher reviewer is rostered"
+                ),
+            });
+        }
+    };
+    let prompt = review_prompt(request, settings, reviewer);
+    let run = run_spawn(exec, &review_spawn(request, reviewer, &prompt)?)?;
+    if !run.status.success() {
+        let summary = format!(
+            "qualitative review failed with {}: {}",
+            status_summary(run.status),
+            summarize_file(&run.stderr_path)
+        );
+        return Ok(ReviewDecision::Failed {
+            dispatches: 1,
+            record: Some(review_record(reviewer, false, &summary)),
+            summary,
+        });
+    }
+
+    let verdict = match parse_review_verdict(&run.stdout_path) {
+        Ok(verdict) => verdict,
+        Err(summary) => {
+            return Ok(ReviewDecision::Failed {
+                dispatches: 1,
+                record: Some(review_record(reviewer, false, &summary)),
+                summary,
+            });
+        }
+    };
+    match verdict.verdict {
+        ReviewVerdictKind::Ship => {
+            let summary = "qualitative review verdict: ship".to_string();
+            Ok(ReviewDecision::Ship(review_record(
+                reviewer, true, &summary,
+            )))
+        }
+        ReviewVerdictKind::Revise => {
+            let summary = review_findings_summary(&verdict.findings);
+            Ok(ReviewDecision::Revise {
+                record: review_record(reviewer, false, &summary),
+                findings: verdict.findings,
+            })
+        }
+    }
+}
+
+enum ReviewerSelection<'a> {
+    NotNeeded,
+    Reviewer(&'a RosterEntry),
+    MissingReviewer(Tier),
+}
+
+fn reviewer_for(settings: &ReviewSettings) -> ReviewerSelection<'_> {
+    if !settings.config.enabled {
+        return ReviewerSelection::NotNeeded;
+    }
+    let review_ceiling = review_ceiling(settings.item_tier_floor);
+    let gap = tier_rank(review_ceiling).saturating_sub(tier_rank(settings.dispatched_model.tier));
+    if gap == 0 || u32::from(gap) < settings.config.min_tier_gap {
+        return ReviewerSelection::NotNeeded;
+    }
+    select_reviewer(&settings.roster, review_ceiling).map_or(
+        ReviewerSelection::MissingReviewer(review_ceiling),
+        ReviewerSelection::Reviewer,
+    )
+}
+
+fn review_ceiling(tier_floor: Tier) -> Tier {
+    match tier_floor {
+        Tier::Junior => Tier::Senior,
+        Tier::Senior | Tier::Lead => Tier::Lead,
+    }
+}
+
+fn select_reviewer(roster: &[RosterEntry], floor: Tier) -> Option<&RosterEntry> {
+    let mut qualifying: Vec<(usize, &RosterEntry)> = roster
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| tier_rank(entry.tier) >= tier_rank(floor))
+        .collect();
+    if qualifying.is_empty() {
+        return None;
+    }
+    let min_tier = qualifying
+        .iter()
+        .map(|(_, entry)| tier_rank(entry.tier))
+        .min()?;
+    qualifying.retain(|(_, entry)| tier_rank(entry.tier) == min_tier);
+    let min_efficiency = qualifying
+        .iter()
+        .map(|(_, entry)| efficiency_rank(entry.efficiency))
+        .min()?;
+    qualifying.retain(|(_, entry)| efficiency_rank(entry.efficiency) == min_efficiency);
+    qualifying.sort_by_key(|(index, _)| *index);
+    qualifying.first().map(|(_, entry)| *entry)
+}
+
+fn tier_rank(tier: Tier) -> u8 {
+    match tier {
+        Tier::Junior => 0,
+        Tier::Senior => 1,
+        Tier::Lead => 2,
+    }
+}
+
+fn efficiency_rank(efficiency: Efficiency) -> u8 {
+    match efficiency {
+        Efficiency::Lean => 0,
+        Efficiency::Std => 1,
+        Efficiency::Heavy => 2,
+    }
+}
+
+fn review_prompt(
+    request: &VerifyRequest,
+    settings: &ReviewSettings,
+    reviewer: &RosterEntry,
+) -> String {
+    format!(
+        "READ-ONLY qualitative review for Conductor.\n\
+         Reviewer model: {}\n\
+         Worker model: {}\n\
+         Repo: {}\n\
+         Bead: {} — {}\n\
+         Description:\n{}\n\n\
+         Acceptance criteria:\n{}\n\n\
+         Notes:\n{}\n\n\
+         Mechanical verify passed with: {}\n\n\
+         Do not edit files, run bd mutations, claim, close, commit, push, or change state.\n\
+         Return ONLY compact JSON with this exact schema: \
+         {{\"verdict\":\"ship\"|\"revise\",\"findings\":[\"...\"]}}.\n\
+         Use verdict=ship only if the work is ready to close; otherwise verdict=revise with actionable findings.",
+        reviewer.name,
+        settings.dispatched_model.name,
+        request.repo.display(),
+        request.issue.id,
+        request.issue.title,
+        request.issue.description,
+        request.issue.acceptance_criteria,
+        request.issue.notes,
+        request.verify_cmd
+    )
+}
+
+fn parse_review_verdict(path: &Path) -> std::result::Result<ReviewVerdict, String> {
+    let stdout = fs::read_to_string(path).map_err(|e| {
+        format!(
+            "failed to read qualitative review stdout {}: {e}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&stdout).map_err(|e| {
+        format!(
+            "invalid qualitative review verdict JSON in {}: {e}",
+            path.display()
+        )
+    })
+}
+
+fn review_record(reviewer: &RosterEntry, verify_passed: bool, summary: &str) -> ReviewRecord {
+    ReviewRecord {
+        model: reviewer.name.clone(),
+        verify_passed,
+        summary: summary.to_string(),
+    }
+}
+
+fn review_findings_summary(findings: &[String]) -> String {
+    if findings.is_empty() {
+        "qualitative review requested revisions".to_string()
+    } else {
+        format!(
+            "qualitative review requested revisions: {}",
+            findings.join("; ")
+        )
+    }
+}
+
+fn review_findings_bullets(findings: &[String]) -> String {
+    if findings.is_empty() {
+        return "- <no findings supplied>".to_string();
+    }
+    findings
+        .iter()
+        .map(|finding| format!("- {finding}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_file(path: &Path) -> String {
+    fs::read_to_string(path).map_or_else(
+        |e| format!("failed to read {}: {e}", path.display()),
+        |content| summarize_stderr(&content),
+    )
 }
 
 enum OrchestraDecision {
@@ -385,7 +783,9 @@ fn summarize_stderr(stderr: &str) -> String {
 mod tests {
     use super::*;
     use crate::bd::{BdClient, BdError, Comment, Issue};
-    use crate::config::VerifyConfig;
+    use crate::config::{
+        Backend, Ceiling, Efficiency, ReviewConfig, RosterEntry, Tier, VerifyConfig,
+    };
     use crate::dispatch::{
         ChildProcess, CommitProbe, DispatchFailure, DispatchStatus, Exec, ProcessStatus,
         SpawnRequest, StdinMode,
@@ -566,6 +966,161 @@ mod tests {
             2,
             "orchestra must run for adversarial beads"
         );
+    }
+
+    #[test]
+    fn review_triggers_only_when_dispatched_tier_is_below_review_ceiling() {
+        let temp = TempDir::new("review-trigger-threshold");
+        let review_request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let roster = review_roster();
+        let bd = FakeBdClient::new(&review_request.issue);
+        let exec = FakeExec::new(vec![
+            Process::exit(0, "verify ok\n", ""),
+            Process::exit(0, r#"{"verdict":"ship","findings":[]}"#, ""),
+        ]);
+        let commits = FakeCommits::new([Some("after")]);
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster: roster.clone(),
+            dispatched_model: roster[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let outcome = run_with_review_backoff(
+            &bd,
+            &exec,
+            &commits,
+            &review_request,
+            &settings,
+            Duration::ZERO,
+        )
+        .expect("reviewed verify pipeline passes");
+
+        assert_eq!(outcome.decision, VerifyDecision::Passed);
+        assert_eq!(outcome.review_dispatches, 1);
+        let spawns = exec.spawns();
+        assert_eq!(spawns.len(), 2);
+        assert_eq!(spawns[1].argv[0], "pi");
+        assert!(spawns[1].argv.contains(&"senior-reviewer".to_string()));
+        assert_eq!(bd.close_count(), 1);
+
+        let no_review_temp = TempDir::new("review-no-threshold");
+        let no_review_request = request(
+            no_review_temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let no_review_bd = FakeBdClient::new(&no_review_request.issue);
+        let no_review_exec = FakeExec::new(vec![Process::exit(0, "verify ok\n", "")]);
+        let no_review_commits = FakeCommits::new([Some("after")]);
+        let no_review_settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster: roster.clone(),
+            dispatched_model: roster[1].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let no_review_outcome = run_with_review_backoff(
+            &no_review_bd,
+            &no_review_exec,
+            &no_review_commits,
+            &no_review_request,
+            &no_review_settings,
+            Duration::ZERO,
+        )
+        .expect("verify pipeline without review passes");
+
+        assert_eq!(no_review_outcome.decision, VerifyDecision::Passed);
+        assert_eq!(no_review_outcome.review_dispatches, 0);
+        assert_eq!(no_review_exec.spawns().len(), 1);
+        assert_eq!(no_review_bd.close_count(), 1);
+    }
+
+    #[test]
+    fn review_revise_holds_bead_comments_findings_and_releases_claim() {
+        let temp = TempDir::new("review-revise");
+        let request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let roster = review_roster();
+        let bd = FakeBdClient::new(&request.issue);
+        let exec = FakeExec::new(vec![
+            Process::exit(0, "verify ok\n", ""),
+            Process::exit(
+                0,
+                r#"{"verdict":"revise","findings":["missing edge-case test","scope drift"]}"#,
+                "",
+            ),
+        ]);
+        let commits = FakeCommits::new([Some("after")]);
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster,
+            dispatched_model: review_roster()[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let outcome =
+            run_with_review_backoff(&bd, &exec, &commits, &request, &settings, Duration::ZERO)
+                .expect("review revise is a normal verify outcome");
+
+        assert_eq!(outcome.decision, VerifyDecision::Failed);
+        assert!(!outcome.verify_passed);
+        assert_eq!(outcome.review_dispatches, 1);
+        assert_eq!(bd.close_count(), 0);
+        assert_release_then_comment_contains(&bd.events(), &request.repo, "missing edge-case test");
+        assert_release_then_comment_contains(&bd.events(), &request.repo, "scope drift");
+    }
+
+    #[test]
+    fn review_config_flag_disables_review_and_closes_after_mechanical_verify() {
+        let temp = TempDir::new("review-disabled");
+        let request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let roster = review_roster();
+        let bd = FakeBdClient::new(&request.issue);
+        let exec = FakeExec::new(vec![Process::exit(0, "verify ok\n", "")]);
+        let commits = FakeCommits::new([Some("after")]);
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: false,
+                min_tier_gap: 1,
+            },
+            roster,
+            dispatched_model: review_roster()[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let outcome =
+            run_with_review_backoff(&bd, &exec, &commits, &request, &settings, Duration::ZERO)
+                .expect("verify pipeline passes without review when disabled");
+
+        assert_eq!(outcome.decision, VerifyDecision::Passed);
+        assert_eq!(outcome.review_dispatches, 0);
+        assert_eq!(exec.spawns().len(), 1);
+        assert_eq!(bd.close_count(), 1);
     }
 
     #[test]
@@ -780,6 +1335,53 @@ mod tests {
         VerifyConfig {
             judge: "opencode-go/qwen3.7-max".to_string(),
             always_orchestra,
+        }
+    }
+
+    fn review_roster() -> Vec<RosterEntry> {
+        vec![
+            roster_entry(
+                "junior-worker",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Agy,
+                "junior-worker",
+            ),
+            roster_entry(
+                "senior-reviewer",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Pi,
+                "senior-reviewer",
+            ),
+            roster_entry(
+                "lead-reviewer",
+                Tier::Lead,
+                Ceiling::L,
+                Efficiency::Std,
+                Backend::Claude,
+                "lead-reviewer",
+            ),
+        ]
+    }
+
+    fn roster_entry(
+        name: &str,
+        tier: Tier,
+        ceiling: Ceiling,
+        efficiency: Efficiency,
+        backend: Backend,
+        dispatch_id: &str,
+    ) -> RosterEntry {
+        RosterEntry {
+            name: name.to_string(),
+            tier,
+            ceiling,
+            efficiency,
+            backend,
+            dispatch_id: dispatch_id.to_string(),
         }
     }
 
