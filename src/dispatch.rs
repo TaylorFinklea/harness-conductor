@@ -23,7 +23,7 @@ pub(crate) struct DispatchError {
 }
 
 impl DispatchError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -146,10 +146,30 @@ pub(crate) fn run<E: Exec, C: CommitProbe>(
     state_dir: &Path,
     timeout: Duration,
 ) -> Result<DispatchResult> {
+    run_with_heartbeat(exec, commits, request, state_dir, timeout, timeout, |_| {
+        Ok(())
+    })
+}
+
+pub(crate) fn run_with_heartbeat<E, C, H>(
+    exec: &E,
+    commits: &C,
+    request: &DispatchRequest,
+    state_dir: &Path,
+    timeout: Duration,
+    heartbeat_interval: Duration,
+    heartbeat: H,
+) -> Result<DispatchResult>
+where
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+    H: FnMut(Duration) -> Result<()>,
+{
     let before_head = commits.head(&request.repo)?;
     let spawn = spawn_request(request, state_dir)?;
     let mut child = exec.spawn(&spawn)?;
-    let process = wait_with_timeout(child.as_mut(), timeout)?;
+    let process =
+        wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, heartbeat)?;
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
     let status = classify(
@@ -242,12 +262,35 @@ struct ProcessRun {
     timed_out: bool,
 }
 
-fn wait_with_timeout(child: &mut dyn ChildProcess, timeout: Duration) -> Result<ProcessRun> {
-    if let Some(status) = child.wait_for(timeout)? {
-        return Ok(ProcessRun {
-            status,
-            timed_out: false,
-        });
+fn wait_with_timeout_and_heartbeat<H>(
+    child: &mut dyn ChildProcess,
+    timeout: Duration,
+    heartbeat_interval: Duration,
+    mut heartbeat: H,
+) -> Result<ProcessRun>
+where
+    H: FnMut(Duration) -> Result<()>,
+{
+    let mut elapsed = Duration::ZERO;
+    let heartbeat_interval = if heartbeat_interval.is_zero() {
+        WAIT_POLL
+    } else {
+        heartbeat_interval
+    };
+
+    loop {
+        if elapsed >= timeout {
+            break;
+        }
+        let wait = timeout.saturating_sub(elapsed).min(heartbeat_interval);
+        if let Some(status) = child.wait_for(wait)? {
+            return Ok(ProcessRun {
+                status,
+                timed_out: false,
+            });
+        }
+        elapsed = elapsed.saturating_add(wait);
+        heartbeat(elapsed)?;
     }
 
     child.terminate()?;
@@ -266,7 +309,7 @@ fn wait_with_timeout(child: &mut dyn ChildProcess, timeout: Duration) -> Result<
     })
 }
 
-fn classify<C: CommitProbe>(
+fn classify<C: CommitProbe + ?Sized>(
     process: ProcessRun,
     stdout_bytes: u64,
     before_head: Option<&str>,

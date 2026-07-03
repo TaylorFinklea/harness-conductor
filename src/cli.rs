@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status] [cycle --dry-run [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -20,6 +20,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         }
         Some("config") => run_config(&mut it),
         Some("cycle") => run_cycle(&mut it),
+        Some("dispatch") => run_dispatch(&mut it),
         Some("roster") => run_roster(&mut it),
         Some("scan") => run_scan(&mut it),
         Some("status") => run_status(&mut it),
@@ -100,6 +101,41 @@ fn home_state_dir() -> Option<PathBuf> {
             .join(".local")
             .join("state")
             .join("conductor"),
+    )
+}
+
+fn reports_home() -> PathBuf {
+    std::env::var("CONDUCTOR_REPORTS_HOME").map_or_else(
+        |_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home)
+        },
+        PathBuf::from,
+    )
+}
+
+fn state_dir() -> PathBuf {
+    std::env::var("CONDUCTOR_STATE_DIR").map_or_else(
+        |_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("conductor")
+        },
+        PathBuf::from,
+    )
+}
+
+fn ledger_path() -> PathBuf {
+    std::env::var("CONDUCTOR_LEDGER_PATH").map_or_else(
+        |_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home)
+                .join(".claude")
+                .join("model-bench.jsonl")
+        },
+        PathBuf::from,
     )
 }
 
@@ -346,12 +382,29 @@ fn run_status(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             println!("completed:  {ts}");
         }
         if let Some(summary) = last_cycle.get("summary").and_then(|v| v.as_object()) {
-            let scanned = summary.get("scanned").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            let ready = summary.get("ready").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            let dispatched = summary.get("dispatched").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            let verified = summary.get("verified").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            let flagged = summary.get("flagged").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            println!("summary:    scanned={scanned} ready={ready} dispatched={dispatched} verified={verified} flagged={flagged}");
+            let scanned = summary
+                .get("scanned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let ready = summary
+                .get("ready")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let dispatched = summary
+                .get("dispatched")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let verified = summary
+                .get("verified")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let flagged = summary
+                .get("flagged")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            println!(
+                "summary:    scanned={scanned} ready={ready} dispatched={dispatched} verified={verified} flagged={flagged}"
+            );
         }
     } else {
         println!("no cycles recorded yet");
@@ -395,24 +448,8 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         }
     };
 
-    let reports_home = std::env::var("CONDUCTOR_REPORTS_HOME").map_or_else(
-        |_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home)
-        },
-        PathBuf::from,
-    );
-
-    let state_dir = std::env::var("CONDUCTOR_STATE_DIR").map_or_else(
-        |_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("conductor")
-        },
-        PathBuf::from,
-    );
+    let reports_home = reports_home();
+    let state_dir = state_dir();
 
     let client = crate::bd::CommandBdClient::new();
     match crate::cycle::run_dry_run(&cfg, &client, &reports_home, &state_dir) {
@@ -423,6 +460,81 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         }
         Err(e) => {
             eprintln!("cycle: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let Some(cycle_id) = it.next() else {
+        eprintln!("usage: conductor dispatch <cycle-id> [--config <path>]");
+        return ExitCode::from(2);
+    };
+    let mut config_path = PathBuf::from("conductor.toml");
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => {
+                let Some(p) = it.next() else {
+                    eprintln!("--config requires a path argument");
+                    return ExitCode::from(2);
+                };
+                config_path = PathBuf::from(p);
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let cfg = match config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config: invalid — {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let bd = crate::bd::CommandBdClient::new();
+    let exec = crate::dispatch::CommandExec;
+    let commits = crate::dispatch::GitCommitProbe;
+    let live = crate::dispatch_cycle::DeckLiveSink;
+    let options = crate::dispatch_cycle::DispatchCycleOptions::from_config(&cfg);
+    match crate::dispatch_cycle::run_dispatch_cycle(
+        &cfg,
+        &bd,
+        &exec,
+        &commits,
+        &reports_home(),
+        &state_dir(),
+        &ledger_path(),
+        &cycle_id,
+        &options,
+        &live,
+    ) {
+        Ok(result) => match result.gate {
+            crate::dispatch_cycle::ApprovalGate::Approved => {
+                println!(
+                    "dispatch {cycle_id}: ran {} item(s), verified {}, failed {}",
+                    result.dispatched, result.verified, result.failed
+                );
+                if result.failed == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+            crate::dispatch_cycle::ApprovalGate::ChangesRequested => {
+                println!("dispatch {cycle_id}: changes requested; cycle closed");
+                ExitCode::SUCCESS
+            }
+        },
+        Err(e) if e.is_not_answered() => {
+            eprintln!("dispatch {cycle_id}: {e}");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("dispatch {cycle_id}: {e}");
             ExitCode::from(1)
         }
     }
@@ -439,7 +551,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_snapshot(name: &str, ready_count: usize, skip: Option<SkipReason>) -> RepoSnapshot {
-        let is_beads_repo = skip != Some(SkipReason::NotBeadsRepo) && skip != Some(SkipReason::Excluded);
+        let is_beads_repo =
+            skip != Some(SkipReason::NotBeadsRepo) && skip != Some(SkipReason::Excluded);
         let zero_state = if ready_count == 0 && skip.is_none() {
             ZeroState::Drained
         } else {

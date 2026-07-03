@@ -6,6 +6,7 @@ mod config;
 mod cycle;
 mod deck;
 mod dispatch;
+mod dispatch_cycle;
 mod fields;
 mod ledger;
 mod plan;

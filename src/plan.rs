@@ -5,12 +5,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::triage::{Flag, Plan, SkipCode};
 
 /// Serializable cycle plan written to the state dir.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CyclePlan {
     pub(crate) cycle_id: String,
     pub(crate) created_at: String,
@@ -20,7 +20,7 @@ pub(crate) struct CyclePlan {
     pub(crate) skips: Vec<SkipEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DispatchEntry {
     pub(crate) repo: String,
     pub(crate) issue_id: String,
@@ -28,14 +28,14 @@ pub(crate) struct DispatchEntry {
     pub(crate) verify_cmd: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProposalEntry {
     pub(crate) repo: String,
     pub(crate) issue_id: String,
     pub(crate) model: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FlagEntry {
     pub(crate) kind: String,
     pub(crate) repo: String,
@@ -43,7 +43,7 @@ pub(crate) struct FlagEntry {
     pub(crate) detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SkipEntry {
     pub(crate) repo: String,
     pub(crate) issue_id: String,
@@ -97,10 +97,17 @@ impl CyclePlan {
         let plans_dir = state_dir.join("plans");
         std::fs::create_dir_all(&plans_dir)?;
         let path = plans_dir.join(format!("{}.json", self.cycle_id));
-        let json = serde_json::to_vec_pretty(self)
-            .map_err(io::Error::other)?;
+        let mut json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        json.push(b'\n');
         std::fs::write(&path, json)?;
         Ok(path)
+    }
+
+    /// Loads `<state_dir>/plans/<cycle-id>.json`.
+    pub(crate) fn load(state_dir: &Path, cycle_id: &str) -> io::Result<Self> {
+        let path = state_dir.join("plans").join(format!("{cycle_id}.json"));
+        let bytes = std::fs::read(path)?;
+        serde_json::from_slice(&bytes).map_err(io::Error::other)
     }
 }
 

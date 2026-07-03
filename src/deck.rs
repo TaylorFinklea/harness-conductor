@@ -469,14 +469,24 @@ pub(crate) fn read_responses(run_dir: &Path) -> Result<Responses> {
     })
 }
 
-/// Writes a conductor report to `~/.harness/reports/conductor/<run-id>/report.json` under `home`.
-pub(crate) fn write_report(home: &Path, report: &Report) -> Result<PathBuf> {
-    validate_run_id(report.id())?;
-    let run_dir = home
+/// Returns `~/.harness/reports/conductor/<run-id>` under `home`.
+pub(crate) fn report_run_dir(home: &Path, run_id: &str) -> Result<PathBuf> {
+    validate_run_id(run_id)?;
+    Ok(home
         .join(".harness")
         .join("reports")
         .join(PROJECT)
-        .join(report.id());
+        .join(run_id))
+}
+
+/// Returns `~/.harness/reports/conductor/<run-id>/report.json` under `home`.
+pub(crate) fn report_path(home: &Path, run_id: &str) -> Result<PathBuf> {
+    Ok(report_run_dir(home, run_id)?.join("report.json"))
+}
+
+/// Writes a conductor report to `~/.harness/reports/conductor/<run-id>/report.json` under `home`.
+pub(crate) fn write_report(home: &Path, report: &Report) -> Result<PathBuf> {
+    let run_dir = report_run_dir(home, report.id())?;
     fs::create_dir_all(&run_dir).map_err(|e| DeckError::io("failed to create", &run_dir, &e))?;
     let report_path = run_dir.join("report.json");
     let mut bytes = serde_json::to_vec_pretty(report)
@@ -484,6 +494,26 @@ pub(crate) fn write_report(home: &Path, report: &Report) -> Result<PathBuf> {
     bytes.push(b'\n');
     atomic_write_bytes(&report_path, &bytes)?;
     Ok(report_path)
+}
+
+/// Patches the manifest status, preserving unmodeled JSON fields elsewhere.
+pub(crate) fn patch_status(report_path: &Path, status: ReportStatus) -> Result<()> {
+    let bytes =
+        fs::read(report_path).map_err(|e| DeckError::io("failed to read", report_path, &e))?;
+    let mut manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| DeckError::json("failed to parse report", &e))?;
+    let Some(root) = manifest.as_object_mut() else {
+        return Err(DeckError::new("report manifest must be a JSON object"));
+    };
+    root.insert(
+        "status".to_string(),
+        serde_json::to_value(status)
+            .map_err(|e| DeckError::json("failed to serialize status", &e))?,
+    );
+    let mut output = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| DeckError::json("failed to serialize patched report", &e))?;
+    output.push(b'\n');
+    atomic_write_bytes(report_path, &output)
 }
 
 /// Patches only the manifest's `live` object, preserving unmodeled JSON fields elsewhere.
@@ -563,11 +593,7 @@ impl DeckValidator for CommandDeckValidator {
 }
 
 fn normalize_response_version(version: u64) -> u64 {
-    if version == 0 {
-        1
-    } else {
-        version
-    }
+    if version == 0 { 1 } else { version }
 }
 
 fn validate_run_id(run_id: &str) -> Result<()> {
@@ -655,7 +681,7 @@ fn temp_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
