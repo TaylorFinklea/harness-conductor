@@ -551,6 +551,9 @@ fn disqualified_profiles(judgements: &[JudgeVerdict]) -> HashMap<String, String>
 }
 
 fn average_score(profile: &str, judgements: &[JudgeVerdict]) -> Option<u32> {
+    if judgements.is_empty() {
+        return None;
+    }
     let mut total = 0u32;
     for judgement in judgements {
         total = total.checked_add(*judgement.scores_x10.get(profile)?)?;
@@ -866,10 +869,7 @@ fn render_current_state(ctx: &RunContext) -> String {
 Branch: arena/{}\n\
 \n\
 ## Plan\n\
-- [ ] {}: {}\n\
-  Verify: `{}`\n\
-  tier_floor: {}\n\
-  complexity: {}\n\
+- [ ] {}: {} — Verify: `{}` · tier_floor: {} · complexity: {}\n\
 \n\
 ## Blockers\n\
 - none\n\
@@ -1422,6 +1422,9 @@ fn extract_json_object(value: &str) -> Option<&str> {
 }
 
 fn aggregate_rank(profile: &str, judgements: &[JudgeVerdict]) -> Option<u32> {
+    if judgements.is_empty() {
+        return None;
+    }
     let mut total = 0u32;
     for judgement in judgements {
         let pos = judgement.ranking.iter().position(|p| p == profile)?;
@@ -1442,6 +1445,69 @@ fn pct(part: usize, total: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_run_context() -> RunContext {
+        RunContext {
+            repo: std::path::PathBuf::from("/repo"),
+            bead: "fixture-bead".to_string(),
+            issue: Issue {
+                id: "fixture-bead".to_string(),
+                title: "Fix candidate plan formatting".to_string(),
+                description: String::new(),
+                acceptance_criteria: String::new(),
+                notes: String::new(),
+                status: "open".to_string(),
+                priority: 1,
+                issue_type: "bug".to_string(),
+                assignee: None,
+                owner: "tester".to_string(),
+                created_at: "2026-07-04T00:00:00Z".to_string(),
+                created_by: "tester".to_string(),
+                updated_at: "2026-07-04T00:00:00Z".to_string(),
+                started_at: None,
+                labels: None,
+                estimated_minutes: None,
+                metadata: None,
+                parent: None,
+                dependencies: None,
+                dependency_count: None,
+                dependent_count: None,
+                comment_count: None,
+            },
+            run_id: "arena-fixture".to_string(),
+            base_head: "base".to_string(),
+            verify_cmd: "cargo test fixture".to_string(),
+            tier_floor: Tier::Junior,
+            complexity: Ceiling::S,
+            work_root: std::path::PathBuf::from("/tmp/work"),
+            log_dir: std::path::PathBuf::from("/tmp/work/logs"),
+        }
+    }
+
+    #[test]
+    fn arena_current_state_plan_line_is_ralph_preflight_compatible() {
+        let state = render_current_state(&fixture_run_context());
+        let unchecked_lines: Vec<&str> = state
+            .lines()
+            .filter(|line| line.starts_with("- [ ]"))
+            .collect();
+
+        assert_eq!(unchecked_lines.len(), 1, "{state}");
+        assert!(
+            unchecked_lines[0].contains("Verify:"),
+            "ralph preflight scans only the unchecked Plan line for Verify:, got:\n{state}"
+        );
+    }
+
+    #[test]
+    fn average_score_returns_none_without_judgements() {
+        assert_eq!(average_score("candidate", &[]), None);
+    }
+
+    #[test]
+    fn aggregate_rank_returns_none_without_judgements() {
+        assert_eq!(aggregate_rank("candidate", &[]), None);
+    }
 
     #[test]
     fn ralph_spawn_uses_harness_specific_model_env() {
@@ -1544,11 +1610,9 @@ mod tests {
         let missing_score_decision = decide_winner(&candidates, &missing_score, 40);
         assert!(!missing_score_decision.auto_apply);
         assert!(missing_score_decision.winner_profile.is_none());
-        assert!(
-            missing_score_decision
-                .reasons
-                .iter()
-                .any(|r| r.contains("missing complete judge scores"))
-        );
+        assert!(missing_score_decision
+            .reasons
+            .iter()
+            .any(|r| r.contains("missing complete judge scores")));
     }
 }
