@@ -1,5 +1,6 @@
 //! Conductor — fleet cycle runner: scan → triage → plan → dispatch → verify → report.
 
+mod arena;
 mod bd;
 mod cli;
 mod config;

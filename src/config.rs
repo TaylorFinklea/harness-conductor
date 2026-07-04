@@ -227,12 +227,51 @@ impl Default for ReviewConfig {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ArenaProfile {
+    pub(crate) name: String,
+    pub(crate) harness: String,
+    pub(crate) model: String,
+    pub(crate) provider_group: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ArenaJudge {
+    pub(crate) name: String,
+    pub(crate) backend: Backend,
+    pub(crate) dispatch_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ArenaConfig {
+    pub(crate) parallel: u32,
+    pub(crate) auto_apply: bool,
+    pub(crate) min_score_x10: u32,
+    pub(crate) keep_worktrees: bool,
+    pub(crate) profiles: Vec<ArenaProfile>,
+    pub(crate) judges: Vec<ArenaJudge>,
+}
+
+impl Default for ArenaConfig {
+    fn default() -> Self {
+        Self {
+            parallel: 2,
+            auto_apply: true,
+            min_score_x10: 40,
+            keep_worktrees: false,
+            profiles: Vec::new(),
+            judges: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) autonomy: Autonomy,
     pub(crate) scan: ScanConfig,
     pub(crate) budgets: Budgets,
     pub(crate) verify: VerifyConfig,
     pub(crate) review: ReviewConfig,
+    pub(crate) arena: ArenaConfig,
     pub(crate) roster: Vec<RosterEntry>,
 }
 
@@ -388,7 +427,7 @@ impl<'a> Parser<'a> {
                     return Err(ConfigError::new(format!(
                         "line {}: unexpected character {:?} (expected key or table header)",
                         self.line, c
-                    )))
+                    )));
                 }
             }
         }
@@ -484,13 +523,13 @@ impl<'a> Parser<'a> {
                     return Err(ConfigError::new(format!(
                         "line {}: expected keyword {kw:?}, found {:?}",
                         self.line, c
-                    )))
+                    )));
                 }
                 None => {
                     return Err(ConfigError::new(format!(
                         "line {}: expected keyword {kw:?}, found end of input",
                         self.line
-                    )))
+                    )));
                 }
             }
         }
@@ -506,7 +545,7 @@ impl<'a> Parser<'a> {
                     return Err(ConfigError::new(format!(
                         "line {}: unterminated string",
                         self.line
-                    )))
+                    )));
                 }
                 Some('"') => break,
                 Some('\\') => match self.bump() {
@@ -519,20 +558,20 @@ impl<'a> Parser<'a> {
                         return Err(ConfigError::new(format!(
                             "line {}: invalid escape \\{other}",
                             self.line
-                        )))
+                        )));
                     }
                     None => {
                         return Err(ConfigError::new(format!(
                             "line {}: unterminated string after escape",
                             self.line
-                        )))
+                        )));
                     }
                 },
                 Some('\n') => {
                     return Err(ConfigError::new(format!(
                         "line {}: newline in string",
                         self.line
-                    )))
+                    )));
                 }
                 Some(c) => s.push(c),
             }
@@ -577,7 +616,7 @@ impl<'a> Parser<'a> {
                     return Err(ConfigError::new(format!(
                         "line {}: unterminated array",
                         self.line
-                    )))
+                    )));
                 }
                 Some(']') => {
                     self.bump();
@@ -598,13 +637,13 @@ impl<'a> Parser<'a> {
                             return Err(ConfigError::new(format!(
                                 "line {}: expected ',' or ']' in array, found {:?}",
                                 self.line, c
-                            )))
+                            )));
                         }
                         None => {
                             return Err(ConfigError::new(format!(
                                 "line {}: unterminated array",
                                 self.line
-                            )))
+                            )));
                         }
                     }
                 }
@@ -612,7 +651,7 @@ impl<'a> Parser<'a> {
                     return Err(ConfigError::new(format!(
                         "line {}: expected string or ']' in array, found {:?}",
                         self.line, c
-                    )))
+                    )));
                 }
             }
         }
@@ -649,7 +688,15 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     for key in doc.keys() {
         if !matches!(
             key.as_str(),
-            "autonomy" | "scan" | "budgets" | "verify" | "review" | "roster"
+            "autonomy"
+                | "scan"
+                | "budgets"
+                | "verify"
+                | "review"
+                | "arena"
+                | "arena_profile"
+                | "arena_judge"
+                | "roster"
         ) {
             return Err(ConfigError::new(format!("unknown config key: {key}")));
         }
@@ -663,6 +710,11 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     let budgets = parse_budgets(doc.get("budgets"))?;
     let verify = parse_verify(doc.get("verify"))?;
     let review = parse_review(doc.get("review"))?;
+    let arena = parse_arena(
+        doc.get("arena"),
+        doc.get("arena_profile"),
+        doc.get("arena_judge"),
+    )?;
     let roster = parse_roster(doc.get("roster"))?;
     Ok(Config {
         autonomy,
@@ -670,6 +722,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         budgets,
         verify,
         review,
+        arena,
         roster,
     })
 }
@@ -755,6 +808,126 @@ fn parse_review(node: Option<&Node>) -> Result<ReviewConfig> {
     Ok(r)
 }
 
+fn parse_arena(
+    table_node: Option<&Node>,
+    profile_node: Option<&Node>,
+    judge_node: Option<&Node>,
+) -> Result<ArenaConfig> {
+    let mut arena = ArenaConfig::default();
+    if let Some(node) = table_node {
+        let Node::Table(t) = node else {
+            return Err(ConfigError::new("arena must be a table"));
+        };
+        for (key, val) in t {
+            match key.as_str() {
+                "parallel" => arena.parallel = expect_u32("arena.parallel", val)?,
+                "auto_apply" => arena.auto_apply = expect_bool("arena.auto_apply", val)?,
+                "min_score_x10" => arena.min_score_x10 = expect_u32("arena.min_score_x10", val)?,
+                "keep_worktrees" => {
+                    arena.keep_worktrees = expect_bool("arena.keep_worktrees", val)?;
+                }
+                other => return Err(ConfigError::new(format!("unknown arena key: {other}"))),
+            }
+        }
+    }
+    if arena.parallel == 0 {
+        return Err(ConfigError::new("arena.parallel must be at least 1"));
+    }
+    if !(10..=50).contains(&arena.min_score_x10) {
+        return Err(ConfigError::new(
+            "arena.min_score_x10 must be between 10 and 50",
+        ));
+    }
+
+    arena.profiles = parse_arena_profiles(profile_node)?;
+    arena.judges = parse_arena_judges(judge_node)?;
+    Ok(arena)
+}
+
+fn parse_arena_profiles(node: Option<&Node>) -> Result<Vec<ArenaProfile>> {
+    let entries = match node {
+        None => return Ok(Vec::new()),
+        Some(Node::Tables(v)) => v,
+        Some(_) => {
+            return Err(ConfigError::new(
+                "arena_profile must be an array of tables ([[arena_profile]])",
+            ));
+        }
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, t) in entries.iter().enumerate() {
+        for key in t.keys() {
+            if !matches!(
+                key.as_str(),
+                "name" | "harness" | "model" | "provider_group"
+            ) {
+                return Err(ConfigError::new(format!(
+                    "unknown arena_profile key in entry {i}: {key}"
+                )));
+            }
+        }
+        let name = get_required_str_at("arena_profile", t, i, "name")?;
+        let harness = get_required_str_at("arena_profile", t, i, "harness")?;
+        if !matches!(harness.as_str(), "claude" | "codex" | "opencode" | "pi") {
+            return Err(ConfigError::new(format!(
+                "arena_profile entry {i} unknown harness {harness:?} (expected claude|codex|opencode|pi)"
+            )));
+        }
+        let model = get_required_str_at("arena_profile", t, i, "model")?;
+        let provider_group = get_required_str_at("arena_profile", t, i, "provider_group")?;
+        if !seen.insert(name.clone()) {
+            return Err(ConfigError::new(format!(
+                "duplicate arena_profile name: {name}"
+            )));
+        }
+        out.push(ArenaProfile {
+            name,
+            harness,
+            model,
+            provider_group,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_arena_judges(node: Option<&Node>) -> Result<Vec<ArenaJudge>> {
+    let entries = match node {
+        None => return Ok(Vec::new()),
+        Some(Node::Tables(v)) => v,
+        Some(_) => {
+            return Err(ConfigError::new(
+                "arena_judge must be an array of tables ([[arena_judge]])",
+            ));
+        }
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, t) in entries.iter().enumerate() {
+        for key in t.keys() {
+            if !matches!(key.as_str(), "name" | "backend" | "dispatch_id") {
+                return Err(ConfigError::new(format!(
+                    "unknown arena_judge key in entry {i}: {key}"
+                )));
+            }
+        }
+        let name = get_required_str_at("arena_judge", t, i, "name")?;
+        let backend = get_required_str_at("arena_judge", t, i, "backend")?.parse::<Backend>()?;
+        let dispatch_id = get_required_str_at("arena_judge", t, i, "dispatch_id")?;
+        if !seen.insert(name.clone()) {
+            return Err(ConfigError::new(format!(
+                "duplicate arena_judge name: {name}"
+            )));
+        }
+        out.push(ArenaJudge {
+            name,
+            backend,
+            dispatch_id,
+        });
+    }
+    Ok(out)
+}
+
 fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
     let entries = match node {
         None => return Ok(Vec::new()),
@@ -762,7 +935,7 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
         Some(_) => {
             return Err(ConfigError::new(
                 "roster must be an array of tables ([[roster]])",
-            ))
+            ));
         }
     };
     let mut seen = HashSet::new();
@@ -800,13 +973,22 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
 }
 
 fn get_required_str(t: &HashMap<String, Node>, i: usize, key: &str) -> Result<String> {
+    get_required_str_at("roster", t, i, key)
+}
+
+fn get_required_str_at(
+    table: &str,
+    t: &HashMap<String, Node>,
+    i: usize,
+    key: &str,
+) -> Result<String> {
     match t.get(key) {
         Some(Node::Str(s)) => Ok(s.clone()),
         Some(_) => Err(ConfigError::new(format!(
-            "roster entry {i} field {key} must be a string"
+            "{table} entry {i} field {key} must be a string"
         ))),
         None => Err(ConfigError::new(format!(
-            "roster entry {i} missing required field: {key}"
+            "{table} entry {i} missing required field: {key}"
         ))),
     }
 }
@@ -846,7 +1028,18 @@ fn expect_bool(loc: &str, node: &Node) -> Result<bool> {
 // Preflight (`conductor config check`)
 // ---------------------------------------------------------------------------
 
-const PATH_TOOLS: &[&str] = &["bd", "pi", "agy", "claude", "orchestra", "bun", "harness-deck"];
+const PATH_TOOLS: &[&str] = &[
+    "bd",
+    "pi",
+    "agy",
+    "claude",
+    "codex",
+    "opencode",
+    "ralph",
+    "orchestra",
+    "bun",
+    "harness-deck",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreflightCheck {
@@ -981,10 +1174,7 @@ mod tests {
 
     fn assert_err(label: &str, src: &str) {
         let res = parse_str(src);
-        assert!(
-            res.is_err(),
-            "expected error for {label}, got Ok: {res:?}"
-        );
+        assert!(res.is_err(), "expected error for {label}, got Ok: {res:?}");
     }
 
     struct TempDir(PathBuf);
@@ -1061,6 +1251,14 @@ mod tests {
         assert!(!cfg.verify.always_orchestra);
         assert!(cfg.review.enabled);
         assert_eq!(cfg.review.min_tier_gap, 1);
+        assert_eq!(cfg.arena.parallel, 2);
+        assert!(cfg.arena.auto_apply);
+        assert_eq!(cfg.arena.min_score_x10, 40);
+        assert_eq!(cfg.arena.profiles.len(), 9);
+        assert_eq!(cfg.arena.profiles[0].name, "codex-gpt55");
+        assert_eq!(cfg.arena.profiles[8].name, "opencode-qwen37max");
+        assert_eq!(cfg.arena.judges.len(), 2);
+        assert_eq!(cfg.arena.judges[0].name, "qwen37max");
     }
 
     // --- valid configs ---
@@ -1089,6 +1287,23 @@ always_orchestra = true
 enabled = false
 min_tier_gap = 2
 
+[arena]
+parallel = 2
+auto_apply = false
+min_score_x10 = 45
+keep_worktrees = true
+
+[[arena_profile]]
+name = \"codex-gpt55\"
+harness = \"codex\"
+model = \"gpt-5.5\"
+provider_group = \"openai-codex\"
+
+[[arena_judge]]
+name = \"qwen-judge\"
+backend = \"pi\"
+dispatch_id = \"opencode-go/qwen3.7-max\"
+
 [[roster]]
 name = \"sonnet-5\"
 tier = \"lead\"
@@ -1113,6 +1328,16 @@ dispatch_id = \"claude-sonnet-5\"
         assert!(cfg.verify.always_orchestra);
         assert!(!cfg.review.enabled);
         assert_eq!(cfg.review.min_tier_gap, 2);
+        assert_eq!(cfg.arena.parallel, 2);
+        assert!(!cfg.arena.auto_apply);
+        assert_eq!(cfg.arena.min_score_x10, 45);
+        assert!(cfg.arena.keep_worktrees);
+        assert_eq!(cfg.arena.profiles.len(), 1);
+        assert_eq!(cfg.arena.profiles[0].name, "codex-gpt55");
+        assert_eq!(cfg.arena.profiles[0].harness, "codex");
+        assert_eq!(cfg.arena.profiles[0].model, "gpt-5.5");
+        assert_eq!(cfg.arena.judges.len(), 1);
+        assert_eq!(cfg.arena.judges[0].dispatch_id, "opencode-go/qwen3.7-max");
         assert_eq!(cfg.roster.len(), 1);
         assert_eq!(cfg.roster[0].tier, Tier::Lead);
     }
@@ -1132,6 +1357,12 @@ dispatch_id = \"claude-sonnet-5\"
         assert!(!cfg.verify.always_orchestra);
         assert!(cfg.review.enabled);
         assert_eq!(cfg.review.min_tier_gap, 1);
+        assert_eq!(cfg.arena.parallel, 2);
+        assert!(cfg.arena.auto_apply);
+        assert_eq!(cfg.arena.min_score_x10, 40);
+        assert!(!cfg.arena.keep_worktrees);
+        assert!(cfg.arena.profiles.is_empty());
+        assert!(cfg.arena.judges.is_empty());
         assert_eq!(cfg.roster.len(), 1);
     }
 
@@ -1295,10 +1526,7 @@ dispatch_id = \"claude-sonnet-5\"
         make_exec(&dir.path().join("pi"));
         // agy, claude, orchestra, bun, harness-deck intentionally absent
         let state = TempDir::new("present-state");
-        let checks = preflight_checks(
-            &dir.path().display().to_string(),
-            Some(state.path()),
-        );
+        let checks = preflight_checks(&dir.path().display().to_string(), Some(state.path()));
         assert!(check(&checks, "bd").ok);
         assert!(check(&checks, "pi").ok);
         assert!(!check(&checks, "agy").ok);

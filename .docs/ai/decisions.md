@@ -42,3 +42,9 @@
 2. **Bursar budget interface** (`conductor-bursar` bead) — consume `bursar status --json` before metered external dispatch; near-exhausted or "unknown" provider windows down-weight/defer (fail-closed: unknown = spend-cautiously). Retires the static-cap limitation; gives orchestra's dormant `ThrottleState`/`routeBoundary` a real data source via Bursar.
 **Alternatives considered**: bake review into the existing m4b verify pipeline (rejected — keep mechanical vs qualitative separable/testable); leave budgets static (rejected — cycle 1 showed real quota exhaustion, agy gemini-flash down ~4.6 days).
 **Rationale**: Cycle 1 was Conductor's own design run by hand; both additions crystallize what the manual Lead loop actually did. Cross-member dependency (Bursar must ship first) is noted in bead prose — bd has no cross-repo dep primitive.
+
+## [2026-07-04] Arena mode deliberately routes through Ralph
+
+**Context**: The v1 conductor dispatch path intentionally bypasses Ralph because ordinary fleet dispatch should own backend argv, budgets, and verify/close semantics directly. Arena has a different product question: compare how harnesses use the same model/prompt on the same bead.
+**Decision**: Add a separate `conductor arena run` path that creates isolated worktrees, writes byte-identical `.docs/ai/current-state.md`/`loop-prompt.md`, invokes `ralph -n 1 -t <harness>` with model env vars, judges anonymized candidate diffs, and only cherry-picks a strict winner. This does not change the normal cycle/dispatch runner.
+**Rationale**: Direct backend dispatch would measure model output while collapsing away the harness variable. Ralph is the existing cross-harness loop contract, so Arena must use it to compare Codex/Pi/OpenCode harness behavior fairly. The apply gate remains Conductor-owned: objective verify, unique safe winner, score threshold, clean worktrees, and real-repo HEAD/clean checks before cherry-pick.

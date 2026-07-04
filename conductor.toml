@@ -36,6 +36,78 @@ always_orchestra = false
 enabled = true
 min_tier_gap = 1
 
+[arena]
+# Head-to-head Ralph arena defaults. Candidate runs are capped low and the
+# scheduler will not run two profiles with the same provider_group together.
+parallel = 2
+auto_apply = true
+min_score_x10 = 40
+keep_worktrees = false
+
+[[arena_profile]]
+name = "codex-gpt55"
+harness = "codex"
+model = "gpt-5.5"
+provider_group = "openai-codex"
+
+[[arena_profile]]
+name = "pi-gpt55"
+harness = "pi"
+model = "openai-codex/gpt-5.5"
+provider_group = "openai-codex"
+
+[[arena_profile]]
+name = "opencode-gpt55"
+harness = "opencode"
+model = "openai-codex/gpt-5.5"
+provider_group = "openai-codex"
+
+[[arena_profile]]
+name = "pi-glm52"
+harness = "pi"
+model = "opencode-go/glm-5.2"
+provider_group = "opencode-go"
+
+[[arena_profile]]
+name = "opencode-glm52"
+harness = "opencode"
+model = "opencode-go/glm-5.2"
+provider_group = "opencode-go"
+
+[[arena_profile]]
+name = "pi-minimax-m3"
+harness = "pi"
+model = "opencode-go/minimax-m3"
+provider_group = "opencode-go"
+
+[[arena_profile]]
+name = "opencode-minimax-m3"
+harness = "opencode"
+model = "opencode-go/minimax-m3"
+provider_group = "opencode-go"
+
+[[arena_profile]]
+name = "pi-qwen37max"
+harness = "pi"
+model = "opencode-go/qwen3.7-max"
+provider_group = "opencode-go"
+
+[[arena_profile]]
+name = "opencode-qwen37max"
+harness = "opencode"
+model = "opencode-go/qwen3.7-max"
+provider_group = "opencode-go"
+
+[[arena_judge]]
+name = "qwen37max"
+backend = "pi"
+dispatch_id = "opencode-go/qwen3.7-max"
+
+[[arena_judge]]
+name = "gpt55"
+backend = "pi"
+dispatch_id = "openai-codex/gpt-5.5"
+
 # Initial roster from scorecard 2026-07-01.
 # (sonnet-5's scorecard "XL via decomposition" is capped to L here because
 # decomposition is out of scope v1; XL lead items route to opus-4.8 or flag.)

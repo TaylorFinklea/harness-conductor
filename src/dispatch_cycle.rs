@@ -460,11 +460,17 @@ fn append_ledger(
     let row = LedgerRow {
         date: Utc::now().format("%Y-%m-%d").to_string(),
         model: roster.name.clone(),
+        harness: None,
+        profile: None,
         role: role.to_string(),
         task: issue.id.clone(),
+        score_1_5: None,
+        blind_rank: None,
+        judge: None,
         verify_passed,
         complexity: fields.complexity.clone(),
         project: repo.to_string(),
+        bias_note: None,
         notes: format!("conductor {cycle_id}: {summary}"),
     };
     ledger::append(ledger_path, &row)
@@ -675,9 +681,11 @@ mod tests {
         )
         .expect_err("missing approval refuses");
         assert!(absent.is_not_answered());
-        assert!(absent
-            .to_string()
-            .contains("dispatch-plan not yet answered"));
+        assert!(
+            absent
+                .to_string()
+                .contains("dispatch-plan not yet answered")
+        );
     }
 
     #[test]
@@ -781,17 +789,21 @@ dispatch_id = "fake-worker"
             heartbeats.len() >= 2,
             "expected multiple live patches, got {heartbeats:?}"
         );
-        assert!(heartbeats
-            .iter()
-            .any(|step| step.contains("worker sandbox-repo/sandbox-1")));
+        assert!(
+            heartbeats
+                .iter()
+                .any(|step| step.contains("worker sandbox-repo/sandbox-1"))
+        );
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(report_path(&reports, cycle_id)).unwrap())
                 .unwrap();
         assert_eq!(report["status"], "done");
-        assert!(report["live"]["step"]
-            .as_str()
-            .unwrap()
-            .contains("complete"));
+        assert!(
+            report["live"]["step"]
+                .as_str()
+                .unwrap()
+                .contains("complete")
+        );
     }
 
     #[test]

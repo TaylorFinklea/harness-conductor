@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -18,6 +18,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             println!("conductor {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Some("arena") => run_arena(&mut it),
         Some("config") => run_config(&mut it),
         Some("cycle") => run_cycle(&mut it),
         Some("dispatch") => run_dispatch(&mut it),
@@ -28,6 +29,154 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             eprintln!("unknown subcommand: {cmd}");
             print_usage();
             ExitCode::from(2)
+        }
+    }
+}
+
+fn run_arena(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    match it.next().as_deref() {
+        Some("run") => run_arena_run(it),
+        None => {
+            eprintln!(
+                "usage: conductor arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]"
+            );
+            ExitCode::from(2)
+        }
+        Some(sub) => {
+            eprintln!("unknown arena subcommand: {sub}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "manual CLI parser stays local to the subcommand"
+)]
+fn run_arena_run(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let mut config_path = PathBuf::from("conductor.toml");
+    let mut repo: Option<String> = None;
+    let mut bead: Option<String> = None;
+    let mut profiles = crate::arena::ProfileSelection::All;
+    let mut parallel = None;
+    let mut auto_apply = true;
+
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => {
+                let Some(p) = it.next() else {
+                    eprintln!("--config requires a path argument");
+                    return ExitCode::from(2);
+                };
+                config_path = PathBuf::from(p);
+            }
+            "--repo" => {
+                let Some(value) = it.next() else {
+                    eprintln!("--repo requires an argument");
+                    return ExitCode::from(2);
+                };
+                repo = Some(value);
+            }
+            "--bead" => {
+                let Some(value) = it.next() else {
+                    eprintln!("--bead requires an argument");
+                    return ExitCode::from(2);
+                };
+                bead = Some(value);
+            }
+            "--profiles" => {
+                let Some(value) = it.next() else {
+                    eprintln!("--profiles requires an argument");
+                    return ExitCode::from(2);
+                };
+                profiles = if value == "all" {
+                    crate::arena::ProfileSelection::All
+                } else {
+                    let names: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    if names.is_empty() {
+                        eprintln!("--profiles requires at least one profile name or all");
+                        return ExitCode::from(2);
+                    }
+                    crate::arena::ProfileSelection::Named(names)
+                };
+            }
+            "--parallel" => {
+                let Some(value) = it.next() else {
+                    eprintln!("--parallel requires an integer argument");
+                    return ExitCode::from(2);
+                };
+                let Ok(parsed) = value.parse::<u32>() else {
+                    eprintln!("--parallel must be an integer");
+                    return ExitCode::from(2);
+                };
+                if parsed == 0 {
+                    eprintln!("--parallel must be at least 1");
+                    return ExitCode::from(2);
+                }
+                parallel = Some(parsed);
+            }
+            "--no-apply" => auto_apply = false,
+            other => {
+                eprintln!("unknown argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(repo) = repo else {
+        eprintln!("arena run requires --repo <repo|path>");
+        return ExitCode::from(2);
+    };
+    let Some(bead) = bead else {
+        eprintln!("arena run requires --bead <id>");
+        return ExitCode::from(2);
+    };
+
+    let cfg = match config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config: invalid — {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let bd = crate::bd::CommandBdClient::new();
+    let options = crate::arena::ArenaRunOptions {
+        repo,
+        bead,
+        profiles,
+        parallel,
+        auto_apply,
+    };
+    match crate::arena::run(
+        &cfg,
+        &bd,
+        &reports_home(),
+        &state_dir(),
+        &ledger_path(),
+        &options,
+    ) {
+        Ok(result) => {
+            println!("arena {}: complete", result.run_id);
+            println!("report: {}", result.report_path.display());
+            match result.winner_profile {
+                Some(winner) if result.applied => println!("winner applied: {winner}"),
+                Some(winner) => println!("winner not applied: {winner}"),
+                None => println!("winner: none"),
+            }
+            if result.applied {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("arena: {e}");
+            ExitCode::from(1)
         }
     }
 }

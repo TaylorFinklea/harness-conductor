@@ -35,16 +35,29 @@ impl std::error::Error for LedgerError {}
 ///
 /// Mirrors the current model-bench JSONL rows (`date`, `model`, `role`,
 /// optional task label, `verify_passed`, `complexity`, `project`, `notes`) and
-/// intentionally omits `score_1_5`; humans/leads score later.
+/// keeps score/harness fields optional so ordinary dispatch rows stay light
+/// while Arena rows can record head-to-head results.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LedgerRow {
     pub(crate) date: String,
     pub(crate) model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
     pub(crate) role: String,
     pub(crate) task: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) score_1_5: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) blind_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) judge: Option<String>,
     pub(crate) verify_passed: bool,
     pub(crate) complexity: String,
     pub(crate) project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bias_note: Option<String>,
     pub(crate) notes: String,
 }
 
@@ -83,11 +96,17 @@ mod tests {
         let row = LedgerRow {
             date: "2026-07-02".to_string(),
             model: "fake-worker".to_string(),
+            harness: None,
+            profile: None,
             role: "implement".to_string(),
             task: "sandbox-1".to_string(),
+            score_1_5: None,
+            blind_rank: None,
+            judge: None,
             verify_passed: true,
             complexity: "S".to_string(),
             project: "sandbox-repo".to_string(),
+            bias_note: None,
             notes: "conductor cycle-1: verified".to_string(),
         };
 
