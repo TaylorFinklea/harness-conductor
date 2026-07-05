@@ -64,7 +64,7 @@ Responsibilities after this work:
 - Consumes: existing `model-bench.jsonl` rows, including old Arena rows whose `notes` match `conductor arena <run-id> profile=<profile> reason=<reason>`.
 - Produces: `~/.harness/reports/model-scorecard/digest/report.json` and `~/.harness/reports/harness-scorecard/digest/report.json`.
 
-- [ ] **Step 1: Write the failing generator test**
+- [x] **Step 1: Write the failing generator test**
 
 Create `/Users/tfinklea/git/chezmoi-config/private_dot_local/lib/scorecard/gen-scorecard-digest.test.mjs`:
 
@@ -180,7 +180,7 @@ test("generator writes model and harness scorecard reports from arena rows", () 
 });
 ```
 
-- [ ] **Step 2: Run the generator test and verify it fails**
+- [x] **Step 2: Run the generator test and verify it fails**
 
 Run:
 
@@ -190,7 +190,7 @@ node --test /Users/tfinklea/git/chezmoi-config/private_dot_local/lib/scorecard/g
 
 Expected before implementation: FAIL because `harness-scorecard/digest/report.json` does not exist.
 
-- [ ] **Step 3: Refactor generator helpers without changing output semantics**
+- [x] **Step 3: Refactor generator helpers without changing output semantics**
 
 Modify `/Users/tfinklea/git/chezmoi-config/private_dot_local/lib/scorecard/gen-scorecard-digest.mjs`:
 
@@ -206,7 +206,7 @@ Modify `/Users/tfinklea/git/chezmoi-config/private_dot_local/lib/scorecard/gen-s
 
 Keep the existing model report path and console output working.
 
-- [ ] **Step 4: Implement harness-scorecard aggregation and report blocks**
+- [x] **Step 4: Implement harness-scorecard aggregation and report blocks**
 
 In the generator, after the existing model report data is built:
 
@@ -221,7 +221,7 @@ In the generator, after the existing model report data is built:
 
 Do not remove the small existing harness/profile table from `model-scorecard/digest`; it can stay as a compact model-scorecard cross-link.
 
-- [ ] **Step 5: Run the generator test and verify it passes**
+- [x] **Step 5: Run the generator test and verify it passes**
 
 Run:
 
@@ -231,7 +231,7 @@ node --test /Users/tfinklea/git/chezmoi-config/private_dot_local/lib/scorecard/g
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the real generator and validate both reports**
+- [x] **Step 6: Run the real generator and validate both reports**
 
 Run:
 
@@ -257,7 +257,7 @@ hdeck validate /Users/tfinklea/.harness/reports/harness-scorecard/digest/report.
 
 Expected: `ok`.
 
-- [ ] **Step 7: Commit Task 1 in chezmoi-config only**
+- [x] **Step 7: Commit Task 1 in chezmoi-config only**
 
 Run:
 
@@ -289,7 +289,7 @@ git -C /Users/tfinklea/git/chezmoi-config commit -m "feat(scorecard): add arena 
 - Consumes: `ArenaDecision`, candidate run summaries, Ralph stderr logs.
 - Produces: Arena candidate ledger rows with optional `arena_run_id`, `winner`, `applied`, `failure_reason`, `duration_ms`, `ralph_duration_ms`, `verify_duration_ms`, `tokens_used`, `cost_usd`.
 
-- [ ] **Step 1: Add ledger serialization test for optional Arena metadata**
+- [x] **Step 1: Add ledger serialization test for optional Arena metadata**
 
 In `/Users/tfinklea/git/harness-conductor/src/ledger.rs`, add a test next to `append_writes_one_row_without_score`:
 
@@ -339,7 +339,7 @@ fn append_writes_arena_metadata_when_present() {
 }
 ```
 
-- [ ] **Step 2: Run the ledger test and verify it fails**
+- [x] **Step 2: Run the ledger test and verify it fails**
 
 Run:
 
@@ -349,7 +349,7 @@ cargo test append_writes_arena_metadata_when_present
 
 Expected before implementation: compile failure because `LedgerRow` lacks the new fields.
 
-- [ ] **Step 3: Add optional fields to `LedgerRow`**
+- [x] **Step 3: Add optional fields to `LedgerRow`**
 
 In `/Users/tfinklea/git/harness-conductor/src/ledger.rs`, add these fields after `notes` or before it; use `#[serde(skip_serializing_if = "Option::is_none")]` on each optional field:
 
@@ -367,7 +367,7 @@ pub(crate) cost_usd: Option<String>,
 
 Update existing `LedgerRow` initializers in tests and production to include `None` for the new fields unless real values are available.
 
-- [ ] **Step 4: Add token parser tests**
+- [x] **Step 4: Add token parser tests**
 
 In `/Users/tfinklea/git/harness-conductor/src/arena.rs` tests module, add tests for the pure parser:
 
@@ -385,7 +385,7 @@ fn parse_tokens_used_ignores_missing_or_bad_values() {
 }
 ```
 
-- [ ] **Step 5: Run parser tests and verify they fail**
+- [x] **Step 5: Run parser tests and verify they fail**
 
 Run:
 
@@ -395,7 +395,7 @@ cargo test parse_tokens_used
 
 Expected before implementation: compile failure because `parse_tokens_used` does not exist.
 
-- [ ] **Step 6: Implement parser and timing fields**
+- [x] **Step 6: Implement parser and timing fields**
 
 In `/Users/tfinklea/git/harness-conductor/src/arena.rs`:
 
@@ -443,7 +443,7 @@ fn parse_tokens_used(stderr: &str) -> Option<u64> {
 - In `run_one_candidate()`, capture total, Ralph, and verify timers. Read `stderr` after Ralph exits and call `parse_tokens_used()`.
 - Ensure every early return populates the metadata fields gathered so far.
 
-- [ ] **Step 7: Populate enriched ledger rows**
+- [x] **Step 7: Populate enriched ledger rows**
 
 Change `append_ledger_rows()` signature so it receives `decision: &ArenaDecision` and `applied: bool`.
 
@@ -458,7 +458,7 @@ For each candidate row:
 
 Update the call site in `arena::run()`.
 
-- [ ] **Step 8: Run targeted Rust tests**
+- [x] **Step 8: Run targeted Rust tests**
 
 Run:
 
@@ -484,7 +484,7 @@ cargo test arena
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit Task 2 in harness-conductor only**
+- [x] **Step 9: Commit Task 2 in harness-conductor only**
 
 Run:
 
@@ -515,7 +515,7 @@ git -C /Users/tfinklea/git/harness-conductor commit -m "feat(arena): record harn
 - Consumes: local HOME path and optional generator at `~/.local/lib/scorecard/gen-scorecard-digest.mjs`.
 - Produces: best-effort regenerated harness-deck scorecard reports after an Arena run writes its own report.
 
-- [ ] **Step 1: Add digest-refresh helper tests**
+- [x] **Step 1: Add digest-refresh helper tests**
 
 In `/Users/tfinklea/git/harness-conductor/src/arena.rs` tests module, add tests for path selection and missing-script behavior:
 
@@ -537,7 +537,7 @@ fn refresh_scorecard_digest_skips_missing_script() {
 }
 ```
 
-- [ ] **Step 2: Run digest helper tests and verify they fail**
+- [x] **Step 2: Run digest helper tests and verify they fail**
 
 Run:
 
@@ -547,7 +547,7 @@ cargo test scorecard_digest
 
 Expected before implementation: compile failure because helper functions do not exist.
 
-- [ ] **Step 3: Implement digest refresh helpers**
+- [x] **Step 3: Implement digest refresh helpers**
 
 In `/Users/tfinklea/git/harness-conductor/src/arena.rs`, add:
 
@@ -585,7 +585,7 @@ fn refresh_scorecard_digest(home: &Path) -> Result<Option<String>> {
 
 This helper returns a warning string instead of failing for non-zero generator exit. Spawn failure may return `Err`; the call site must catch and warn instead of failing the Arena.
 
-- [ ] **Step 4: Call refresh after the Arena report is written**
+- [x] **Step 4: Call refresh after the Arena report is written**
 
 In `arena::run()`, after `deck::write_report(...)` succeeds and before cleanup, call:
 
@@ -599,7 +599,7 @@ match refresh_scorecard_digest(&home_dir()) {
 
 Do not change Arena success/failure based on digest refresh.
 
-- [ ] **Step 5: Run targeted and full Arena tests**
+- [x] **Step 5: Run targeted and full Arena tests**
 
 Run:
 
@@ -617,7 +617,7 @@ cargo test arena
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 3 in harness-conductor only**
+- [x] **Step 6: Commit Task 3 in harness-conductor only**
 
 Run:
 
@@ -640,7 +640,7 @@ git -C /Users/tfinklea/git/harness-conductor commit -m "feat(arena): refresh sco
 - Consumes: completed Tasks 1–3.
 - Produces: verified reports and clean git status aside from known pre-existing WIP.
 
-- [ ] **Step 1: Run final generator verification**
+- [x] **Step 1: Run final generator verification**
 
 Run:
 
@@ -658,7 +658,7 @@ node /Users/tfinklea/git/chezmoi-config/private_dot_local/lib/scorecard/gen-scor
 
 Expected: writes model and harness scorecard reports.
 
-- [ ] **Step 2: Validate reports**
+- [x] **Step 2: Validate reports**
 
 Run:
 
@@ -676,7 +676,7 @@ hdeck validate /Users/tfinklea/.harness/reports/harness-scorecard/digest/report.
 
 Expected: `ok`.
 
-- [ ] **Step 3: Run final Conductor verification**
+- [x] **Step 3: Run final Conductor verification**
 
 Run:
 
@@ -686,7 +686,7 @@ cargo test arena
 
 Expected: PASS.
 
-- [ ] **Step 4: Inspect generated harness report content**
+- [x] **Step 4: Inspect generated harness report content**
 
 Run:
 
@@ -704,7 +704,7 @@ Recent Arena runs
 Per-run candidate stats
 ```
 
-- [ ] **Step 5: Apply the handoff-doc routing rule**
+- [x] **Step 5: Apply the handoff-doc routing rule**
 
 If implementation spans sessions or leaves pending apply/work, add terse bullets to the relevant current-state file:
 
@@ -713,7 +713,7 @@ If implementation spans sessions or leaves pending apply/work, add terse bullets
 
 Do not duplicate rationale there; if a new durable decision was made beyond the approved spec, add it to the matching `decisions.md`.
 
-- [ ] **Step 6: Final status check**
+- [x] **Step 6: Final status check**
 
 Run:
 
