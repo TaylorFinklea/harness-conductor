@@ -784,14 +784,32 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
         cwd: spawn.cwd,
         env: spawn.env,
         stdout_path: stdout,
-        stderr_path: stderr,
+        stderr_path: stderr.clone(),
     })?;
 
     let mut summary =
         CandidateSummary::eligible(&profile.name, profile.harness.as_str(), &profile.model);
     if !ralph_run.success {
         summary.eligible = false;
-        summary.reason = format!("ralph exited {}", status_summary(ralph_run.code));
+        let reason = match fs::read_to_string(&stderr) {
+            Ok(stderr_text) => {
+                if let Some(cause) = classify_ralph_failure(&stderr_text) {
+                    format!(
+                        "ralph exited {} (provider {}: {}{})",
+                        status_summary(ralph_run.code),
+                        cause.kind,
+                        cause.message,
+                        cause
+                            .ref_id
+                            .map_or(String::new(), |r| format!(" [ref {r}]"))
+                    )
+                } else {
+                    format!("ralph exited {}", status_summary(ralph_run.code))
+                }
+            }
+            Err(_) => format!("ralph exited {}", status_summary(ralph_run.code)),
+        };
+        summary.reason = reason;
         return Ok(CandidateRun {
             summary,
             worktree,
@@ -1377,6 +1395,58 @@ fn status_summary(code: Option<i32>) -> String {
     code.map_or_else(|| "signal".to_string(), |code| format!("exit {code}"))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct RalphFailureCause {
+    kind: String,
+    message: String,
+    ref_id: Option<String>,
+}
+
+fn classify_ralph_failure(stderr: &str) -> Option<RalphFailureCause> {
+    if stderr.contains("UnknownError") || stderr.contains("Unexpected server error") {
+        let ref_id = extract_json_string_field(stderr, "ref");
+        return Some(RalphFailureCause {
+            kind: "500".to_string(),
+            message: "Unexpected server error".to_string(),
+            ref_id,
+        });
+    }
+
+    if stderr.contains("429")
+        || stderr.contains("rate_limit")
+        || stderr.contains("rate limit")
+        || stderr.contains("quota exhausted")
+        || stderr.contains("GoUsageLimitError")
+        || stderr.contains("usage limit reached")
+    {
+        let message = extract_json_string_field(stderr, "message")
+            .unwrap_or_else(|| "rate limit or quota exceeded".to_string());
+        return Some(RalphFailureCause {
+            kind: "429".to_string(),
+            message,
+            ref_id: None,
+        });
+    }
+
+    None
+}
+
+fn extract_json_string_field(haystack: &str, key: &str) -> Option<String> {
+    let search = format!(r#""{}""#, key);
+    let pos = haystack.find(&search)?;
+    let mut rest = &haystack[pos + search.len()..];
+    rest = rest.trim_start();
+    rest = rest.strip_prefix(':').unwrap_or(rest);
+    rest = rest.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    rest = &rest[1..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
 fn candidate_has_disqualifying_dirt(status: &str) -> bool {
     const IGNORED_SCAFFOLD: &[&str] = &["?? .docs/ai/loop-prompt.md", "?? .docs/ai/current-state.md"];
     status
@@ -1612,6 +1682,62 @@ mod tests {
         assert!(candidate_has_disqualifying_dirt(
             "?? .docs/ai/current-state.md\n M src/arena.rs\n"
         ));
+    }
+
+    #[test]
+    fn classify_ralph_failure_detects_unknown_error_with_ref() {
+        let stderr = r#"Error: {
+  "name": "UnknownError",
+  "data": {
+    "message": "Unexpected server error. Check server logs for details.",
+    "ref": "err_9da6ee8c"
+  }
+}"#;
+        let cause = classify_ralph_failure(stderr).unwrap();
+        assert_eq!(cause.kind, "500");
+        assert_eq!(cause.message, "Unexpected server error");
+        assert_eq!(cause.ref_id, Some("err_9da6ee8c".to_string()));
+    }
+
+    #[test]
+    fn classify_ralph_failure_detects_429_rate_limit() {
+        let stderr = r#"429 {"type":"error","error":{"type":"GoUsageLimitError","message":"5-hour usage limit reached. Resets in 3min."}}"#;
+        let cause = classify_ralph_failure(stderr).unwrap();
+        assert_eq!(cause.kind, "429");
+        assert_eq!(cause.message, "5-hour usage limit reached. Resets in 3min.");
+        assert_eq!(cause.ref_id, None);
+    }
+
+    #[test]
+    fn classify_ralph_failure_detects_429_with_rate_limit_keyword() {
+        let stderr = "rate_limit exceeded for model minimax-m3";
+        let cause = classify_ralph_failure(stderr).unwrap();
+        assert_eq!(cause.kind, "429");
+        assert_eq!(cause.message, "rate limit or quota exceeded");
+        assert_eq!(cause.ref_id, None);
+    }
+
+    #[test]
+    fn classify_ralph_failure_detects_quota_exhausted() {
+        let stderr = "quota exhausted for provider opencode-go";
+        let cause = classify_ralph_failure(stderr).unwrap();
+        assert_eq!(cause.kind, "429");
+        assert_eq!(cause.message, "rate limit or quota exceeded");
+        assert_eq!(cause.ref_id, None);
+    }
+
+    #[test]
+    fn classify_ralph_failure_detects_signal_amid_noise() {
+        let stderr = "some random noise\nmore noise\n429: GoUsageLimitError\nfinal noise";
+        let cause = classify_ralph_failure(stderr).unwrap();
+        assert_eq!(cause.kind, "429");
+        assert_eq!(cause.message, "rate limit or quota exceeded");
+    }
+
+    #[test]
+    fn classify_ralph_failure_returns_none_for_clean_stderr() {
+        let stderr = "ralph: preflight ok\nralph: starting cycle\n";
+        assert_eq!(classify_ralph_failure(stderr), None);
     }
 
     #[test]

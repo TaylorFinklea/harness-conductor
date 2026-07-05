@@ -1,8 +1,10 @@
 # current-state.md — harness-conductor
 
 Branch: main
-`cargo test` green (162). `conductor-b9h` closed. Now working `conductor-avg` (P1): Arena opencode harness/provider 500 surfaced as bare `ralph exited exit 1`.
+`cargo test` green (168). `conductor-avg` plan complete. No active plan.
 
 ## Plan
 
-- [ ] Fix `conductor-avg`: when ralph exits non-success, Conductor currently records `"ralph exited exit 1"` with no cause. The opencode-harness (and opencode-go provider for pi-dispatched minimax/glm/qwen) returns a structured 500 (`{name: UnknownError, data: {message: "Unexpected server error. Check server logs for details.", ref: err_9da6ee8c}}`) written to the candidate's ralph.err log. Surface provider errors as a distinct, meaningful failure mode so reports say e.g. `"ralph exited exit 1 (provider 500: Unexpected server error [ref err_9da6ee8c])"` instead of the bare exit. Touches `src/arena.rs`: around line 792-800 where `ralph_run.success == false` is handled and `summary.reason` is set. Read the bead for the failure signature. Implementation: add a `classify_ralph_failure(stderr: &str) -> Option<RalphFailureCause>` helper that scans the captured stderr log (the `stderr_path` already passed to `CommandRunner::run` — read it from disk after the non-success return) for known provider-error signatures (`UnknownError`, `Unexpected server error`, `429`, `rate_limit`/`rate limit`, `quota exhausted`), returning a structured cause (kind + message + optional ref). When `ralph_run.success` is false and `classify_ralph_failure` returns `Some(cause)`, set `summary.reason = format!("ralph exited {} (provider {}: {}{})", status_summary(ralph_run.code), cause.kind, cause.message, cause.ref.map_or(String::new(), |r| format!(" [ref {r}]")))`. If `None`, keep the existing bare `"ralph exited {}"` reason. Add unit tests for `classify_ralph_failure` mirroring the `candidate_has_disqualifying_dirt` tests at line ~1551 — one test per signature, one for no-match, one for combined noise + signal. Do NOT change the exit-code reporting itself or the eligibility decision — only enrich the reason string. Do not implement Bursar/provider pre-check (bead direction 3) — that is a separate follow-up. Verify: `cargo test arena 2>&1 | tail -5`
+## Blockers
+
+## Open questions
