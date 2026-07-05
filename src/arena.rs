@@ -150,6 +150,27 @@ impl JudgeVerdict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct JudgeFailure {
+    judge: String,
+    reason: String,
+}
+
+impl JudgeFailure {
+    fn new(judge: &str, reason: impl Into<String>) -> Self {
+        Self {
+            judge: judge.to_string(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JudgeRunResult {
+    verdicts: Vec<JudgeVerdict>,
+    failures: Vec<JudgeFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArenaDecision {
     pub(crate) winner_profile: Option<String>,
     pub(crate) auto_apply: bool,
@@ -351,7 +372,9 @@ pub(crate) fn run(
         .iter()
         .map(|run| run.summary.clone())
         .collect();
-    let judgements = run_judges(cfg, &ctx, &candidate_runs)?;
+    let judge_run = run_judges(cfg, &ctx, &candidate_runs)?;
+    let judgements = judge_run.verdicts;
+    let judge_failures = judge_run.failures;
     let mut decision = decide_winner(&candidates, &judgements, cfg.arena.min_score_x10);
     if !auto_apply {
         decision.auto_apply = false;
@@ -361,6 +384,7 @@ pub(crate) fn run(
                 .push("auto-apply disabled by config or --no-apply".to_string());
         }
     }
+    record_judge_failures(&mut decision, &judge_failures);
 
     let mut applied = false;
     if let (true, Some(winner)) = (decision.auto_apply, decision.winner_profile.as_deref()) {
@@ -390,6 +414,7 @@ pub(crate) fn run(
         &ctx,
         &candidate_runs,
         &judgements,
+        &judge_failures,
         &decision,
         applied,
     )?;
@@ -398,6 +423,7 @@ pub(crate) fn run(
         &ctx,
         &candidate_runs,
         &judgements,
+        &judge_failures,
         &decision,
         applied,
         &created_at,
@@ -989,13 +1015,13 @@ fn run_judges(
     cfg: &Config,
     ctx: &RunContext,
     candidates: &[CandidateRun],
-) -> Result<Vec<JudgeVerdict>> {
+) -> Result<JudgeRunResult> {
     let eligible: Vec<&CandidateRun> = candidates
         .iter()
         .filter(|candidate| candidate.summary.eligible)
         .collect();
     if eligible.is_empty() {
-        return Ok(Vec::new());
+        return Ok(JudgeRunResult::default());
     }
     if cfg.arena.judges.is_empty() {
         return Err(ArenaError::new(
@@ -1008,7 +1034,10 @@ fn run_judges(
         .map(|(idx, candidate)| (alias_for_index(idx), candidate.summary.profile.clone()))
         .collect();
     let prompt = judge_prompt(ctx, &eligible, &aliases);
-    let mut out = Vec::with_capacity(cfg.arena.judges.len());
+    let mut out = JudgeRunResult {
+        verdicts: Vec::with_capacity(cfg.arena.judges.len()),
+        failures: Vec::new(),
+    };
     for judge in &cfg.arena.judges {
         let stdout_path = ctx.log_dir.join(format!("judge-{}.out", judge.name));
         let stderr_path = ctx.log_dir.join(format!("judge-{}.err", judge.name));
@@ -1023,24 +1052,69 @@ fn run_judges(
             cwd: ctx.repo.clone(),
             env: Vec::new(),
             stdout_path: stdout_path.clone(),
-            stderr_path,
-        })?;
+            stderr_path: stderr_path.clone(),
+        });
+        let run = match run {
+            Ok(run) => run,
+            Err(e) => {
+                out.failures
+                    .push(JudgeFailure::new(&judge.name, e.to_string()));
+                continue;
+            }
+        };
         if !run.success {
-            return Err(ArenaError::new(format!(
-                "judge {} exited {}",
-                judge.name,
-                status_summary(run.code)
-            )));
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+            out.failures.push(JudgeFailure::new(
+                &judge.name,
+                failed_judge_reason(&run, &stderr),
+            ));
+            continue;
         }
-        let raw = fs::read_to_string(&stdout_path).map_err(|e| {
-            ArenaError::new(format!(
-                "failed to read judge stdout {}: {e}",
-                stdout_path.display()
-            ))
-        })?;
-        out.push(parse_judge_verdict(&judge.name, &raw, &aliases)?);
+        let raw = match fs::read_to_string(&stdout_path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                out.failures.push(JudgeFailure::new(
+                    &judge.name,
+                    format!("failed to read judge stdout {}: {e}", stdout_path.display()),
+                ));
+                continue;
+            }
+        };
+        match parse_judge_verdict(&judge.name, &raw, &aliases) {
+            Ok(verdict) => out.verdicts.push(verdict),
+            Err(e) => out
+                .failures
+                .push(JudgeFailure::new(&judge.name, e.to_string())),
+        }
     }
     Ok(out)
+}
+
+fn failed_judge_reason(run: &CommandOutput, stderr: &str) -> String {
+    let status = status_summary(run.code);
+    if let Some(cause) = classify_ralph_failure(stderr) {
+        return if let Some(ref_id) = cause.ref_id {
+            format!("{status}: {} ({} ref {ref_id})", cause.message, cause.kind)
+        } else {
+            format!("{status}: {}", cause.message)
+        };
+    }
+
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        status
+    } else {
+        format!("{status}: {}", truncate_chars(trimmed, 300))
+    }
+}
+
+fn record_judge_failures(decision: &mut ArenaDecision, failures: &[JudgeFailure]) {
+    for failure in failures {
+        decision.reasons.push(format!(
+            "judge {} skipped: {}",
+            failure.judge, failure.reason
+        ));
+    }
 }
 
 fn judge_prompt(
@@ -1210,6 +1284,7 @@ fn append_ledger_rows(
     ctx: &RunContext,
     candidates: &[CandidateRun],
     judgements: &[JudgeVerdict],
+    judge_failures: &[JudgeFailure],
     decision: &ArenaDecision,
     applied: bool,
 ) -> Result<()> {
@@ -1222,6 +1297,7 @@ fn append_ledger_rows(
     for candidate in candidates {
         let avg = average_score(&candidate.summary.profile, judgements);
         let rank = aggregate_rank(&candidate.summary.profile, judgements);
+        let judge = judge_label(judgements, judge_failures);
         ledger::append(
             ledger_path,
             &LedgerRow {
@@ -1233,13 +1309,7 @@ fn append_ledger_rows(
                 task: ctx.bead.clone(),
                 score_1_5: avg.map(|score| f64::from(score) / 10.0),
                 blind_rank: rank,
-                judge: Some(
-                    judgements
-                        .iter()
-                        .map(|j| j.judge.as_str())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
+                judge: Some(judge.clone()),
                 verify_passed: candidate.summary.eligible,
                 complexity: complexity_label(ctx.complexity).to_string(),
                 project: project.clone(),
@@ -1273,10 +1343,35 @@ fn append_ledger_rows(
     Ok(())
 }
 
+fn judge_label(judgements: &[JudgeVerdict], judge_failures: &[JudgeFailure]) -> String {
+    let mut parts = Vec::new();
+    if !judgements.is_empty() {
+        parts.push(
+            judgements
+                .iter()
+                .map(|j| j.judge.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    if !judge_failures.is_empty() {
+        parts.push(format!(
+            "failed:{}",
+            judge_failures
+                .iter()
+                .map(|j| j.judge.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    parts.join(";")
+}
+
 fn build_report(
     ctx: &RunContext,
     candidates: &[CandidateRun],
     judgements: &[JudgeVerdict],
+    judge_failures: &[JudgeFailure],
     decision: &ArenaDecision,
     applied: bool,
     created_at: &str,
@@ -1292,6 +1387,7 @@ fn build_report(
             Metric::new("Candidates", candidates.len().to_string()),
             Metric::new("Eligible", eligible.to_string()),
             Metric::new("Judges", judgements.len().to_string()),
+            Metric::new("Judge Failures", judge_failures.len().to_string()),
             Metric::new(
                 "Winner",
                 decision
@@ -1337,6 +1433,15 @@ fn build_report(
             ]
         }),
     ));
+    if !judge_failures.is_empty() {
+        blocks.push(Block::table(
+            "Judge Failures",
+            ["Judge", "Reason"],
+            judge_failures
+                .iter()
+                .map(|failure| vec![failure.judge.clone(), failure.reason.clone()]),
+        ));
+    }
     if !decision.reasons.is_empty() {
         blocks.push(Block::callout(
             CalloutLevel::Warn,
@@ -1893,6 +1998,99 @@ mod tests {
     fn classify_ralph_failure_returns_none_for_clean_stderr() {
         let stderr = "ralph: preflight ok\nralph: starting cycle\n";
         assert_eq!(classify_ralph_failure(stderr), None);
+    }
+
+    #[test]
+    fn failed_judge_reason_classifies_quota_output() {
+        let run = CommandOutput {
+            code: Some(1),
+            success: false,
+        };
+
+        assert_eq!(
+            failed_judge_reason(&run, "quota exhausted for provider openai-codex"),
+            "exit 1: rate limit or quota exceeded"
+        );
+    }
+
+    #[test]
+    fn skipped_judges_are_recorded_without_blocking_safe_winner() {
+        let candidates = vec![
+            CandidateSummary::eligible("cand-a", "pi", "neuralwatt/glm-5.2"),
+            CandidateSummary::eligible("cand-b", "opencode", "neuralwatt/glm-5.2"),
+        ];
+        let judgements = vec![JudgeVerdict::fixture(
+            "nw-glm52",
+            [("cand-a", 45), ("cand-b", 41)],
+            ["cand-a", "cand-b"],
+        )];
+        let failures = vec![JudgeFailure::new(
+            "gpt55",
+            "exit 1: rate limit or quota exceeded",
+        )];
+
+        let mut decision = decide_winner(&candidates, &judgements, 40);
+        record_judge_failures(&mut decision, &failures);
+
+        assert_eq!(decision.winner_profile.as_deref(), Some("cand-a"));
+        assert!(decision.auto_apply);
+        assert_eq!(judge_label(&judgements, &failures), "nw-glm52;failed:gpt55");
+        assert!(decision.reasons.iter().any(|reason| {
+            reason == "judge gpt55 skipped: exit 1: rate limit or quota exceeded"
+        }));
+    }
+
+    #[test]
+    fn all_failed_judges_still_build_no_winner_report() {
+        let ctx = fixture_run_context();
+        let candidate = CandidateRun {
+            summary: CandidateSummary::eligible("cand-a", "pi", "neuralwatt/glm-5.2"),
+            worktree: std::path::PathBuf::from("/tmp/cand-a"),
+            commit: Some("abc123".to_string()),
+            patch: String::new(),
+            duration_ms: None,
+            ralph_duration_ms: None,
+            verify_duration_ms: None,
+            tokens_used: None,
+        };
+        let candidates = vec![candidate];
+        let summaries = candidates
+            .iter()
+            .map(|candidate| candidate.summary.clone())
+            .collect::<Vec<_>>();
+        let failures = vec![JudgeFailure::new(
+            "gpt55",
+            "exit 1: rate limit or quota exceeded",
+        )];
+        let mut decision = decide_winner(&summaries, &[], 40);
+        record_judge_failures(&mut decision, &failures);
+
+        let report = build_report(
+            &ctx,
+            &candidates,
+            &[],
+            &failures,
+            &decision,
+            false,
+            "2026-07-05T00:00:00Z",
+        )
+        .expect("report should build when every judge failed");
+        let report_json = serde_json::to_value(&report).expect("serialize report");
+
+        assert!(decision.winner_profile.is_none());
+        assert!(!decision.auto_apply);
+        assert!(decision.reasons.iter().any(|r| r == "no judge verdicts"));
+        assert!(
+            report_json["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| {
+                    block["title"] == "Judge Failures"
+                        && block["rows"][0][0] == "gpt55"
+                        && block["rows"][0][1] == "exit 1: rate limit or quota exceeded"
+                })
+        );
     }
 
     #[test]
