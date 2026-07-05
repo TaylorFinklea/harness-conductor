@@ -472,6 +472,15 @@ fn append_ledger(
         project: repo.to_string(),
         bias_note: None,
         notes: format!("conductor {cycle_id}: {summary}"),
+        arena_run_id: None,
+        winner: None,
+        applied: None,
+        failure_reason: None,
+        duration_ms: None,
+        ralph_duration_ms: None,
+        verify_duration_ms: None,
+        tokens_used: None,
+        cost_usd: None,
     };
     ledger::append(ledger_path, &row)
         .map_err(|e| DispatchCycleError::message(format!("ledger: {e}")))
