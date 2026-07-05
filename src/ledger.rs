@@ -59,6 +59,24 @@ pub(crate) struct LedgerRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) bias_note: Option<String>,
     pub(crate) notes: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) arena_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) winner: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ralph_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verify_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tokens_used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cost_usd: Option<String>,
 }
 
 /// Appends one JSON row and trailing newline to `path`, creating parent dirs.
@@ -108,6 +126,15 @@ mod tests {
             project: "sandbox-repo".to_string(),
             bias_note: None,
             notes: "conductor cycle-1: verified".to_string(),
+            arena_run_id: None,
+            winner: None,
+            applied: None,
+            failure_reason: None,
+            duration_ms: None,
+            ralph_duration_ms: None,
+            verify_duration_ms: None,
+            tokens_used: None,
+            cost_usd: None,
         };
 
         append(&path, &row).expect("append ledger");
@@ -123,6 +150,50 @@ mod tests {
         assert_eq!(parsed["project"], json!("sandbox-repo"));
         assert_eq!(parsed["notes"], json!("conductor cycle-1: verified"));
         assert!(parsed.get("score_1_5").is_none());
+    }
+
+    #[test]
+    fn append_writes_arena_metadata_when_present() {
+        let temp = TempDir::new("ledger-arena");
+        let path = temp.path().join("model-bench.jsonl");
+        let row = LedgerRow {
+            date: "2026-07-04".to_string(),
+            model: "neuralwatt/kimi-k2.6".to_string(),
+            harness: Some("pi".to_string()),
+            profile: Some("pi-nw-kimi-k26".to_string()),
+            role: "arena-candidate".to_string(),
+            task: "warden-vy1".to_string(),
+            score_1_5: Some(4.4),
+            blind_rank: Some(1),
+            judge: Some("qwen37max,gpt55,nw-glm52".to_string()),
+            verify_passed: true,
+            complexity: "S".to_string(),
+            project: "warden".to_string(),
+            bias_note: Some("arena blind panel".to_string()),
+            notes: "conductor arena arena-20260704-225738-warden-vy1 profile=pi-nw-kimi-k26 reason=".to_string(),
+            arena_run_id: Some("arena-20260704-225738-warden-vy1".to_string()),
+            winner: Some(true),
+            applied: Some(true),
+            failure_reason: None,
+            duration_ms: Some(120_000),
+            ralph_duration_ms: Some(90_000),
+            verify_duration_ms: Some(30_000),
+            tokens_used: Some(309_466),
+            cost_usd: None,
+        };
+
+        append(&path, &row).expect("append ledger");
+
+        let content = std::fs::read_to_string(&path).expect("read ledger");
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).expect("json row");
+        assert_eq!(parsed["arena_run_id"], json!("arena-20260704-225738-warden-vy1"));
+        assert_eq!(parsed["winner"], json!(true));
+        assert_eq!(parsed["applied"], json!(true));
+        assert_eq!(parsed["duration_ms"], json!(120_000));
+        assert_eq!(parsed["ralph_duration_ms"], json!(90_000));
+        assert_eq!(parsed["verify_duration_ms"], json!(30_000));
+        assert_eq!(parsed["tokens_used"], json!(309_466));
+        assert!(parsed.get("cost_usd").is_none());
     }
 
     struct TempDir(PathBuf);

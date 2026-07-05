@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::Instant;
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -236,6 +237,10 @@ struct CandidateRun {
     worktree: PathBuf,
     commit: Option<String>,
     patch: String,
+    duration_ms: Option<u64>,
+    ralph_duration_ms: Option<u64>,
+    verify_duration_ms: Option<u64>,
+    tokens_used: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,7 +384,15 @@ pub(crate) fn run(
         claim.release_now()?;
     }
 
-    append_ledger_rows(ledger_path, &repo, &ctx, &candidate_runs, &judgements)?;
+    append_ledger_rows(
+        ledger_path,
+        &repo,
+        &ctx,
+        &candidate_runs,
+        &judgements,
+        &decision,
+        applied,
+    )?;
     let created_at = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let report = build_report(
         &ctx,
@@ -391,6 +404,12 @@ pub(crate) fn run(
     )?;
     let report_path = deck::write_report(reports_home, &report)
         .map_err(|e| ArenaError::new(format!("report: {e}")))?;
+
+    match refresh_scorecard_digest(&home_dir()) {
+        Ok(Some(warning)) => eprintln!("arena: {warning}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("arena: scorecard digest skipped: {e}"),
+    }
 
     if !cfg.arena.keep_worktrees {
         cleanup_worktrees(&ctx, &candidate_runs)?;
@@ -756,6 +775,7 @@ fn run_candidates(
 }
 
 fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<CandidateRun> {
+    let candidate_start = Instant::now();
     let worktree = ctx.work_root.join("worktrees").join(&profile.name);
     fs::create_dir_all(worktree.parent().unwrap_or(&ctx.work_root)).map_err(|e| {
         ArenaError::new(format!(
@@ -778,6 +798,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
     let spawn = ralph_spawn_request(profile, &worktree);
     let stdout = ctx.log_dir.join(format!("{}.ralph.out", profile.name));
     let stderr = ctx.log_dir.join(format!("{}.ralph.err", profile.name));
+    let ralph_start = Instant::now();
     let ralph_run = CommandRunner::run(&CommandSpec {
         program: spawn.argv[0].clone(),
         args: spawn.argv[1..].to_vec(),
@@ -786,6 +807,10 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
         stdout_path: stdout,
         stderr_path: stderr.clone(),
     })?;
+    let ralph_duration_ms = Some(elapsed_ms(ralph_start));
+    let tokens_used = fs::read_to_string(&stderr)
+        .ok()
+        .and_then(|stderr| parse_tokens_used(&stderr));
 
     let mut summary =
         CandidateSummary::eligible(&profile.name, profile.harness.as_str(), &profile.model);
@@ -815,6 +840,10 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
             worktree,
             commit: None,
             patch: String::new(),
+            duration_ms: Some(elapsed_ms(candidate_start)),
+            ralph_duration_ms,
+            verify_duration_ms: None,
+            tokens_used,
         });
     }
 
@@ -826,6 +855,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
 
     let verify_stdout = ctx.log_dir.join(format!("{}.verify.out", profile.name));
     let verify_stderr = ctx.log_dir.join(format!("{}.verify.err", profile.name));
+    let verify_start = Instant::now();
     let verify_run = CommandRunner::run(&CommandSpec {
         program: "sh".to_string(),
         args: vec!["-c".to_string(), ctx.verify_cmd.clone()],
@@ -834,6 +864,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
         stdout_path: verify_stdout.clone(),
         stderr_path: verify_stderr,
     })?;
+    let verify_duration_ms = Some(elapsed_ms(verify_start));
     if !verify_run.success {
         summary.eligible = false;
         summary.reason = format!("verify_cmd exited {}", status_summary(verify_run.code));
@@ -880,6 +911,10 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
             Some(head)
         },
         patch,
+        duration_ms: Some(elapsed_ms(candidate_start)),
+        ralph_duration_ms,
+        verify_duration_ms,
+        tokens_used,
     })
 }
 
@@ -1182,6 +1217,8 @@ fn append_ledger_rows(
     ctx: &RunContext,
     candidates: &[CandidateRun],
     judgements: &[JudgeVerdict],
+    decision: &ArenaDecision,
+    applied: bool,
 ) -> Result<()> {
     let date = Utc::now().format("%Y-%m-%d").to_string();
     let project = repo
@@ -1221,6 +1258,22 @@ fn append_ledger_rows(
                     "conductor arena {} profile={} reason={}",
                     ctx.run_id, candidate.summary.profile, candidate.summary.reason
                 ),
+                arena_run_id: Some(ctx.run_id.clone()),
+                winner: Some(
+                    decision.winner_profile.as_deref()
+                        == Some(candidate.summary.profile.as_str()),
+                ),
+                applied: Some(applied),
+                failure_reason: if candidate.summary.reason.is_empty() {
+                    None
+                } else {
+                    Some(candidate.summary.reason.clone())
+                },
+                duration_ms: candidate.duration_ms,
+                ralph_duration_ms: candidate.ralph_duration_ms,
+                verify_duration_ms: candidate.verify_duration_ms,
+                tokens_used: candidate.tokens_used,
+                cost_usd: None,
             },
         )?;
     }
@@ -1495,6 +1548,59 @@ fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn parse_tokens_used(stderr: &str) -> Option<u64> {
+    let mut lines = stderr.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "tokens used" {
+            for value in lines.by_ref() {
+                let digits = value
+                    .chars()
+                    .filter(|ch| ch.is_ascii_digit())
+                    .collect::<String>();
+                if digits.is_empty() {
+                    continue;
+                }
+                return digits.parse::<u64>().ok();
+            }
+        }
+    }
+    None
+}
+
+fn scorecard_digest_script_path(home: &Path) -> PathBuf {
+    home.join(".local")
+        .join("lib")
+        .join("scorecard")
+        .join("gen-scorecard-digest.mjs")
+}
+
+fn refresh_scorecard_digest(home: &Path) -> Result<Option<String>> {
+    let script = scorecard_digest_script_path(home);
+    if !script.exists() {
+        return Ok(None);
+    }
+    let output = Command::new("node")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| ArenaError::new(format!("failed to run scorecard digest: {e}")))?;
+    if output.status.success() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "scorecard digest exited {}: {}",
+            status_summary(output.status.code()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
 fn complexity_label(complexity: Ceiling) -> &'static str {
     match complexity {
         Ceiling::S => "S",
@@ -1636,6 +1742,43 @@ mod tests {
     #[test]
     fn aggregate_rank_returns_none_without_judgements() {
         assert_eq!(aggregate_rank("candidate", &[]), None);
+    }
+
+    #[test]
+    fn parse_tokens_used_from_ralph_stderr() {
+        let stderr = "hook: Stop\nhook: Stop Completed\ntokens used\n309,466\n";
+        assert_eq!(parse_tokens_used(stderr), Some(309_466));
+    }
+
+    #[test]
+    fn parse_tokens_used_ignores_missing_or_bad_values() {
+        assert_eq!(parse_tokens_used("hook: Stop\n"), None);
+        assert_eq!(parse_tokens_used("tokens used\nnot-a-number\n"), None);
+    }
+
+    #[test]
+    fn scorecard_digest_script_path_points_under_home() {
+        let home = std::path::PathBuf::from("/tmp/fake-home");
+        assert_eq!(
+            scorecard_digest_script_path(&home),
+            home.join(".local")
+                .join("lib")
+                .join("scorecard")
+                .join("gen-scorecard-digest.mjs")
+        );
+    }
+
+    #[test]
+    fn refresh_scorecard_digest_skips_missing_script() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("arena-digest-missing-{nanos}"));
+        std::fs::create_dir_all(&home).expect("mkdir temp home");
+        let warning = refresh_scorecard_digest(&home).expect("missing script is not an error");
+        assert!(warning.is_none());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
