@@ -13,3 +13,8 @@ This scorecard matches conductor.toml exactly.
 | **qwen3.7-max** | opencode-go/qwen3.7-max | **Senior** | M | high | Test fixture |
 | **glm-5.2** | opencode-go/glm-5.2 | **Senior** | M | good | Test fixture |
 | **gemini-3.5-flash** | gemini-3.5-flash | **Junior** | S | medium | Test fixture |
+| **nw-glm-5.2** | neuralwatt/glm-5.2 | **Senior** | M | good | Test fixture |
+| **nw-glm-5.2-short** | neuralwatt/glm-5.2-short | **Senior** | M | good | Test fixture |
+| **nw-glm-5.2-fast** | neuralwatt/glm-5.2-fast | **Junior** | S | good | Test fixture |
+| **nw-kimi-k2.6** | neuralwatt/kimi-k2.6 | **Senior** | M | good | Test fixture |
+| **nw-kimi-k2.6-fast** | neuralwatt/kimi-k2.6-fast | **Junior** | S | good | Test fixture |

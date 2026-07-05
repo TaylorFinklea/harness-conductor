@@ -1403,10 +1403,10 @@ mod tests {
     // --- the checked-in config ---
 
     #[test]
-    fn checked_in_config_parses_and_has_seven_entries() {
+    fn checked_in_config_parses_and_has_twelve_entries() {
         let cfg = parse_str(include_str!("../conductor.toml"))
             .expect("checked-in conductor.toml must parse");
-        assert_eq!(cfg.roster.len(), 7);
+        assert_eq!(cfg.roster.len(), 12);
         // spec's exact roster table, in order.
         assert_eq!(cfg.roster[0].name, "sonnet-5");
         assert_eq!(cfg.roster[0].tier, Tier::Lead);
@@ -1422,6 +1422,25 @@ mod tests {
         assert_eq!(cfg.roster[6].ceiling, Ceiling::S);
         assert_eq!(cfg.roster[6].backend, Backend::Agy);
         assert_eq!(cfg.roster[6].dispatch_id, "Gemini 3.5 Flash (High)");
+        // neuralwatt lane
+        assert_eq!(cfg.roster[7].name, "nw-glm-5.2");
+        assert_eq!(cfg.roster[7].tier, Tier::Senior);
+        assert_eq!(cfg.roster[7].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[7].efficiency, Efficiency::Lean);
+        assert_eq!(cfg.roster[7].backend, Backend::Pi);
+        assert_eq!(cfg.roster[7].dispatch_id, "neuralwatt/glm-5.2");
+        assert_eq!(cfg.roster[8].name, "nw-glm-5.2-short");
+        assert_eq!(cfg.roster[8].tier, Tier::Senior);
+        assert_eq!(cfg.roster[8].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[9].name, "nw-glm-5.2-fast");
+        assert_eq!(cfg.roster[9].tier, Tier::Junior);
+        assert_eq!(cfg.roster[9].ceiling, Ceiling::S);
+        assert_eq!(cfg.roster[10].name, "nw-kimi-k2.6");
+        assert_eq!(cfg.roster[10].tier, Tier::Senior);
+        assert_eq!(cfg.roster[10].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[11].name, "nw-kimi-k2.6-fast");
+        assert_eq!(cfg.roster[11].tier, Tier::Junior);
+        assert_eq!(cfg.roster[11].ceiling, Ceiling::S);
         // defaults
         assert_eq!(cfg.autonomy, Autonomy::Propose);
         assert_eq!(cfg.scan.root, "~/git");
@@ -1438,10 +1457,10 @@ mod tests {
         assert_eq!(cfg.arena.parallel, 2);
         assert!(cfg.arena.auto_apply);
         assert_eq!(cfg.arena.min_score_x10, 40);
-        assert_eq!(cfg.arena.profiles.len(), 9);
+        assert_eq!(cfg.arena.profiles.len(), 19);
         assert_eq!(cfg.arena.profiles[0].name, "codex-gpt55");
-        assert_eq!(cfg.arena.profiles[8].name, "opencode-qwen37max");
-        assert_eq!(cfg.arena.judges.len(), 2);
+        assert_eq!(cfg.arena.profiles[18].name, "opencode-nw-kimi-k26-fast");
+        assert_eq!(cfg.arena.judges.len(), 3);
         assert_eq!(cfg.arena.judges[0].name, "qwen37max");
     }
 
