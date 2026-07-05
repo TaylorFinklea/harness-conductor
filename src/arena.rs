@@ -848,10 +848,6 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
     }
 
     let mut head = git_stdout(&worktree, ["rev-parse", "HEAD"])?;
-    if head == ctx.base_head {
-        summary.eligible = false;
-        summary.reason = "ralph produced no new commit".to_string();
-    }
 
     let verify_stdout = ctx.log_dir.join(format!("{}.verify.out", profile.name));
     let verify_stderr = ctx.log_dir.join(format!("{}.verify.err", profile.name));
@@ -868,33 +864,32 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
     if !verify_run.success {
         summary.eligible = false;
         summary.reason = format!("verify_cmd exited {}", status_summary(verify_run.code));
-    }
+    } else {
+        // Verify passed — check for uncommitted changes and auto-commit if needed
+        let dirty = git_stdout(&worktree, ["status", "--porcelain"])?;
+        let post_verify_head = git_stdout(&worktree, ["rev-parse", "HEAD"])?;
 
-    // Check for uncommitted changes after verify
-    let dirty = git_stdout(&worktree, ["status", "--porcelain"])?;
-    let post_verify_head = git_stdout(&worktree, ["rev-parse", "HEAD"])?;
-    
-    // If verify passed and there are uncommitted changes but no agent commits,
-    // commit on behalf of the agent (handles sandbox git permission issues)
-    if verify_run.success 
-        && candidate_has_committable_changes(&dirty) 
-        && post_verify_head == ctx.base_head 
-    {
-        match commit_on_behalf_of_agent(&worktree, &ctx.issue.id, &profile.name) {
-            Ok(new_head) => {
-                // Successfully committed, update head
-                head = new_head;
+        // If verify passed and there are uncommitted changes but no agent commits,
+        // commit on behalf of the agent (handles sandbox git permission issues)
+        if candidate_has_committable_changes(&dirty) && post_verify_head == ctx.base_head {
+            match commit_on_behalf_of_agent(&worktree, &ctx.issue.id, &profile.name) {
+                Ok(new_head) => {
+                    head = new_head;
+                }
+                Err(e) => {
+                    summary.eligible = false;
+                    summary.reason = format!("failed to auto-commit agent changes: {}", e);
+                }
             }
-            Err(e) => {
-                // Failed to commit, mark as dirty
-                summary.eligible = false;
-                summary.reason = format!("failed to auto-commit agent changes: {}", e);
-            }
+        } else if head == ctx.base_head {
+            // No agent commits and auto-commit didn't apply
+            summary.eligible = false;
+            summary.reason = "ralph produced no new commit".to_string();
+        } else if candidate_has_disqualifying_dirt(&dirty) {
+            // Worktree is dirty for other reasons (agent made commits but left changes)
+            summary.eligible = false;
+            summary.reason = "worktree dirty after verify_cmd".to_string();
         }
-    } else if candidate_has_disqualifying_dirt(&dirty) {
-        // Worktree is dirty for other reasons (verify failed, or agent made commits but left changes)
-        summary.eligible = false;
-        summary.reason = "worktree dirty after verify_cmd".to_string();
     }
 
     let patch = if head == ctx.base_head {
@@ -985,11 +980,9 @@ Notes:\n{}\n",
 
 fn candidate_patch(worktree: &Path, base_head: &str) -> Result<String> {
     let stat = git_stdout(worktree, ["diff", "--stat", base_head, "HEAD"])?;
-    let show = git_stdout(
-        worktree,
-        ["show", "--format=fuller", "--stat", "--patch", "HEAD"],
-    )?;
-    Ok(format!("STAT\n{stat}\n\nPATCH\n{show}"))
+    let log = git_stdout(worktree, ["log", "--oneline", base_head, "HEAD"])?;
+    let patch = git_stdout(worktree, ["diff", "--patch", base_head, "HEAD"])?;
+    Ok(format!("COMMITS\n{log}\n\nSTAT\n{stat}\n\nPATCH\n{patch}"))
 }
 
 fn run_judges(
@@ -1500,26 +1493,46 @@ fn extract_json_string_field(haystack: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Returns true if a git status --porcelain line refers to an arena scaffold
+/// file that should be ignored when checking for dirt. Scaffold files
+/// (loop-prompt.md, current-state.md) are written by the arena for agent
+/// handoff and should never disqualify a candidate regardless of their git
+/// status prefix (untracked, modified, etc.).
+fn is_scaffold_file(status_line: &str) -> bool {
+    const SCAFFOLD_FILES: &[&str] = &[
+        ".docs/ai/loop-prompt.md",
+        ".docs/ai/current-state.md",
+    ];
+
+    // Git status --porcelain format: XY <space> <path>
+    // where XY is exactly 2 chars (may include spaces, e.g. " M" for
+    // modified-in-worktree). The caller may trim() the line, stripping
+    // the leading space and shifting offsets. To be robust, we check
+    // whether the line ENDS WITH one of the scaffold paths — this works
+    // regardless of the status prefix or whether leading spaces survive.
+    SCAFFOLD_FILES
+        .iter()
+        .any(|scaffold| status_line.ends_with(scaffold) && status_line.len() > scaffold.len())
+}
+
 fn candidate_has_disqualifying_dirt(status: &str) -> bool {
-    const IGNORED_SCAFFOLD: &[&str] = &["?? .docs/ai/loop-prompt.md", "?? .docs/ai/current-state.md"];
     status
         .lines()
         .any(|line| {
             let trimmed = line.trim();
-            !trimmed.is_empty() && !IGNORED_SCAFFOLD.contains(&trimmed)
+            !trimmed.is_empty() && !is_scaffold_file(trimmed)
         })
 }
 
 /// Returns true if the worktree has uncommitted changes that should be committed
 /// by Conductor on behalf of the agent (e.g., when the agent's sandbox prevented
-/// git operations).
+/// git operations). Excludes scaffold files.
 fn candidate_has_committable_changes(status: &str) -> bool {
-    const IGNORED_SCAFFOLD: &[&str] = &["?? .docs/ai/loop-prompt.md", "?? .docs/ai/current-state.md"];
     status
         .lines()
         .any(|line| {
             let trimmed = line.trim();
-            !trimmed.is_empty() && !IGNORED_SCAFFOLD.contains(&trimmed)
+            !trimmed.is_empty() && !is_scaffold_file(trimmed)
         })
 }
 
