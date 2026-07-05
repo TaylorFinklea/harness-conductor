@@ -1357,9 +1357,13 @@ fn status_summary(code: Option<i32>) -> String {
 }
 
 fn candidate_has_disqualifying_dirt(status: &str) -> bool {
+    const IGNORED_SCAFFOLD: &[&str] = &["?? .docs/ai/loop-prompt.md", "?? .docs/ai/current-state.md"];
     status
         .lines()
-        .any(|line| line.trim() != "?? .docs/ai/loop-prompt.md")
+        .any(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !IGNORED_SCAFFOLD.contains(&trimmed)
+        })
 }
 
 fn display_command(program: &str, args: &[String]) -> String {
@@ -1547,11 +1551,17 @@ mod tests {
         assert!(!candidate_has_disqualifying_dirt(
             "?? .docs/ai/loop-prompt.md\n"
         ));
+        assert!(!candidate_has_disqualifying_dirt(
+            "?? .docs/ai/current-state.md\n"
+        ));
+        assert!(!candidate_has_disqualifying_dirt(
+            "?? .docs/ai/loop-prompt.md\n?? .docs/ai/current-state.md\n"
+        ));
         assert!(candidate_has_disqualifying_dirt(
             "?? .docs/ai/loop-prompt.md\n M src/arena.rs\n"
         ));
         assert!(candidate_has_disqualifying_dirt(
-            "?? .docs/ai/current-state.md\n"
+            "?? .docs/ai/current-state.md\n M src/arena.rs\n"
         ));
     }
 
