@@ -290,6 +290,7 @@ mod tests {
             tier_floor: tier,
             complexity,
             verify_cmd: verify_cmd.map(str::to_string),
+            trains_ok: false,
         })
     }
 

@@ -784,7 +784,7 @@ mod tests {
     use super::*;
     use crate::bd::{BdClient, BdError, Comment, Issue};
     use crate::config::{
-        Backend, Ceiling, Efficiency, ReviewConfig, RosterEntry, Tier, VerifyConfig,
+        Backend, Ceiling, Cost, Efficiency, ReviewConfig, RosterEntry, Tier, VerifyConfig,
     };
     use crate::dispatch::{
         ChildProcess, CommitProbe, DispatchFailure, DispatchStatus, Exec, ProcessStatus,
@@ -1382,6 +1382,9 @@ mod tests {
             efficiency,
             backend,
             dispatch_id: dispatch_id.to_string(),
+            provider: String::new(),
+            cost: Cost::Paid,
+            fallback: Vec::new(),
         }
     }
 

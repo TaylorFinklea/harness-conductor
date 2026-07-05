@@ -453,6 +453,9 @@ mod tests {
             efficiency,
             backend,
             dispatch_id: format!("dispatch-{name}"),
+            provider: String::new(),
+            cost: Cost::Paid,
+            fallback: Vec::new(),
         }
     }
 
@@ -548,6 +551,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         let known: Vec<&str> = roster.iter().map(|r| r.name.as_str()).collect();
         for d in &plan.dispatches {
@@ -578,6 +582,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         assert!(plan.dispatches.is_empty());
         assert!(plan.proposals.is_empty());
@@ -609,7 +614,7 @@ mod tests {
             "repo1",
             vec![issue("i1", 1, "2026-01-01T00:00:00Z", "senior", "S", None)],
         )];
-        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none(), &HashMap::new());
         assert_eq!(plan.proposals.len(), 1);
         assert_eq!(plan.proposals[0].model, "senior-model");
     }
@@ -636,6 +641,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         assert!(plan.dispatches.is_empty());
         assert!(plan.proposals.is_empty());
@@ -669,6 +675,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         assert!(
             plan.dispatches.is_empty(),
@@ -716,6 +723,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["busy-repo"]),
+        &HashMap::new(),
         );
         assert!(plan.dispatches.is_empty());
         assert!(plan.proposals.is_empty());
@@ -757,7 +765,7 @@ mod tests {
             ],
         )];
         let b = budgets(100, 1, 100); // max_active_per_repo = 1 (spec default)
-        let plan = route(&repos, &roster, &b, &ratchet_unlocked(&["repo1"]));
+        let plan = route(&repos, &roster, &b, &ratchet_unlocked(&["repo1"]), &HashMap::new());
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].issue_id, "i1");
         assert_eq!(plan.skips.len(), 1);
@@ -793,6 +801,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["chezmoi-config"]),
+        &HashMap::new(),
         );
         assert!(plan.dispatches.is_empty());
         assert!(plan.proposals.is_empty());
@@ -827,6 +836,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.dispatches[0].verify_cmd, "cargo test triage");
@@ -880,7 +890,7 @@ mod tests {
         ];
         let b = budgets(2, 100, 100); // exactly-at-ceiling boundary = 2
         let ratchet = ratchet_unlocked(&["repo1", "repo2", "repo3"]);
-        let plan = route(&repos, &roster, &b, &ratchet);
+        let plan = route(&repos, &roster, &b, &ratchet, &HashMap::new());
         assert_eq!(plan.dispatches.len(), 2, "exactly at ceiling must be allowed");
         assert_eq!(plan.skips.len(), 1, "excess beyond ceiling must be skipped");
         assert_eq!(plan.skips[0].issue_id, "i3");
@@ -930,7 +940,7 @@ mod tests {
             ),
         ];
         let b = budgets(100, 100, 1); // max_external_dispatches = 1 (pi + agy combined)
-        let plan = route(&repos, &roster, &b, &ratchet_unlocked(&["repo1", "repo2"]));
+        let plan = route(&repos, &roster, &b, &ratchet_unlocked(&["repo1", "repo2"]), &HashMap::new());
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(plan.skips.len(), 1);
         assert_eq!(plan.skips[0].reason, SkipCode::Budget);
@@ -994,6 +1004,7 @@ mod tests {
             &roster,
             &b,
             &ratchet_unlocked(&["repo-ext", "repo-int"]),
+        &HashMap::new(),
         );
         assert_eq!(
             plan.dispatches.len(),
@@ -1131,7 +1142,7 @@ mod tests {
         let b = budgets(1, 100, 100); // only 1 global dispatch allowed this cycle
         let ratchet = ratchet_unlocked(&["repo1", "repo2", "repo3-busy"]);
 
-        let plan = route(&repos, &roster, &b, &ratchet);
+        let plan = route(&repos, &roster, &b, &ratchet, &HashMap::new());
 
         assert_every_ready_item_lands_in_one_bucket(&repos, &plan);
     }
@@ -1162,7 +1173,7 @@ mod tests {
         // budgets) but the repo's ratchet has not earned unlock (e.g.
         // re-locked to 0 after a prior rejected proposal or failed verify,
         // per invariant 9) -> must propose only.
-        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none(), &HashMap::new());
         assert!(plan.dispatches.is_empty());
         assert_eq!(plan.proposals.len(), 1);
         assert_eq!(plan.proposals[0].model, "senior-model");
@@ -1193,6 +1204,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         assert_eq!(plan.dispatches.len(), 1);
         assert!(plan.proposals.is_empty());
@@ -1232,6 +1244,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         assert!(
             plan.dispatches.is_empty(),
@@ -1277,7 +1290,7 @@ mod tests {
             "repo1",
             vec![issue("i1", 1, "2026-01-01T00:00:00Z", "junior", "S", None)],
         )];
-        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none(), &HashMap::new());
         assert_eq!(plan.proposals.len(), 1);
         assert_eq!(plan.proposals[0].model, "junior-model");
     }
@@ -1304,7 +1317,7 @@ mod tests {
             "repo1",
             vec![issue("i1", 1, "2026-01-01T00:00:00Z", "senior", "M", None)],
         )];
-        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none(), &HashMap::new());
         assert_eq!(plan.proposals[0].model, "lean-senior");
     }
 
@@ -1330,7 +1343,7 @@ mod tests {
             "repo1",
             vec![issue("i1", 1, "2026-01-01T00:00:00Z", "senior", "M", None)],
         )];
-        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none());
+        let plan = route(&repos, &roster, &generous_budgets(), &ratchet_none(), &HashMap::new());
         assert_eq!(plan.proposals[0].model, "first-listed");
     }
 
@@ -1385,6 +1398,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1", "repo2"]),
+        &HashMap::new(),
         );
         assert_eq!(plan.dispatches.len(), 2);
         assert_eq!(plan.dispatches[0].model, "first-listed");
@@ -1426,6 +1440,7 @@ mod tests {
             &roster,
             &generous_budgets(),
             &ratchet_unlocked(&["repo1"]),
+        &HashMap::new(),
         );
         assert!(plan.dispatches.is_empty());
         assert!(plan.proposals.is_empty());
@@ -1477,6 +1492,7 @@ mod tests {
             &roster,
             &b,
             &ratchet_unlocked(&["repo-newer", "repo-older"]),
+        &HashMap::new(),
         );
         assert_eq!(plan.dispatches.len(), 1);
         assert_eq!(
@@ -1505,7 +1521,7 @@ mod tests {
         i.metadata = None;
         i.notes = notes.to_string();
         let repos = vec![active_repo("tesela", vec![i])];
-        let plan = route(&repos, &cfg.roster, &generous_budgets(), &ratchet_none());
+        let plan = route(&repos, &cfg.roster, &generous_budgets(), &ratchet_none(), &HashMap::new());
         // No runnable verify_cmd (verify_type is prose, not a command) and a
         // locked ratchet -> proposal, not dispatch.
         assert_eq!(plan.proposals.len(), 1);

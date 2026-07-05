@@ -428,6 +428,9 @@ mod tests {
             efficiency: Efficiency::Std,
             backend: Backend::Pi,
             dispatch_id: format!("dispatch-{name}"),
+            provider: String::new(),
+            cost: config::Cost::Paid,
+            fallback: Vec::new(),
         }
     }
 
