@@ -1556,16 +1556,14 @@ fn parse_tokens_used(stderr: &str) -> Option<u64> {
     let mut lines = stderr.lines();
     while let Some(line) = lines.next() {
         if line.trim() == "tokens used" {
-            for value in lines.by_ref() {
-                let digits = value
-                    .chars()
-                    .filter(|ch| ch.is_ascii_digit())
-                    .collect::<String>();
-                if digits.is_empty() {
-                    continue;
-                }
-                return digits.parse::<u64>().ok();
-            }
+            let value = lines.find(|line| !line.trim().is_empty())?;
+            let digits = value
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            return (!digits.is_empty())
+                .then(|| digits.parse::<u64>().ok())
+                .flatten();
         }
     }
     None
@@ -1754,6 +1752,7 @@ mod tests {
     fn parse_tokens_used_ignores_missing_or_bad_values() {
         assert_eq!(parse_tokens_used("hook: Stop\n"), None);
         assert_eq!(parse_tokens_used("tokens used\nnot-a-number\n"), None);
+        assert_eq!(parse_tokens_used("tokens used\nnot-a-number\nlater 429\n"), None);
     }
 
     #[test]
