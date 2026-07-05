@@ -822,7 +822,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
     }
 
     let dirty = git_stdout(&worktree, ["status", "--porcelain"])?;
-    if !dirty.trim().is_empty() {
+    if candidate_has_disqualifying_dirt(&dirty) {
         summary.eligible = false;
         summary.reason = "worktree dirty after verify_cmd".to_string();
     }
@@ -1356,6 +1356,12 @@ fn status_summary(code: Option<i32>) -> String {
     code.map_or_else(|| "signal".to_string(), |code| format!("exit {code}"))
 }
 
+fn candidate_has_disqualifying_dirt(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| line.trim() != "?? .docs/ai/loop-prompt.md")
+}
+
 fn display_command(program: &str, args: &[String]) -> String {
     let mut parts = vec![program.to_string()];
     parts.extend(args.iter().cloned());
@@ -1537,6 +1543,19 @@ mod tests {
     }
 
     #[test]
+    fn arena_scaffolding_loop_prompt_does_not_make_candidate_dirty() {
+        assert!(!candidate_has_disqualifying_dirt(
+            "?? .docs/ai/loop-prompt.md\n"
+        ));
+        assert!(candidate_has_disqualifying_dirt(
+            "?? .docs/ai/loop-prompt.md\n M src/arena.rs\n"
+        ));
+        assert!(candidate_has_disqualifying_dirt(
+            "?? .docs/ai/current-state.md\n"
+        ));
+    }
+
+    #[test]
     fn strict_gate_selects_only_unique_safe_threshold_winner() {
         let candidates = vec![
             CandidateSummary::eligible("cand-a", "codex", "gpt-5.5"),
@@ -1610,9 +1629,11 @@ mod tests {
         let missing_score_decision = decide_winner(&candidates, &missing_score, 40);
         assert!(!missing_score_decision.auto_apply);
         assert!(missing_score_decision.winner_profile.is_none());
-        assert!(missing_score_decision
-            .reasons
-            .iter()
-            .any(|r| r.contains("missing complete judge scores")));
+        assert!(
+            missing_score_decision
+                .reasons
+                .iter()
+                .any(|r| r.contains("missing complete judge scores"))
+        );
     }
 }
