@@ -800,7 +800,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
         });
     }
 
-    let head = git_stdout(&worktree, ["rev-parse", "HEAD"])?;
+    let mut head = git_stdout(&worktree, ["rev-parse", "HEAD"])?;
     if head == ctx.base_head {
         summary.eligible = false;
         summary.reason = "ralph produced no new commit".to_string();
@@ -821,8 +821,29 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
         summary.reason = format!("verify_cmd exited {}", status_summary(verify_run.code));
     }
 
+    // Check for uncommitted changes after verify
     let dirty = git_stdout(&worktree, ["status", "--porcelain"])?;
-    if candidate_has_disqualifying_dirt(&dirty) {
+    let post_verify_head = git_stdout(&worktree, ["rev-parse", "HEAD"])?;
+    
+    // If verify passed and there are uncommitted changes but no agent commits,
+    // commit on behalf of the agent (handles sandbox git permission issues)
+    if verify_run.success 
+        && candidate_has_committable_changes(&dirty) 
+        && post_verify_head == ctx.base_head 
+    {
+        match commit_on_behalf_of_agent(&worktree, &ctx.issue.id, &profile.name) {
+            Ok(new_head) => {
+                // Successfully committed, update head
+                head = new_head;
+            }
+            Err(e) => {
+                // Failed to commit, mark as dirty
+                summary.eligible = false;
+                summary.reason = format!("failed to auto-commit agent changes: {}", e);
+            }
+        }
+    } else if candidate_has_disqualifying_dirt(&dirty) {
+        // Worktree is dirty for other reasons (verify failed, or agent made commits but left changes)
         summary.eligible = false;
         summary.reason = "worktree dirty after verify_cmd".to_string();
     }
@@ -1364,6 +1385,34 @@ fn candidate_has_disqualifying_dirt(status: &str) -> bool {
             let trimmed = line.trim();
             !trimmed.is_empty() && !IGNORED_SCAFFOLD.contains(&trimmed)
         })
+}
+
+/// Returns true if the worktree has uncommitted changes that should be committed
+/// by Conductor on behalf of the agent (e.g., when the agent's sandbox prevented
+/// git operations).
+fn candidate_has_committable_changes(status: &str) -> bool {
+    const IGNORED_SCAFFOLD: &[&str] = &["?? .docs/ai/loop-prompt.md", "?? .docs/ai/current-state.md"];
+    status
+        .lines()
+        .any(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !IGNORED_SCAFFOLD.contains(&trimmed)
+        })
+}
+
+/// Stage and commit all changes in the worktree on behalf of the agent.
+/// This is used when the agent successfully implemented the feature but couldn't
+/// commit due to sandbox restrictions.
+fn commit_on_behalf_of_agent(worktree: &Path, issue_id: &str, profile_name: &str) -> Result<String> {
+    // Stage all changes
+    git_checked(worktree, ["add", "-A"])?;
+    
+    // Commit with a message that identifies the agent and issue
+    let commit_msg = format!("arena: {} implementation by {} (auto-committed)", issue_id, profile_name);
+    git_checked(worktree, ["commit", "-m", &commit_msg])?;
+    
+    // Return the new HEAD
+    git_stdout(worktree, ["rev-parse", "HEAD"])
 }
 
 fn display_command(program: &str, args: &[String]) -> String {
