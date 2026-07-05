@@ -405,6 +405,12 @@ pub(crate) fn run(
     let report_path = deck::write_report(reports_home, &report)
         .map_err(|e| ArenaError::new(format!("report: {e}")))?;
 
+    match refresh_scorecard_digest(&home_dir()) {
+        Ok(Some(warning)) => eprintln!("arena: {warning}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("arena: scorecard digest skipped: {e}"),
+    }
+
     if !cfg.arena.keep_worktrees {
         cleanup_worktrees(&ctx, &candidate_runs)?;
     }
@@ -1446,6 +1452,36 @@ fn parse_tokens_used(stderr: &str) -> Option<u64> {
     None
 }
 
+fn scorecard_digest_script_path(home: &Path) -> PathBuf {
+    home.join(".local")
+        .join("lib")
+        .join("scorecard")
+        .join("gen-scorecard-digest.mjs")
+}
+
+fn refresh_scorecard_digest(home: &Path) -> Result<Option<String>> {
+    let script = scorecard_digest_script_path(home);
+    if !script.exists() {
+        return Ok(None);
+    }
+    let output = Command::new("node")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| ArenaError::new(format!("failed to run scorecard digest: {e}")))?;
+    if output.status.success() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "scorecard digest exited {}: {}",
+            status_summary(output.status.code()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
 fn complexity_label(complexity: Ceiling) -> &'static str {
     match complexity {
         Ceiling::S => "S",
@@ -1599,6 +1635,31 @@ mod tests {
     fn parse_tokens_used_ignores_missing_or_bad_values() {
         assert_eq!(parse_tokens_used("hook: Stop\n"), None);
         assert_eq!(parse_tokens_used("tokens used\nnot-a-number\n"), None);
+    }
+
+    #[test]
+    fn scorecard_digest_script_path_points_under_home() {
+        let home = std::path::PathBuf::from("/tmp/fake-home");
+        assert_eq!(
+            scorecard_digest_script_path(&home),
+            home.join(".local")
+                .join("lib")
+                .join("scorecard")
+                .join("gen-scorecard-digest.mjs")
+        );
+    }
+
+    #[test]
+    fn refresh_scorecard_digest_skips_missing_script() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("arena-digest-missing-{nanos}"));
+        std::fs::create_dir_all(&home).expect("mkdir temp home");
+        let warning = refresh_scorecard_digest(&home).expect("missing script is not an error");
+        assert!(warning.is_none());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
