@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::bd::BdClient;
-use crate::config::Config;
+use crate::config::{Config, CostPolicy};
 use crate::deck::{self, Bar, Block, CalloutLevel, Metric, Report, ReportStatus};
 use crate::plan::CyclePlan;
 use crate::scan::{self, RepoSnapshot, SkipReason, ZeroState};
@@ -80,7 +80,18 @@ pub(crate) fn run_dry_run_with_timestamps(
 
     // 2. Triage (dry-run: all ratchets locked → propose-only)
     let ratchet: HashMap<String, RatchetState> = HashMap::new();
-    let plan = triage::route(&snapshots, &cfg.roster, &cfg.budgets, &ratchet);
+    let repo_cost_policy_by_repo: HashMap<String, CostPolicy> = cfg
+        .repo_policies
+        .iter()
+        .map(|p| (p.repo.clone(), p.cost_policy))
+        .collect();
+    let plan = triage::route(
+        &snapshots,
+        &cfg.roster,
+        &cfg.budgets,
+        &ratchet,
+        &repo_cost_policy_by_repo,
+    );
 
     // 3. Build and save cycle plan
     let cycle_plan = CyclePlan::from_triage(cycle_id, created_at, &plan);

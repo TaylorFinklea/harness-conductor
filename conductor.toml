@@ -98,6 +98,70 @@ harness = "opencode"
 model = "opencode-go/qwen3.7-max"
 provider_group = "opencode-go"
 
+# NeuralWatt provider lane — same base models as opencode-go but a distinct
+# provider/account (quota isolation). Valuable as fallback when the shared
+# opencode-go weekly quota is exhausted. Also serves the fast/short variants.
+
+[[arena_profile]]
+name = "pi-nw-glm52"
+harness = "pi"
+model = "neuralwatt/glm-5.2"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "opencode-nw-glm52"
+harness = "opencode"
+model = "neuralwatt/glm-5.2"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "pi-nw-glm52-short"
+harness = "pi"
+model = "neuralwatt/glm-5.2-short"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "opencode-nw-glm52-short"
+harness = "opencode"
+model = "neuralwatt/glm-5.2-short"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "pi-nw-glm52-fast"
+harness = "pi"
+model = "neuralwatt/glm-5.2-fast"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "opencode-nw-glm52-fast"
+harness = "opencode"
+model = "neuralwatt/glm-5.2-fast"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "pi-nw-kimi-k26"
+harness = "pi"
+model = "neuralwatt/kimi-k2.6"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "opencode-nw-kimi-k26"
+harness = "opencode"
+model = "neuralwatt/kimi-k2.6"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "pi-nw-kimi-k26-fast"
+harness = "pi"
+model = "neuralwatt/kimi-k2.6-fast"
+provider_group = "neuralwatt"
+
+[[arena_profile]]
+name = "opencode-nw-kimi-k26-fast"
+harness = "opencode"
+model = "neuralwatt/kimi-k2.6-fast"
+provider_group = "neuralwatt"
+
 [[arena_judge]]
 name = "qwen37max"
 backend = "pi"
@@ -107,6 +171,11 @@ dispatch_id = "opencode-go/qwen3.7-max"
 name = "gpt55"
 backend = "pi"
 dispatch_id = "openai-codex/gpt-5.5"
+
+[[arena_judge]]
+name = "nw-glm52"
+backend = "pi"
+dispatch_id = "neuralwatt/glm-5.2"
 
 # Initial roster from scorecard 2026-07-01.
 # (sonnet-5's scorecard "XL via decomposition" is capped to L here because
@@ -167,3 +236,48 @@ ceiling = "S"
 efficiency = "lean"
 backend = "agy"
 dispatch_id = "Gemini 3.5 Flash (High)"
+
+# NeuralWatt provider lane — distinct account from opencode-go (quota isolation).
+# Same base models; the fast (non-reasoning) variants land as Junior, the short
+# (200K context, reasoning) variants stay Senior. Use as fallback when the
+# shared opencode-go weekly quota is exhausted.
+
+[[roster]]
+name = "nw-glm-5.2"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "neuralwatt/glm-5.2"
+
+[[roster]]
+name = "nw-glm-5.2-short"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "neuralwatt/glm-5.2-short"
+
+[[roster]]
+name = "nw-glm-5.2-fast"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "neuralwatt/glm-5.2-fast"
+
+[[roster]]
+name = "nw-kimi-k2.6"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "neuralwatt/kimi-k2.6"
+
+[[roster]]
+name = "nw-kimi-k2.6-fast"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "neuralwatt/kimi-k2.6-fast"

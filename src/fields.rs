@@ -25,12 +25,16 @@ use crate::config::{Ceiling, Tier};
 /// Routing fields extracted from a bead: `tier_floor` and `complexity` are
 /// always present when `Triage::Triaged`; `verify_cmd` is optional (a missing
 /// `verify_cmd` flags the item for triage downstream but does not make it
-/// Untriaged — see conductor-v1-spec invariant 3).
+/// Untriaged — see conductor-v1-spec invariant 3). `trains_ok` is an item-level
+/// opt-in that lifts the `FreeTrainsInput` repo-policy gate (bead metadata
+/// `data_policy: trains-ok` — e.g. a public-dataset task on a proprietary
+/// repo).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutingFields {
     pub(crate) tier_floor: Tier,
     pub(crate) complexity: Ceiling,
     pub(crate) verify_cmd: Option<String>,
+    pub(crate) trains_ok: bool,
 }
 
 /// Which required field was missing or unparseable. `verify_cmd` is not a
@@ -59,12 +63,14 @@ pub(crate) fn extract(issue: &Issue) -> Triage {
     let tier_floor = extract_tier(metadata, notes);
     let complexity = extract_complexity(metadata, notes);
     let verify_cmd = extract_verify_cmd(metadata);
+    let trains_ok = extract_trains_ok(metadata);
 
     if let (Some(tier_floor), Some(complexity)) = (tier_floor, complexity) {
         return Triage::Triaged(RoutingFields {
             tier_floor,
             complexity,
             verify_cmd,
+            trains_ok,
         });
     }
     let mut missing = Vec::new();
@@ -185,6 +191,22 @@ fn extract_verify_cmd(metadata: Option<&BTreeMap<String, Value>>) -> Option<Stri
     let map = metadata?;
     let value = map.get("verify_cmd")?;
     value.as_str().map(str::to_string)
+}
+
+/// Extract the per-item `data_policy` opt-in. A bead carrying
+/// `data_policy: "trains-ok"` lifts the `FreeTrainsInput` repo-policy gate
+/// (lets a free-train model run on a proprietary repo for a specific item).
+fn extract_trains_ok(metadata: Option<&BTreeMap<String, Value>>) -> bool {
+    let Some(map) = metadata else {
+        return false;
+    };
+    let Some(value) = map.get("data_policy") else {
+        return false;
+    };
+    match value.as_str() {
+        Some(s) => s.trim().eq_ignore_ascii_case("trains-ok"),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

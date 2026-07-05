@@ -113,6 +113,87 @@ pub(crate) enum Backend {
     Agy,
 }
 
+/// Cost axis on a roster entry — orthogonal to `Tier`. A free model can sit
+/// at any tier; `cost` only gates eligibility per-repo (see `CostPolicy`).
+/// `FreeTrainsInput` models a free provider that trains on submitted input
+/// (e.g. Google AI Studio free tier); it is excluded from proprietary/internal
+/// repos unless a bead opts in via `data_policy: trains-ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cost {
+    Paid,
+    Free,
+    FreeTrainsInput,
+}
+
+impl Default for Cost {
+    fn default() -> Self {
+        Cost::Paid
+    }
+}
+
+impl FromStr for Cost {
+    type Err = ConfigError;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "paid" => Ok(Cost::Paid),
+            "free" => Ok(Cost::Free),
+            "free-trains-input" => Ok(Cost::FreeTrainsInput),
+            _ => Err(ConfigError::new(format!(
+                "unknown cost {s:?} (expected paid|free|free-trains-input)"
+            ))),
+        }
+    }
+}
+
+/// Per-repo data Policy. `Proprietary`/`Internal` exclude `FreeTrainsInput`
+/// models; `Oss`/`Public` allow them. A repo absent from `[[repo_policy]]`
+/// defaults to `Proprietary` (fail closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostPolicy {
+    Proprietary,
+    Internal,
+    Oss,
+    Public,
+}
+
+impl Default for CostPolicy {
+    fn default() -> Self {
+        CostPolicy::Proprietary
+    }
+}
+
+impl FromStr for CostPolicy {
+    type Err = ConfigError;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "proprietary" => Ok(CostPolicy::Proprietary),
+            "internal" => Ok(CostPolicy::Internal),
+            "oss" => Ok(CostPolicy::Oss),
+            "public" => Ok(CostPolicy::Public),
+            _ => Err(ConfigError::new(format!(
+                "unknown cost_policy {s:?} (expected proprietary|internal|oss|public)"
+            ))),
+        }
+    }
+}
+
+impl CostPolicy {
+    /// Whether a model of the given `Cost` is eligible under this policy.
+    pub(crate) fn allows(self, cost: Cost) -> bool {
+        match (self, cost) {
+            (CostPolicy::Proprietary | CostPolicy::Internal, Cost::FreeTrainsInput) => false,
+            _ => true,
+        }
+    }
+}
+
+/// A single `[[repo_policy]]` entry mapping a repo name to its `CostPolicy`.
+#[derive(Debug, Clone)]
+pub(crate) struct RepoPolicy {
+    pub(crate) repo: String,
+    pub(crate) cost_policy: CostPolicy,
+}
+
 impl FromStr for Backend {
     type Err = ConfigError;
     fn from_str(s: &str) -> Result<Self> {
@@ -158,6 +239,19 @@ pub(crate) struct RosterEntry {
     pub(crate) efficiency: Efficiency,
     pub(crate) backend: Backend,
     pub(crate) dispatch_id: String,
+    /// Which provider/account this model lives on (mirrors
+    /// `arena_profile.provider_group`; unify on a single name in a later
+    /// phase). Empty string when unset (defaults to "" so existing rows
+    /// parse — drift detection only).
+    pub(crate) provider: String,
+    /// Cost axis — `paid` (default) | `free` | `free-trains-input`. Gates
+    /// per-repo eligibility; orthogonal to `Tier`.
+    pub(crate) cost: Cost,
+    /// Ordered list of roster entry names to try on a classified retryable
+    /// failure (429 / quota / rate_limit). Empty by default. Walked by the
+    /// dispatcher (Phase 3); triage picks ONE model and the chain only kicks
+    /// in at runtime. Names must exist in the roster (validated at parse).
+    pub(crate) fallback: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +367,20 @@ pub(crate) struct Config {
     pub(crate) review: ReviewConfig,
     pub(crate) arena: ArenaConfig,
     pub(crate) roster: Vec<RosterEntry>,
+    /// Per-repo `[[repo_policy]]` entries; absent repos default to
+    /// `CostPolicy::Proprietary` (fail closed for `FreeTrainsInput`).
+    pub(crate) repo_policies: Vec<RepoPolicy>,
+}
+
+impl Config {
+    /// Look up the `CostPolicy` for a repo, defaulting to `Proprietary`.
+    pub(crate) fn cost_policy_for(&self, repo: &str) -> CostPolicy {
+        self.repo_policies
+            .iter()
+            .find(|p| p.repo == repo)
+            .map(|p| p.cost_policy)
+            .unwrap_or_default()
+    }
 }
 
 // Repos hard-excluded from scanning regardless of the config `[scan] exclude`
@@ -697,6 +805,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "arena_profile"
                 | "arena_judge"
                 | "roster"
+                | "repo_policy"
         ) {
             return Err(ConfigError::new(format!("unknown config key: {key}")));
         }
@@ -716,6 +825,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         doc.get("arena_judge"),
     )?;
     let roster = parse_roster(doc.get("roster"))?;
+    let repo_policies = parse_repo_policies(doc.get("repo_policy"), &roster)?;
     Ok(Config {
         autonomy,
         scan,
@@ -724,6 +834,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         review,
         arena,
         roster,
+        repo_policies,
     })
 }
 
@@ -945,6 +1056,7 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
             if !matches!(
                 key.as_str(),
                 "name" | "tier" | "ceiling" | "efficiency" | "backend" | "dispatch_id"
+                    | "provider" | "cost" | "fallback"
             ) {
                 return Err(ConfigError::new(format!(
                     "unknown roster key in entry {i}: {key}"
@@ -957,6 +1069,28 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
         let efficiency = get_required_str(t, i, "efficiency")?.parse::<Efficiency>()?;
         let backend = get_required_str(t, i, "backend")?.parse::<Backend>()?;
         let dispatch_id = get_required_str(t, i, "dispatch_id")?;
+        let provider = match t.get("provider") {
+            Some(Node::Str(s)) => s.clone(),
+            Some(_) => {
+                return Err(ConfigError::new(format!(
+                    "roster entry {i} field provider must be a string"
+                )))
+            }
+            None => String::new(),
+        };
+        let cost = match t.get("cost") {
+            Some(Node::Str(s)) => s.parse::<Cost>()?,
+            Some(_) => {
+                return Err(ConfigError::new(format!(
+                    "roster entry {i} field cost must be a string"
+                )))
+            }
+            None => Cost::Paid,
+        };
+        let fallback = match t.get("fallback") {
+            Some(node) => expect_str_arr("roster.fallback", node)?,
+            None => Vec::new(),
+        };
         if !seen.insert(name.clone()) {
             return Err(ConfigError::new(format!("duplicate roster name: {name}")));
         }
@@ -967,7 +1101,57 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
             efficiency,
             backend,
             dispatch_id,
+            provider,
+            cost,
+            fallback,
         });
+    }
+    Ok(out)
+}
+
+fn parse_repo_policies(node: Option<&Node>, roster: &[RosterEntry]) -> Result<Vec<RepoPolicy>> {
+    let entries = match node {
+        None => return Ok(Vec::new()),
+        Some(Node::Tables(v)) => v,
+        Some(_) => {
+            return Err(ConfigError::new(
+                "repo_policy must be an array of tables ([[repo_policy]])",
+            ));
+        }
+    };
+    let roster_names: HashSet<&str> = roster.iter().map(|r| r.name.as_str()).collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, t) in entries.iter().enumerate() {
+        for key in t.keys() {
+            if !matches!(key.as_str(), "repo" | "cost_policy") {
+                return Err(ConfigError::new(format!(
+                    "unknown repo_policy key in entry {i}: {key}"
+                )));
+            }
+        }
+        let repo = get_required_str_at("repo_policy", t, i, "repo")?;
+        let cost_policy = get_required_str_at("repo_policy", t, i, "cost_policy")?
+            .parse::<CostPolicy>()?;
+        if !seen.insert(repo.clone()) {
+            return Err(ConfigError::new(format!(
+                "duplicate repo_policy repo: {repo}"
+            )));
+        }
+        out.push(RepoPolicy { repo, cost_policy });
+    }
+    // Validate that `fallback` references on roster entries resolve to
+    // existing roster names (fail closed at parse time so a typo can't
+    // silently disable a fallback chain at runtime).
+    for entry in roster {
+        for fb in &entry.fallback {
+            if !roster_names.contains(fb.as_str()) {
+                return Err(ConfigError::new(format!(
+                    "roster entry {:?} fallback references unknown roster name {:?}",
+                    entry.name, fb
+                )));
+            }
+        }
     }
     Ok(out)
 }

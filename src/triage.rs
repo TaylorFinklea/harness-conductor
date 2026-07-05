@@ -36,7 +36,8 @@
 use std::collections::HashMap;
 
 use crate::bd::Issue;
-use crate::config::{Backend, Budgets, Ceiling, Efficiency, RosterEntry, Tier};
+#[allow(unused_imports)]
+use crate::config::{Backend, Budgets, Ceiling, Cost, CostPolicy, Efficiency, RosterEntry, Tier};
 use crate::fields::{extract, MissingField, RoutingFields, Triage};
 use crate::scan::{RepoSnapshot, SkipReason};
 
@@ -173,11 +174,23 @@ fn skip_code_for(reason: &SkipReason) -> SkipCode {
 /// `tier ≥ tier_floor` and `ceiling ≥ complexity`, narrowed to the lowest
 /// qualifying tier, then the most efficient, then fewest dispatches so far
 /// this cycle, then roster order. `None` means over-ceiling (no candidate).
+///
+/// Cost-axis gate: a model whose `cost` is `FreeTrainsInput` is only eligible
+/// when the repo's `CostPolicy` allows it (`oss`/`public`), OR the item opts
+/// in via `routing.trains_ok`. Applied after the tier/ceiling filter, before
+/// the efficiency tiebreak, so a free-train model never shadows a paid one on
+/// a proprietary repo.
 fn select_candidate<'a>(
     roster: &'a [RosterEntry],
     routing: &RoutingFields,
+    repo: &str,
+    repo_cost_policy: CostPolicy,
     dispatch_count_by_model: &HashMap<String, u32>,
 ) -> Option<&'a RosterEntry> {
+    // `repo` is consumed by Phase 3's dispatcher to log failover context;
+    // the cost gate uses `repo_cost_policy` directly. Silence the dead-store
+    // here rather than dropping the parameter (keeps the call site stable).
+    let _ = repo;
     let mut qualifying: Vec<(usize, &RosterEntry)> = roster
         .iter()
         .enumerate()
@@ -185,6 +198,7 @@ fn select_candidate<'a>(
             tier_rank(r.tier) >= tier_rank(routing.tier_floor)
                 && ceiling_rank(r.ceiling) >= ceiling_rank(routing.complexity)
         })
+        .filter(|(_, r)| routing.trains_ok || repo_cost_policy.allows(r.cost))
         .collect();
     if qualifying.is_empty() {
         return None;
@@ -215,11 +229,17 @@ fn select_candidate<'a>(
 
 /// Runs the pure triage core over one cycle's fleet snapshot, producing a
 /// `Plan`. No IO: all inputs are already-gathered data.
+///
+/// `repo_cost_policy_by_repo` is a per-repo lookup of `CostPolicy`; repos
+/// absent from the map default to `CostPolicy::Proprietary` (fail closed for
+/// `FreeTrainsInput` models). In production this is built from the config's
+/// `[[repo_policy]]` entries (see `Config::cost_policy_for`).
 pub(crate) fn route(
     repos: &[RepoSnapshot],
     roster: &[RosterEntry],
     budgets: &Budgets,
     ratchet: &HashMap<String, RatchetState>,
+    repo_cost_policy_by_repo: &HashMap<String, CostPolicy>,
 ) -> Plan {
     let mut plan = Plan::default();
 
@@ -269,8 +289,17 @@ pub(crate) fn route(
                 });
             }
             Triage::Triaged(routing) => {
-                let Some(chosen) = select_candidate(roster, &routing, &dispatch_count_by_model)
-                else {
+                let repo_policy = repo_cost_policy_by_repo
+                    .get(repo_name)
+                    .copied()
+                    .unwrap_or_default();
+                let Some(chosen) = select_candidate(
+                    roster,
+                    &routing,
+                    repo_name,
+                    repo_policy,
+                    &dispatch_count_by_model,
+                ) else {
                     // Step 3: no candidate qualifies (complexity above every
                     // qualifying ceiling) -> over-ceiling flag.
                     plan.flags.push(Flag::OverCeiling {
