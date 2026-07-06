@@ -236,6 +236,12 @@ struct DispatchOneResult {
     dispatches: u64,
 }
 
+struct WorkerAttempt {
+    roster: RosterEntry,
+    result: dispatch::DispatchResult,
+    attempts: u64,
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -297,32 +303,26 @@ fn dispatch_one<
     let before_head = commits
         .head(&repo_path)
         .map_err(|e| DispatchCycleError::message(format!("git head before worker: {e}")))?;
-    let request = DispatchRequest {
-        repo: repo_path.clone(),
-        cycle_id: cycle_id.to_string(),
-        bead_id: item.issue_id.clone(),
-        backend: roster.backend,
-        dispatch_id: roster.dispatch_id.clone(),
-        prompt,
-    };
-
     let worker_step = format!("worker {}/{}", item.repo, item.issue_id);
-    let dispatch_result = dispatch::run_with_heartbeat(
+    let worker_attempt = run_worker_chain(
+        cfg,
         exec,
         commits,
-        &request,
         state_dir,
-        options.item_timeout,
-        options.heartbeat_interval,
-        |_elapsed| {
-            let bounded = duration_millis_u64(cycle_start.elapsed());
-            let live_update = LiveUpdate::new(timestamp())
-                .with_step(worker_step.clone())
-                .with_elapsed_ms(bounded)
-                .with_progress(progress.unwrap_or(0.0));
-            live.patch(report_path, &live_update)
-                .map_err(dispatch::DispatchError::new)
-        },
+        ledger_path,
+        cycle_id,
+        options,
+        live,
+        report_path,
+        cycle_start,
+        item,
+        roster,
+        &claimed,
+        &extracted,
+        &repo_path,
+        &prompt,
+        &worker_step,
+        progress,
     )
     .map_err(|e| {
         let _ = bd.release(&repo_path, &item.issue_id);
@@ -344,6 +344,7 @@ fn dispatch_one<
         );
         DispatchCycleError::message(format!("dispatch: {e}"))
     })?;
+    let active_roster = worker_attempt.roster;
 
     patch_live(
         live,
@@ -359,13 +360,13 @@ fn dispatch_one<
         issue: claimed.clone(),
         verify_cmd: extracted.verify_cmd.clone(),
         verify: cfg.verify.clone(),
-        worker_status: dispatch_result.status.clone(),
+        worker_status: worker_attempt.result.status.clone(),
         before_head,
     };
     let review = ReviewSettings {
         config: cfg.review.clone(),
         roster: cfg.roster.clone(),
-        dispatched_model: roster.clone(),
+        dispatched_model: active_roster.clone(),
         item_tier_floor: extracted.tier_floor,
     };
     let outcome = verify::run_with_review(bd, exec, commits, &verify_request, &review)
@@ -395,7 +396,7 @@ fn dispatch_one<
     }
     append_ledger(
         ledger_path,
-        roster,
+        &active_roster,
         &item.repo,
         &claimed,
         &extracted,
@@ -406,8 +407,163 @@ fn dispatch_one<
     )?;
     Ok(DispatchOneResult {
         decision: outcome.decision,
-        dispatches: 1 + outcome.review_dispatches,
+        dispatches: worker_attempt.attempts + outcome.review_dispatches,
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps fallback runtime explicit at dispatch boundary"
+)]
+fn run_worker_chain<E, C, L>(
+    cfg: &Config,
+    exec: &E,
+    commits: &C,
+    state_dir: &Path,
+    ledger_path: &Path,
+    cycle_id: &str,
+    options: &DispatchCycleOptions,
+    live: &L,
+    report_path: &Path,
+    cycle_start: Instant,
+    item: &PlannedItem,
+    initial_roster: &RosterEntry,
+    issue: &Issue,
+    fields: &ExtractedFields,
+    repo_path: &Path,
+    prompt: &str,
+    worker_step: &str,
+    progress: Option<f64>,
+) -> std::result::Result<WorkerAttempt, DispatchCycleError>
+where
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+    L: LiveSink + ?Sized,
+{
+    let chain = fallback_chain(&cfg.roster, initial_roster)?;
+    let mut attempts = 0_u64;
+    for (idx, roster) in chain.iter().enumerate() {
+        attempts += 1;
+        let request = DispatchRequest {
+            repo: repo_path.to_path_buf(),
+            cycle_id: cycle_id.to_string(),
+            bead_id: item.issue_id.clone(),
+            backend: roster.backend,
+            dispatch_id: roster.dispatch_id.clone(),
+            prompt: prompt.to_string(),
+        };
+        let result = dispatch::run_with_heartbeat(
+            exec,
+            commits,
+            &request,
+            state_dir,
+            options.item_timeout,
+            options.heartbeat_interval,
+            |_elapsed| {
+                let bounded = duration_millis_u64(cycle_start.elapsed());
+                let live_update = LiveUpdate::new(timestamp())
+                    .with_step(worker_step.to_string())
+                    .with_elapsed_ms(bounded)
+                    .with_progress(progress.unwrap_or(0.0));
+                live.patch(report_path, &live_update)
+                    .map_err(dispatch::DispatchError::new)
+            },
+        )
+        .map_err(|e| DispatchCycleError::message(e.to_string()))?;
+
+        let Some(reason) = retryable_failure_reason(&result)? else {
+            return Ok(WorkerAttempt {
+                roster: roster.clone(),
+                result,
+                attempts,
+            });
+        };
+        let Some(next) = chain.get(idx + 1) else {
+            return Ok(WorkerAttempt {
+                roster: roster.clone(),
+                result,
+                attempts,
+            });
+        };
+        append_ledger(
+            ledger_path,
+            roster,
+            &item.repo,
+            issue,
+            fields,
+            "implement",
+            false,
+            cycle_id,
+            &format!(
+                "retryable worker failure ({reason}); failover to {}",
+                next.name
+            ),
+        )?;
+        patch_live(
+            live,
+            report_path,
+            cycle_start,
+            format!(
+                "failover {}/{}: {} -> {}",
+                item.repo, item.issue_id, roster.name, next.name
+            ),
+            progress,
+        )?;
+    }
+    Err(DispatchCycleError::message("empty worker fallback chain"))
+}
+
+fn fallback_chain(
+    roster: &[RosterEntry],
+    initial: &RosterEntry,
+) -> std::result::Result<Vec<RosterEntry>, DispatchCycleError> {
+    let mut chain = Vec::with_capacity(1 + initial.fallback.len());
+    chain.push(initial.clone());
+    for name in &initial.fallback {
+        let entry = roster
+            .iter()
+            .find(|entry| entry.name == *name)
+            .ok_or_else(|| {
+                DispatchCycleError::message(format!(
+                    "roster entry {} fallback references unknown model {name}",
+                    initial.name
+                ))
+            })?;
+        chain.push(entry.clone());
+    }
+    Ok(chain)
+}
+
+fn retryable_failure_reason(
+    result: &dispatch::DispatchResult,
+) -> std::result::Result<Option<String>, DispatchCycleError> {
+    if !matches!(result.status, dispatch::DispatchStatus::Failed(_)) {
+        return Ok(None);
+    }
+    let stderr = std::fs::read_to_string(&result.stderr_path).map_err(|e| {
+        DispatchCycleError::message(format!(
+            "read worker stderr {}: {e}",
+            result.stderr_path.display()
+        ))
+    })?;
+    if !is_retryable_worker_stderr(&stderr) {
+        return Ok(None);
+    }
+    let reason = stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("retryable provider failure")
+        .trim()
+        .to_string();
+    Ok(Some(reason))
+}
+
+fn is_retryable_worker_stderr(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("429")
+        || stderr.contains("quota")
+        || stderr.contains("rate_limit")
+        || stderr.contains("rate limit")
 }
 
 struct ExtractedFields {
@@ -906,6 +1062,117 @@ dispatch_id = "senior-reviewer"
         assert_eq!(rows[1]["model"], "fake-worker");
     }
 
+    #[test]
+    fn fallback_e2e_retries_retryable_worker_failure_and_verifies_fallback_commit() {
+        let temp = TempDir::new("fallback-e2e-sandbox");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "primary-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "primary-worker"
+fallback = ["fallback-worker"]
+
+[[roster]]
+name = "fallback-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fallback-worker"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-20260706-fallback";
+        write_plan_with_proposal(
+            &state,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "primary-worker",
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = FallbackExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+
+        let result = run_dispatch_cycle(
+            &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+        )
+        .expect("approved fallback dispatch succeeds");
+
+        assert_eq!(result.gate, ApprovalGate::Approved);
+        assert_eq!(result.dispatched, 2, "primary attempt + fallback attempt");
+        assert_eq!(result.verified, 1);
+        assert_eq!(bd.close_count(), 1);
+
+        let spawns = exec.spawns();
+        assert_eq!(spawns.len(), 3, "primary worker + fallback worker + verify");
+        assert!(spawns[0].argv.contains(&"primary-worker".to_string()));
+        assert!(spawns[1].argv.contains(&"fallback-worker".to_string()));
+        assert_eq!(spawns[1].cwd, repo);
+
+        let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
+        let rows: Vec<serde_json::Value> = ledger_line
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("ledger line json"))
+            .collect();
+        assert_eq!(rows.len(), 2, "failover row + final implement row");
+        assert_eq!(rows[0]["model"], "primary-worker");
+        assert_eq!(rows[0]["verify_passed"], false);
+        assert!(
+            rows[0]["notes"]
+                .as_str()
+                .expect("notes")
+                .contains("failover to fallback-worker")
+        );
+        assert_eq!(rows[1]["model"], "fallback-worker");
+        assert_eq!(rows[1]["verify_passed"], true);
+    }
+
+    #[test]
+    fn retryable_worker_stderr_classifier_matches_provider_limit_signals() {
+        assert!(is_retryable_worker_stderr("HTTP 429: too many requests"));
+        assert!(is_retryable_worker_stderr("quota exceeded"));
+        assert!(is_retryable_worker_stderr("provider returned rate_limit"));
+        assert!(is_retryable_worker_stderr("provider returned rate limit"));
+        assert!(!is_retryable_worker_stderr("syntax error in worker prompt"));
+    }
+
     fn fixture_config(root: &Path) -> &str {
         Box::leak(
             format!(
@@ -1376,6 +1643,63 @@ dispatch_id = "fake-worker"
                     &request.cwd,
                     "git",
                     &["commit", "-m", "worker: complete sandbox bead"],
+                );
+                return Ok(Box::new(FakeChild::delayed_success()));
+            }
+            if request.argv.first().map(String::as_str) == Some("sh") {
+                let output = Command::new(&request.argv[0])
+                    .args(&request.argv[1..])
+                    .current_dir(&request.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("spawn verify shell");
+                std::fs::write(&request.stdout_path, &output.stdout).expect("write verify stdout");
+                std::fs::write(&request.stderr_path, &output.stderr).expect("write verify stderr");
+                let code = output.status.code().unwrap_or(1);
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(code))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    struct FallbackExec {
+        spawns: RefCell<Vec<SpawnRequest>>,
+    }
+
+    impl FallbackExec {
+        fn new() -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn spawns(&self) -> Vec<SpawnRequest> {
+            self.spawns.borrow().clone()
+        }
+    }
+
+    impl Exec for FallbackExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            self.spawns.borrow_mut().push(request.clone());
+            if request.argv.iter().any(|arg| arg == "primary-worker") {
+                std::fs::write(&request.stdout_path, b"").expect("write primary stdout");
+                std::fs::write(&request.stderr_path, b"429 quota exceeded\n")
+                    .expect("write primary stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
+            }
+            if request.argv.iter().any(|arg| arg == "fallback-worker") {
+                std::fs::write(&request.stdout_path, b"fallback worker ran\n")
+                    .expect("write fallback stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
+                std::fs::write(request.cwd.join("worker.txt"), b"done\n")
+                    .expect("write worker file");
+                run(&request.cwd, "git", &["add", "worker.txt"]);
+                run(
+                    &request.cwd,
+                    "git",
+                    &["commit", "-m", "worker: fallback complete sandbox bead"],
                 );
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
