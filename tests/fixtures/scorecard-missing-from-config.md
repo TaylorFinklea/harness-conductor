@@ -17,6 +17,7 @@ This scorecard has a model that's not in conductor.toml.
 | **qwen3.6-plus** | opencode-go/qwen3.6-plus | **Junior** | S | unproven | Test fixture |
 | **deepseek-v4-flash** | opencode-go/deepseek-v4-flash | **Junior** | S | unproven | Test fixture |
 | **gemini-3.5-flash-free** | google-ai-studio/gemini-3.5-flash | **Junior** | S | unproven | Test fixture |
+| **agy-gemini-3.5-flash-free** | Gemini 3.5 Flash (High) | **Junior** | S | unproven | Test fixture |
 | **nw-glm-5.2** | neuralwatt/glm-5.2 | **Senior** | M | good | Test fixture |
 | **nw-glm-5.2-short** | neuralwatt/glm-5.2-short | **Senior** | M | good | Test fixture |
 | **nw-glm-5.2-fast** | neuralwatt/glm-5.2-fast | **Junior** | S | good | Test fixture |

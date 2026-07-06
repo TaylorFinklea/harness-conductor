@@ -708,29 +708,29 @@ Just some prose, no table at all.
     fn roster_drift_fixture_agreement() {
         let scorecard = load_fixture("scorecard-agreement.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 17);
+        assert_eq!(entries.len(), 18);
     }
 
     #[test]
     fn roster_drift_fixture_missing_from_config() {
         let scorecard = load_fixture("scorecard-missing-from-config.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 18);
-        assert_eq!(entries[17].model, "new-model");
+        assert_eq!(entries.len(), 19);
+        assert_eq!(entries[18].model, "new-model");
     }
 
     #[test]
     fn roster_drift_fixture_extra_in_config() {
         let scorecard = load_fixture("scorecard-extra-in-config.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 16);
+        assert_eq!(entries.len(), 17);
     }
 
     #[test]
     fn roster_drift_fixture_tier_mismatch() {
         let scorecard = load_fixture("scorecard-tier-mismatch.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 17);
+        assert_eq!(entries.len(), 18);
         let sonnet = entries.iter().find(|e| e.model == "sonnet-5").unwrap();
         assert_eq!(sonnet.tier, "Senior");
     }
@@ -739,7 +739,7 @@ Just some prose, no table at all.
     fn roster_drift_fixture_ceiling_mismatch() {
         let scorecard = load_fixture("scorecard-ceiling-mismatch.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 17);
+        assert_eq!(entries.len(), 18);
         let sonnet = entries.iter().find(|e| e.model == "sonnet-5").unwrap();
         assert_eq!(sonnet.ceiling, "XL");
     }

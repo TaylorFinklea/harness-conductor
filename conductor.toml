@@ -294,6 +294,16 @@ dispatch_id = "google-ai-studio/gemini-3.5-flash"
 provider = "google-ai-studio"
 cost = "free-trains-input"
 
+[[roster]]
+name = "agy-gemini-3.5-flash-free"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "agy"
+dispatch_id = "Gemini 3.5 Flash (High)"
+provider = "agy"
+cost = "free-trains-input"
+
 # NeuralWatt provider lane — distinct account from opencode-go (quota isolation).
 # Same base models; the fast (non-reasoning) variants land as Junior, the short
 # (200K context, reasoning) variants stay Senior. Use as fallback when the
