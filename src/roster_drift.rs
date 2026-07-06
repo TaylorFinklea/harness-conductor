@@ -59,6 +59,10 @@ pub(crate) struct ScorecardEntry {
     pub(crate) tier: String,
     /// Ceiling from the Ceiling column (e.g. "XL (via decomposition)").
     pub(crate) ceiling: String,
+    /// Cost from the optional Cost column (`paid` | `free` | `free-trains-input`).
+    pub(crate) cost: String,
+    /// Ordered fallback roster names from the optional Fallback column.
+    pub(crate) fallback: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +91,10 @@ pub(crate) enum DriftKind {
     TierMismatch,
     /// Ceiling differs between scorecard and config.
     CeilingMismatch,
+    /// Cost differs between scorecard and config.
+    CostMismatch,
+    /// Fallback chain differs between scorecard and config.
+    FallbackMismatch,
 }
 
 impl fmt::Display for DriftKind {
@@ -96,6 +104,8 @@ impl fmt::Display for DriftKind {
             Self::ExtraInConfig => f.write_str("extra in config"),
             Self::TierMismatch => f.write_str("tier mismatch"),
             Self::CeilingMismatch => f.write_str("ceiling mismatch"),
+            Self::CostMismatch => f.write_str("cost mismatch"),
+            Self::FallbackMismatch => f.write_str("fallback mismatch"),
         }
     }
 }
@@ -146,6 +156,18 @@ fn normalize_ceiling(s: &str) -> String {
     strip_first_word(strip_parenthetical(s.trim())).to_uppercase()
 }
 
+fn normalize_cost(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+fn config_cost(cost: config::Cost) -> &'static str {
+    match cost {
+        config::Cost::Paid => "paid",
+        config::Cost::Free => "free",
+        config::Cost::FreeTrainsInput => "free-trains-input",
+    }
+}
+
 /// Strips bold markers, inline code backticks, and parenthetical notes from a
 /// markdown table cell value.
 fn clean_cell(s: &str) -> String {
@@ -158,6 +180,19 @@ fn clean_cell(s: &str) -> String {
     let s = s.strip_prefix('`').unwrap_or(s);
     let s = s.strip_suffix('`').unwrap_or(s);
     s.trim().to_string()
+}
+
+fn parse_fallback_cell(s: &str) -> Vec<String> {
+    let cleaned = clean_cell(s);
+    if cleaned.is_empty() || cleaned == "—" || cleaned == "-" {
+        return Vec::new();
+    }
+    cleaned
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -181,12 +216,11 @@ pub(crate) fn parse_scorecard(content: &str) -> Result<Vec<ScorecardEntry>> {
         RosterDriftError::new("could not find '## Live Roster' section in scorecard")
     })?;
 
-    let (header_idx, col_map) =
-        find_table_header(&lines, section_start).ok_or_else(|| {
-            RosterDriftError::new(
-                "could not find markdown table with a Model column after Live Roster heading",
-            )
-        })?;
+    let (header_idx, col_map) = find_table_header(&lines, section_start).ok_or_else(|| {
+        RosterDriftError::new(
+            "could not find markdown table with a Model column after Live Roster heading",
+        )
+    })?;
 
     let model_col = *col_map
         .get("model")
@@ -198,10 +232,11 @@ pub(crate) fn parse_scorecard(content: &str) -> Result<Vec<ScorecardEntry>> {
         .get("ceiling")
         .ok_or_else(|| RosterDriftError::new("missing required column: Ceiling"))?;
     let dispatch_col = col_map.get("dispatch id").copied();
+    let cost_col = col_map.get("cost").copied();
+    let fallback_col = col_map.get("fallback").copied();
 
-    let data_start = skip_separator(&lines, header_idx + 1).ok_or_else(|| {
-        RosterDriftError::new("expected separator row after table header")
-    })?;
+    let data_start = skip_separator(&lines, header_idx + 1)
+        .ok_or_else(|| RosterDriftError::new("expected separator row after table header"))?;
 
     let mut entries = Vec::new();
     for &line in &lines[data_start..] {
@@ -231,11 +266,20 @@ pub(crate) fn parse_scorecard(content: &str) -> Result<Vec<ScorecardEntry>> {
             .get(ceiling_col)
             .map(|c| clean_cell(c))
             .unwrap_or_default();
+        let cost = cost_col
+            .and_then(|col| cells.get(col))
+            .map(|c| clean_cell(c))
+            .unwrap_or_default();
+        let fallback = fallback_col
+            .and_then(|col| cells.get(col))
+            .map_or_else(Vec::new, |c| parse_fallback_cell(c));
         entries.push(ScorecardEntry {
             model,
             dispatch_id,
             tier,
             ceiling,
+            cost,
+            fallback,
         });
     }
 
@@ -255,10 +299,7 @@ fn find_live_roster_section(lines: &[&str]) -> Option<usize> {
     })
 }
 
-fn find_table_header(
-    lines: &[&str],
-    start: usize,
-) -> Option<(usize, HashMap<String, usize>)> {
+fn find_table_header(lines: &[&str], start: usize) -> Option<(usize, HashMap<String, usize>)> {
     for (i, &line) in lines.iter().enumerate().skip(start) {
         if !line.contains('|') {
             continue;
@@ -285,7 +326,9 @@ fn find_table_header(
 fn is_separator_row(line: &str) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty()
-        && trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
         && trimmed.contains('-')
 }
 
@@ -367,10 +410,7 @@ pub(crate) fn diff(
                 report.items.push(DriftItem {
                     kind: DriftKind::TierMismatch,
                     model: sc_entry.model.clone(),
-                    detail: format!(
-                        "scorecard: {}, config: {:?}",
-                        sc_entry.tier, cfg_entry.tier
-                    ),
+                    detail: format!("scorecard: {}, config: {:?}", sc_entry.tier, cfg_entry.tier),
                 });
             }
 
@@ -385,6 +425,30 @@ pub(crate) fn diff(
                         sc_entry.ceiling, cfg_entry.ceiling
                     ),
                 });
+            }
+
+            if !sc_entry.cost.is_empty() {
+                let sc_cost = normalize_cost(&sc_entry.cost);
+                let cfg_cost = config_cost(cfg_entry.cost);
+                if sc_cost != cfg_cost {
+                    report.items.push(DriftItem {
+                        kind: DriftKind::CostMismatch,
+                        model: sc_entry.model.clone(),
+                        detail: format!("scorecard: {}, config: {cfg_cost}", sc_entry.cost),
+                    });
+                }
+
+                if sc_entry.fallback != cfg_entry.fallback {
+                    report.items.push(DriftItem {
+                        kind: DriftKind::FallbackMismatch,
+                        model: sc_entry.model.clone(),
+                        detail: format!(
+                            "scorecard: [{}], config: [{}]",
+                            sc_entry.fallback.join(", "),
+                            cfg_entry.fallback.join(", ")
+                        ),
+                    });
+                }
             }
         }
     }
@@ -418,7 +482,7 @@ pub(crate) fn print_report(report: &DriftReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{self, Ceiling, Efficiency, Backend, Tier};
+    use crate::config::{self, Backend, Ceiling, Efficiency, Tier};
 
     fn cfg_entry(name: &str, tier: Tier, ceiling: Ceiling) -> config::RosterEntry {
         config::RosterEntry {
@@ -430,6 +494,17 @@ mod tests {
             dispatch_id: format!("dispatch-{name}"),
             provider: String::new(),
             cost: config::Cost::Paid,
+            fallback: Vec::new(),
+        }
+    }
+
+    fn sc_entry(model: &str, tier: &str, ceiling: &str) -> ScorecardEntry {
+        ScorecardEntry {
+            model: model.to_string(),
+            dispatch_id: String::new(),
+            tier: tier.to_string(),
+            ceiling: ceiling.to_string(),
+            cost: String::new(),
             fallback: Vec::new(),
         }
     }
@@ -486,6 +561,24 @@ mod tests {
     }
 
     #[test]
+    fn roster_drift_parse_reads_cost_and_fallback_columns() {
+        let md = "\
+## Live Roster
+
+| Model | Dispatch ID | Tier | Ceiling | Cost | Fallback |
+|---|---|---|---|---|---|
+| **glm-5.2** | `opencode-go/glm-5.2` | **Senior** | M | paid | nw-glm-5.2-short, nw-glm-5.2 |
+";
+        let entries = parse_scorecard(md).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cost, "paid");
+        assert_eq!(
+            entries[0].fallback,
+            vec!["nw-glm-5.2-short".to_string(), "nw-glm-5.2".to_string()]
+        );
+    }
+
+    #[test]
     fn roster_drift_parse_error_missing_section() {
         let md = "# Some other document\n\nNo live roster here.\n";
         assert!(parse_scorecard(md).is_err());
@@ -530,16 +623,12 @@ Just some prose, no table at all.
     fn roster_drift_diff_agreement() {
         let sc = vec![
             ScorecardEntry {
-                model: "opus-4.8".to_string(),
                 dispatch_id: "claude-opus-4-8".to_string(),
-                tier: "Lead".to_string(),
-                ceiling: "XL".to_string(),
+                ..sc_entry("opus-4.8", "Lead", "XL")
             },
             ScorecardEntry {
-                model: "sonnet-5".to_string(),
                 dispatch_id: "claude-sonnet-5".to_string(),
-                tier: "Lead".to_string(),
-                ceiling: "L".to_string(),
+                ..sc_entry("sonnet-5", "Lead", "L")
             },
         ];
         let cfg = vec![
@@ -552,12 +641,7 @@ Just some prose, no table at all.
 
     #[test]
     fn roster_drift_diff_agreement_case_insensitive_model_name() {
-        let sc = vec![ScorecardEntry {
-            model: "Sonnet-5".to_string(),
-            dispatch_id: String::new(),
-            tier: "Lead".to_string(),
-            ceiling: "L".to_string(),
-        }];
+        let sc = vec![sc_entry("Sonnet-5", "Lead", "L")];
         let cfg = vec![cfg_entry("sonnet-5", Tier::Lead, Ceiling::L)];
         let report = diff(&sc, &cfg);
         assert!(!report.has_drift());
@@ -568,18 +652,8 @@ Just some prose, no table at all.
     #[test]
     fn roster_drift_diff_missing_from_config() {
         let sc = vec![
-            ScorecardEntry {
-                model: "opus-4.8".to_string(),
-                dispatch_id: String::new(),
-                tier: "Lead".to_string(),
-                ceiling: "XL".to_string(),
-            },
-            ScorecardEntry {
-                model: "new-model".to_string(),
-                dispatch_id: String::new(),
-                tier: "Senior".to_string(),
-                ceiling: "M".to_string(),
-            },
+            sc_entry("opus-4.8", "Lead", "XL"),
+            sc_entry("new-model", "Senior", "M"),
         ];
         let cfg = vec![cfg_entry("opus-4.8", Tier::Lead, Ceiling::Xl)];
         let report = diff(&sc, &cfg);
@@ -592,12 +666,7 @@ Just some prose, no table at all.
 
     #[test]
     fn roster_drift_diff_extra_in_config() {
-        let sc = vec![ScorecardEntry {
-            model: "opus-4.8".to_string(),
-            dispatch_id: String::new(),
-            tier: "Lead".to_string(),
-            ceiling: "XL".to_string(),
-        }];
+        let sc = vec![sc_entry("opus-4.8", "Lead", "XL")];
         let cfg = vec![
             cfg_entry("opus-4.8", Tier::Lead, Ceiling::Xl),
             cfg_entry("old-model", Tier::Junior, Ceiling::S),
@@ -612,12 +681,7 @@ Just some prose, no table at all.
 
     #[test]
     fn roster_drift_diff_tier_mismatch() {
-        let sc = vec![ScorecardEntry {
-            model: "sonnet-5".to_string(),
-            dispatch_id: String::new(),
-            tier: "Senior".to_string(),
-            ceiling: "L".to_string(),
-        }];
+        let sc = vec![sc_entry("sonnet-5", "Senior", "L")];
         let cfg = vec![cfg_entry("sonnet-5", Tier::Lead, Ceiling::L)];
         let report = diff(&sc, &cfg);
         assert_eq!(report.items.len(), 1);
@@ -628,16 +692,31 @@ Just some prose, no table at all.
 
     #[test]
     fn roster_drift_diff_ceiling_mismatch() {
-        let sc = vec![ScorecardEntry {
-            model: "sonnet-5".to_string(),
-            dispatch_id: String::new(),
-            tier: "Lead".to_string(),
-            ceiling: "XL".to_string(),
-        }];
+        let sc = vec![sc_entry("sonnet-5", "Lead", "XL")];
         let cfg = vec![cfg_entry("sonnet-5", Tier::Lead, Ceiling::L)];
         let report = diff(&sc, &cfg);
         assert_eq!(report.items.len(), 1);
         assert_eq!(report.items[0].kind, DriftKind::CeilingMismatch);
+    }
+
+    #[test]
+    fn roster_drift_diff_cost_and_fallback_mismatch() {
+        let sc = vec![ScorecardEntry {
+            model: "glm-5.2".to_string(),
+            dispatch_id: String::new(),
+            tier: "Senior".to_string(),
+            ceiling: "M".to_string(),
+            cost: "free".to_string(),
+            fallback: vec!["other-fallback".to_string()],
+        }];
+        let mut cfg = vec![cfg_entry("glm-5.2", Tier::Senior, Ceiling::M)];
+        cfg[0].cost = config::Cost::Paid;
+        cfg[0].fallback = vec!["nw-glm-5.2-short".to_string(), "nw-glm-5.2".to_string()];
+
+        let report = diff(&sc, &cfg);
+        let kinds: Vec<DriftKind> = report.items.iter().map(|i| i.kind.clone()).collect();
+        assert!(kinds.contains(&DriftKind::CostMismatch));
+        assert!(kinds.contains(&DriftKind::FallbackMismatch));
     }
 
     // --- diff: multiple drift types ---
@@ -645,18 +724,8 @@ Just some prose, no table at all.
     #[test]
     fn roster_drift_diff_all_drift_types_at_once() {
         let sc = vec![
-            ScorecardEntry {
-                model: "opus-4.8".to_string(),
-                dispatch_id: String::new(),
-                tier: "Lead".to_string(),
-                ceiling: "XL".to_string(),
-            },
-            ScorecardEntry {
-                model: "new-guy".to_string(),
-                dispatch_id: String::new(),
-                tier: "Junior".to_string(),
-                ceiling: "S".to_string(),
-            },
+            sc_entry("opus-4.8", "Lead", "XL"),
+            sc_entry("new-guy", "Junior", "S"),
         ];
         let cfg = vec![
             cfg_entry("opus-4.8", Tier::Senior, Ceiling::M),
@@ -692,10 +761,7 @@ Just some prose, no table at all.
         assert_eq!(clean_cell("**opus-4.8**"), "opus-4.8");
         assert_eq!(clean_cell("`opencode-go/glm-5.2`"), "opencode-go/glm-5.2");
         assert_eq!(clean_cell("**Lead** (all but hardest)"), "Lead");
-        assert_eq!(
-            clean_cell("high (7+ clean runs)"),
-            "high"
-        );
+        assert_eq!(clean_cell("high (7+ clean runs)"), "high");
     }
 
     // Fixture-based tests
@@ -748,7 +814,10 @@ Just some prose, no table at all.
     fn roster_drift_fixture_unparseable() {
         let scorecard = load_fixture("scorecard-unparseable.md");
         let result = parse_scorecard(&scorecard);
-        assert!(result.is_err(), "Expected parse error for unparseable fixture");
+        assert!(
+            result.is_err(),
+            "Expected parse error for unparseable fixture"
+        );
     }
 
     fn load_conductor_config() -> config::Config {
@@ -760,7 +829,11 @@ Just some prose, no table at all.
         let entries = parse_scorecard(&load_fixture("scorecard-agreement.md")).unwrap();
         let cfg = load_conductor_config();
         let report = diff(&entries, &cfg.roster);
-        assert!(!report.has_drift(), "expected no drift, got: {:?}", report.items);
+        assert!(
+            !report.has_drift(),
+            "expected no drift, got: {:?}",
+            report.items
+        );
     }
 
     #[test]
@@ -768,7 +841,11 @@ Just some prose, no table at all.
         let entries = parse_scorecard(&load_fixture("scorecard-missing-from-config.md")).unwrap();
         let cfg = load_conductor_config();
         let report = diff(&entries, &cfg.roster);
-        let missing: Vec<_> = report.items.iter().filter(|i| i.kind == DriftKind::MissingFromConfig).collect();
+        let missing: Vec<_> = report
+            .items
+            .iter()
+            .filter(|i| i.kind == DriftKind::MissingFromConfig)
+            .collect();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].model, "new-model");
     }
@@ -778,7 +855,11 @@ Just some prose, no table at all.
         let entries = parse_scorecard(&load_fixture("scorecard-extra-in-config.md")).unwrap();
         let cfg = load_conductor_config();
         let report = diff(&entries, &cfg.roster);
-        let extra: Vec<_> = report.items.iter().filter(|i| i.kind == DriftKind::ExtraInConfig).collect();
+        let extra: Vec<_> = report
+            .items
+            .iter()
+            .filter(|i| i.kind == DriftKind::ExtraInConfig)
+            .collect();
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].model, "gemini-3.5-flash-free");
     }
@@ -788,7 +869,11 @@ Just some prose, no table at all.
         let entries = parse_scorecard(&load_fixture("scorecard-tier-mismatch.md")).unwrap();
         let cfg = load_conductor_config();
         let report = diff(&entries, &cfg.roster);
-        let mismatches: Vec<_> = report.items.iter().filter(|i| i.kind == DriftKind::TierMismatch).collect();
+        let mismatches: Vec<_> = report
+            .items
+            .iter()
+            .filter(|i| i.kind == DriftKind::TierMismatch)
+            .collect();
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].model, "sonnet-5");
     }
@@ -798,7 +883,11 @@ Just some prose, no table at all.
         let entries = parse_scorecard(&load_fixture("scorecard-ceiling-mismatch.md")).unwrap();
         let cfg = load_conductor_config();
         let report = diff(&entries, &cfg.roster);
-        let mismatches: Vec<_> = report.items.iter().filter(|i| i.kind == DriftKind::CeilingMismatch).collect();
+        let mismatches: Vec<_> = report
+            .items
+            .iter()
+            .filter(|i| i.kind == DriftKind::CeilingMismatch)
+            .collect();
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].model, "sonnet-5");
     }
