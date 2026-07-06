@@ -1038,22 +1038,18 @@ fn run_judges(
         verdicts: Vec::with_capacity(cfg.arena.judges.len()),
         failures: Vec::new(),
     };
+    let judge_cwd_dir = judge_cwd(ctx);
+    fs::create_dir_all(&judge_cwd_dir).map_err(|e| {
+        ArenaError::new(format!(
+            "failed to create judge cwd {}: {e}",
+            judge_cwd_dir.display()
+        ))
+    })?;
     for judge in &cfg.arena.judges {
         let stdout_path = ctx.log_dir.join(format!("judge-{}.out", judge.name));
         let stderr_path = ctx.log_dir.join(format!("judge-{}.err", judge.name));
-        let command_line =
-            dispatch::argv_for_backend(judge.backend, &judge.dispatch_id, &prompt, &ctx.repo);
-        let Some((program, command_args)) = command_line.split_first() else {
-            return Err(ArenaError::new("judge argv was empty"));
-        };
-        let run = CommandRunner::run(&CommandSpec {
-            program: program.clone(),
-            args: command_args.to_vec(),
-            cwd: ctx.repo.clone(),
-            env: Vec::new(),
-            stdout_path: stdout_path.clone(),
-            stderr_path: stderr_path.clone(),
-        });
+        let spec = judge_command_spec(ctx, judge, &prompt, &stdout_path, &stderr_path)?;
+        let run = CommandRunner::run(&spec);
         let run = match run {
             Ok(run) => run,
             Err(e) => {
@@ -1088,6 +1084,35 @@ fn run_judges(
         }
     }
     Ok(out)
+}
+
+fn judge_cwd(ctx: &RunContext) -> PathBuf {
+    ctx.work_root.join("judge-cwd")
+}
+
+fn judge_command_spec(
+    ctx: &RunContext,
+    judge: &config::ArenaJudge,
+    prompt: &str,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<CommandSpec> {
+    // Judges must not mutate the real repo: throwaway cwd under the arena work
+    // root (outside the real repo), passed as the repo arg so agy's `--add-dir`
+    // also points away from ctx.repo. (bead conductor-2ti)
+    let cwd = judge_cwd(ctx);
+    let command_line = dispatch::argv_for_backend(judge.backend, &judge.dispatch_id, prompt, &cwd);
+    let Some((program, command_args)) = command_line.split_first() else {
+        return Err(ArenaError::new("judge argv was empty"));
+    };
+    Ok(CommandSpec {
+        program: program.clone(),
+        args: command_args.to_vec(),
+        cwd,
+        env: Vec::new(),
+        stdout_path: stdout_path.to_path_buf(),
+        stderr_path: stderr_path.to_path_buf(),
+    })
 }
 
 fn failed_judge_reason(run: &CommandOutput, stderr: &str) -> String {
@@ -1129,11 +1154,12 @@ Compare candidate patches for bead `{}` without using harness or model identity.
 {{\"scores_x10\":{{\"A\":45}},\"ranking\":[\"A\"],\"unsafe\":[],\"revise\":[],\"notes\":\"short rationale\"}}\n\
 Scores are integers 10..50, where 40 means good enough to apply. Put any candidate that must not be applied in `unsafe`; put candidates that need changes in `revise`.\n\
 \n\
+Score from the patch text and the verification logs included under each candidate below only. Do NOT run git, do NOT check out commits, and do NOT reproduce the verify command — you have no repo access and the verification logs are already captured for you.\n\
+\n\
 Task: {}\n\
 Acceptance: {}\n\
-Verify command: {}\n\
 \n",
-        ctx.issue.id, ctx.issue.title, ctx.issue.acceptance_criteria, ctx.verify_cmd
+        ctx.issue.id, ctx.issue.title, ctx.issue.acceptance_criteria
     );
     for (alias, profile) in aliases {
         if let Some(candidate) = candidates
@@ -1145,9 +1171,41 @@ Verify command: {}\n\
                 "\n=== Candidate {alias} ===\n{}\n",
                 truncate_chars(&candidate.patch, 30_000)
             );
+            let _ = write!(
+                prompt,
+                "{}",
+                verify_evidence(ctx, &candidate.summary.profile)
+            );
         }
     }
     prompt
+}
+
+fn verify_evidence(ctx: &RunContext, profile: &str) -> String {
+    let out_path = ctx.log_dir.join(format!("{profile}.verify.out"));
+    let err_path = ctx.log_dir.join(format!("{profile}.verify.err"));
+    let stdout = fs::read_to_string(&out_path).ok().unwrap_or_default();
+    let stderr = fs::read_to_string(&err_path).ok().unwrap_or_default();
+    let mut out = String::new();
+    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+        let _ = write!(out, "\n--- verify output (no log captured) ---\n<none>\n");
+        return out;
+    }
+    if !stdout.trim().is_empty() {
+        let _ = write!(
+            out,
+            "\n--- verify output (tail) ---\n{}\n",
+            truncate_tail_chars(&stdout, 2_000)
+        );
+    }
+    if !stderr.trim().is_empty() {
+        let _ = write!(
+            out,
+            "\n--- verify stderr (tail) ---\n{}\n",
+            truncate_tail_chars(&stderr, 1_000)
+        );
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -1323,8 +1381,7 @@ fn append_ledger_rows(
                 ),
                 arena_run_id: Some(ctx.run_id.clone()),
                 winner: Some(
-                    decision.winner_profile.as_deref()
-                        == Some(candidate.summary.profile.as_str()),
+                    decision.winner_profile.as_deref() == Some(candidate.summary.profile.as_str()),
                 ),
                 applied: Some(applied),
                 failure_reason: if candidate.summary.reason.is_empty() {
@@ -1604,10 +1661,7 @@ fn extract_json_string_field(haystack: &str, key: &str) -> Option<String> {
 /// handoff and should never disqualify a candidate regardless of their git
 /// status prefix (untracked, modified, etc.).
 fn is_scaffold_file(status_line: &str) -> bool {
-    const SCAFFOLD_FILES: &[&str] = &[
-        ".docs/ai/loop-prompt.md",
-        ".docs/ai/current-state.md",
-    ];
+    const SCAFFOLD_FILES: &[&str] = &[".docs/ai/loop-prompt.md", ".docs/ai/current-state.md"];
 
     // Git status --porcelain format: XY <space> <path>
     // where XY is exactly 2 chars (may include spaces, e.g. " M" for
@@ -1621,37 +1675,40 @@ fn is_scaffold_file(status_line: &str) -> bool {
 }
 
 fn candidate_has_disqualifying_dirt(status: &str) -> bool {
-    status
-        .lines()
-        .any(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty() && !is_scaffold_file(trimmed)
-        })
+    status.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !is_scaffold_file(trimmed)
+    })
 }
 
 /// Returns true if the worktree has uncommitted changes that should be committed
 /// by Conductor on behalf of the agent (e.g., when the agent's sandbox prevented
 /// git operations). Excludes scaffold files.
 fn candidate_has_committable_changes(status: &str) -> bool {
-    status
-        .lines()
-        .any(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty() && !is_scaffold_file(trimmed)
-        })
+    status.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !is_scaffold_file(trimmed)
+    })
 }
 
 /// Stage and commit all changes in the worktree on behalf of the agent.
 /// This is used when the agent successfully implemented the feature but couldn't
 /// commit due to sandbox restrictions.
-fn commit_on_behalf_of_agent(worktree: &Path, issue_id: &str, profile_name: &str) -> Result<String> {
+fn commit_on_behalf_of_agent(
+    worktree: &Path,
+    issue_id: &str,
+    profile_name: &str,
+) -> Result<String> {
     // Stage all changes
     git_checked(worktree, ["add", "-A"])?;
-    
+
     // Commit with a message that identifies the agent and issue
-    let commit_msg = format!("arena: {} implementation by {} (auto-committed)", issue_id, profile_name);
+    let commit_msg = format!(
+        "arena: {} implementation by {} (auto-committed)",
+        issue_id, profile_name
+    );
     git_checked(worktree, ["commit", "-m", &commit_msg])?;
-    
+
     // Return the new HEAD
     git_stdout(worktree, ["rev-parse", "HEAD"])
 }
@@ -1766,6 +1823,15 @@ fn truncate_chars(value: &str, max: usize) -> String {
     out
 }
 
+fn truncate_tail_chars(value: &str, max: usize) -> String {
+    let count = value.chars().count();
+    if count <= max {
+        return value.to_string();
+    }
+    let tail: String = value.chars().skip(count - max).collect();
+    format!("...[truncated head]...\n{tail}")
+}
+
 fn extract_json_object(value: &str) -> Option<&str> {
     let start = value.find('{')?;
     let end = value.rfind('}')?;
@@ -1870,7 +1936,10 @@ mod tests {
     fn parse_tokens_used_ignores_missing_or_bad_values() {
         assert_eq!(parse_tokens_used("hook: Stop\n"), None);
         assert_eq!(parse_tokens_used("tokens used\nnot-a-number\n"), None);
-        assert_eq!(parse_tokens_used("tokens used\nnot-a-number\nlater 429\n"), None);
+        assert_eq!(
+            parse_tokens_used("tokens used\nnot-a-number\nlater 429\n"),
+            None
+        );
     }
 
     #[test]
@@ -2173,5 +2242,254 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("missing complete judge scores"))
         );
+    }
+
+    #[test]
+    fn truncate_tail_chars_keeps_short_strings_intact() {
+        assert_eq!(truncate_tail_chars("abc", 10), "abc");
+        assert_eq!(truncate_tail_chars("", 10), "");
+    }
+
+    #[test]
+    fn truncate_tail_chars_keeps_tail_and_marks_dropped_head() {
+        // 12 chars; keep the last 5 ("hijkl") and mark the dropped prefix
+        let out = truncate_tail_chars("abcdefghijkl", 5);
+        assert_eq!(out, "...[truncated head]...\nhijkl");
+        assert!(!out.contains("abcdefg"));
+    }
+
+    #[test]
+    fn verify_evidence_includes_captured_stdout_and_stderr_tails() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("arena-verify-evidence-{nanos}"));
+        let logs = tmp.join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        std::fs::write(
+            logs.join("cand-a.verify.out"),
+            "running tests...\ntest result: ok. 3 passed\n",
+        )
+        .expect("write stdout");
+        std::fs::write(logs.join("cand-a.verify.err"), "warning: unused variable\n")
+            .expect("write stderr");
+        let mut ctx = fixture_run_context();
+        ctx.log_dir = logs.clone();
+        let evidence = verify_evidence(&ctx, "cand-a");
+        assert!(
+            evidence.contains("test result: ok. 3 passed"),
+            "must include stdout tail, got:\n{evidence}"
+        );
+        assert!(
+            evidence.contains("warning: unused variable"),
+            "must include stderr tail, got:\n{evidence}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn verify_evidence_reports_none_when_no_log_captured() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("arena-verify-evidence-none-{nanos}"));
+        let logs = tmp.join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        let mut ctx = fixture_run_context();
+        ctx.log_dir = logs.clone();
+        let evidence = verify_evidence(&ctx, "cand-a");
+        assert!(
+            evidence.contains("no log captured"),
+            "missing log should be reported, got:\n{evidence}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn verify_evidence_tails_long_logs_so_the_summary_survives() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("arena-verify-tail-{nanos}"));
+        let logs = tmp.join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        // big head that must be dropped + a tail summary that must survive
+        let log = format!("HEADSECRET{}TAILSECRET test result: ok\n", "p".repeat(3000));
+        std::fs::write(logs.join("cand-long.verify.out"), log).expect("write stdout");
+        let mut ctx = fixture_run_context();
+        ctx.log_dir = logs;
+        let evidence = verify_evidence(&ctx, "cand-long");
+        assert!(
+            evidence.contains("test result: ok"),
+            "tail summary must survive, got:\n{evidence}"
+        );
+        assert!(
+            evidence.contains("TAILSECRET"),
+            "tail marker must survive, got:\n{evidence}"
+        );
+        assert!(
+            !evidence.contains("HEADSECRET"),
+            "dropped head must not survive, got:\n{evidence}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn judge_command_spec_uses_throwaway_cwd_for_every_backend() {
+        let ctx = fixture_run_context();
+        let throwaway = ctx.work_root.join("judge-cwd");
+        for backend in [
+            crate::config::Backend::Pi,
+            crate::config::Backend::Claude,
+            crate::config::Backend::Agy,
+        ] {
+            let judge = crate::config::ArenaJudge {
+                name: "j".to_string(),
+                backend,
+                dispatch_id: "id".to_string(),
+            };
+            let spec = judge_command_spec(
+                &ctx,
+                &judge,
+                "p",
+                &ctx.log_dir.join("o"),
+                &ctx.log_dir.join("e"),
+            )
+            .expect("spec builds");
+            assert_ne!(
+                spec.cwd, ctx.repo,
+                "{backend:?}: judge must not run in the real repo"
+            );
+            assert_eq!(
+                spec.cwd, throwaway,
+                "{backend:?}: judge cwd must be the throwaway under work_root"
+            );
+        }
+    }
+
+    #[test]
+    fn judge_command_spec_agy_add_dir_targets_throwaway_not_real_repo() {
+        let ctx = fixture_run_context();
+        let judge = crate::config::ArenaJudge {
+            name: "agy-judge".to_string(),
+            backend: crate::config::Backend::Agy,
+            dispatch_id: "Gemini 3.5 Flash (High)".to_string(),
+        };
+        let spec = judge_command_spec(
+            &ctx,
+            &judge,
+            "p",
+            &ctx.log_dir.join("j.out"),
+            &ctx.log_dir.join("j.err"),
+        )
+        .expect("spec builds");
+        let throwaway = ctx.work_root.join("judge-cwd");
+        let add_dir_idx = spec
+            .args
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("agy argv must include --add-dir");
+        let add_dir_val = &spec.args[add_dir_idx + 1];
+        assert_eq!(
+            add_dir_val,
+            &throwaway.display().to_string(),
+            "agy --add-dir must target the throwaway, not the real repo"
+        );
+        assert_ne!(
+            add_dir_val,
+            &ctx.repo.display().to_string(),
+            "agy --add-dir must not target the real repo"
+        );
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|a| a == &ctx.repo.display().to_string()),
+            "agy argv must not reference the real repo at all"
+        );
+    }
+
+    #[test]
+    fn judge_prompt_omits_runnable_verify_command_and_forbids_git() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("arena-judge-prompt-norun-{nanos}"));
+        let logs = tmp.join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        std::fs::write(
+            logs.join("cand-a.verify.out"),
+            "test result: ok. 1 passed\n",
+        )
+        .expect("write");
+        let mut ctx = fixture_run_context();
+        ctx.log_dir = logs;
+        let candidate = CandidateRun {
+            summary: CandidateSummary::eligible("cand-a", "pi", "neuralwatt/glm-5.2"),
+            worktree: std::path::PathBuf::from("/tmp/cand-a"),
+            commit: Some("abc".to_string()),
+            patch: "PATCH BODY\n".to_string(),
+            duration_ms: None,
+            ralph_duration_ms: None,
+            verify_duration_ms: None,
+            tokens_used: None,
+        };
+        let candidates = vec![&candidate];
+        let aliases = BTreeMap::from([("A".to_string(), "cand-a".to_string())]);
+        let prompt = judge_prompt(&ctx, &candidates, &aliases);
+        assert!(
+            !prompt.contains(&ctx.verify_cmd),
+            "prompt must not hand judges the runnable verify_cmd, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Do NOT run git"),
+            "prompt must forbid running git/reproducing verify, got:\n{prompt}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn judge_prompt_includes_captured_verify_logs_as_evidence() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("arena-judge-prompt-evidence-{nanos}"));
+        let logs = tmp.join("logs");
+        std::fs::create_dir_all(&logs).expect("mkdir logs");
+        std::fs::write(
+            logs.join("cand-a.verify.out"),
+            "test result: ok. 5 passed\n",
+        )
+        .expect("write out");
+        std::fs::write(logs.join("cand-a.verify.err"), "warning: deprecated\n").expect("write err");
+        let mut ctx = fixture_run_context();
+        ctx.log_dir = logs;
+        let candidate = CandidateRun {
+            summary: CandidateSummary::eligible("cand-a", "pi", "neuralwatt/glm-5.2"),
+            worktree: std::path::PathBuf::from("/tmp/cand-a"),
+            commit: Some("abc".to_string()),
+            patch: "PATCH BODY\n".to_string(),
+            duration_ms: None,
+            ralph_duration_ms: None,
+            verify_duration_ms: None,
+            tokens_used: None,
+        };
+        let candidates = vec![&candidate];
+        let aliases = BTreeMap::from([("A".to_string(), "cand-a".to_string())]);
+        let prompt = judge_prompt(&ctx, &candidates, &aliases);
+        assert!(
+            prompt.contains("test result: ok. 5 passed"),
+            "prompt must include verify stdout evidence, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("warning: deprecated"),
+            "prompt must include verify stderr evidence, got:\n{prompt}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
