@@ -162,6 +162,42 @@ harness = "opencode"
 model = "neuralwatt/kimi-k2.6-fast"
 provider_group = "neuralwatt"
 
+[[arena_profile]]
+name = "pi-ollama-glm52"
+harness = "pi"
+model = "ollama-cloud/glm-5.2"
+provider_group = "ollama-cloud"
+
+[[arena_profile]]
+name = "opencode-ollama-glm52"
+harness = "opencode"
+model = "ollama-cloud/glm-5.2"
+provider_group = "ollama-cloud"
+
+[[arena_profile]]
+name = "pi-ollama-kimi-k26"
+harness = "pi"
+model = "ollama-cloud/kimi-k2.6"
+provider_group = "ollama-cloud"
+
+[[arena_profile]]
+name = "opencode-ollama-kimi-k26"
+harness = "opencode"
+model = "ollama-cloud/kimi-k2.6"
+provider_group = "ollama-cloud"
+
+[[arena_profile]]
+name = "pi-ollama-minimax-m3"
+harness = "pi"
+model = "ollama-cloud/minimax-m3"
+provider_group = "ollama-cloud"
+
+[[arena_profile]]
+name = "opencode-ollama-minimax-m3"
+harness = "opencode"
+model = "ollama-cloud/minimax-m3"
+provider_group = "ollama-cloud"
+
 [[arena_judge]]
 name = "qwen37max"
 backend = "pi"
@@ -220,7 +256,7 @@ backend = "pi"
 dispatch_id = "opencode-go/minimax-m3"
 provider = "opencode-go"
 cost = "paid"
-fallback = ["nw-glm-5.2-short", "nw-glm-5.2"]
+fallback = ["ollama-minimax-m3", "nw-glm-5.2-short", "nw-glm-5.2"]
 
 [[roster]]
 name = "qwen3.7-max"
@@ -242,7 +278,37 @@ backend = "pi"
 dispatch_id = "opencode-go/glm-5.2"
 provider = "opencode-go"
 cost = "paid"
-fallback = ["nw-glm-5.2-short", "nw-glm-5.2"]
+fallback = ["ollama-glm-5.2", "nw-glm-5.2-short", "nw-glm-5.2"]
+
+[[roster]]
+name = "ollama-glm-5.2"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "ollama-cloud/glm-5.2"
+provider = "ollama-cloud"
+cost = "paid"
+
+[[roster]]
+name = "ollama-kimi-k2.6"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "ollama-cloud/kimi-k2.6"
+provider = "ollama-cloud"
+cost = "paid"
+
+[[roster]]
+name = "ollama-minimax-m3"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "ollama-cloud/minimax-m3"
+provider = "ollama-cloud"
+cost = "paid"
 
 [[roster]]
 name = "glm-5.1"
