@@ -459,6 +459,44 @@ mod tests {
         }
     }
 
+    /// Roster entry with an explicit `cost` axis (defaults to Paid in
+    /// `roster_entry`). Used by the cost-axis gate invariant tests.
+    fn roster_entry_with_cost(
+        name: &str,
+        tier: Tier,
+        ceiling: Ceiling,
+        efficiency: Efficiency,
+        backend: Backend,
+        cost: Cost,
+    ) -> RosterEntry {
+        let mut e = roster_entry(name, tier, ceiling, efficiency, backend);
+        e.cost = cost;
+        e
+    }
+
+    /// Build a `CostPolicy` lookup map for one repo in tests.
+    fn repo_policy_map(repo: &str, policy: CostPolicy) -> HashMap<String, CostPolicy> {
+        let mut m = HashMap::new();
+        m.insert(repo.to_string(), policy);
+        m
+    }
+
+    /// Issue carrying the per-item `data_policy: trains-ok` opt-in, which
+    /// lifts the `FreeTrainsInput` repo-policy gate for that one item.
+    fn issue_with_trains_ok(
+        id: &str,
+        priority: u32,
+        created_at: &str,
+        tier_floor: &str,
+        complexity: &str,
+        verify_cmd: Option<&str>,
+    ) -> Issue {
+        let mut i = issue(id, priority, created_at, tier_floor, complexity, verify_cmd);
+        let metadata = i.metadata.get_or_insert_with(BTreeMap::new);
+        metadata.insert("data_policy".to_string(), json!("trains-ok"));
+        i
+    }
+
     fn active_repo(name: &str, ready: Vec<Issue>) -> RepoSnapshot {
         RepoSnapshot {
             path: PathBuf::from(format!("/fixtures/{name}")),
@@ -652,6 +690,171 @@ mod tests {
             }
             other => panic!("expected Untriaged flag, got {other:?}"),
         }
+    }
+
+    // --- cost-axis gate (Phase 1: FreeTrainsInput eligibility) ---
+
+    /// A `FreeTrainsInput` model is NOT eligible on a repo whose
+    /// `cost_policy` is `Proprietary` (the default for any repo absent from
+    /// `[[repo_policy]]`). The paid sibling with identical tier/ceiling/
+    /// efficiency is chosen instead. Fail-closed: a free-train model never
+    /// shadows a paid one on a proprietary repo.
+    #[test]
+    fn cost_gate_free_trains_input_excluded_on_proprietary_repo() {
+        let roster = vec![
+            roster_entry_with_cost(
+                "free-train-junior",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Pi,
+                Cost::FreeTrainsInput,
+            ),
+            roster_entry_with_cost(
+                "paid-junior",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Pi,
+                Cost::Paid,
+            ),
+        ];
+        let repos = vec![active_repo(
+            "proprietary-repo",
+            vec![issue(
+                "fan-out-item",
+                1,
+                "2026-01-01T00:00:00Z",
+                "junior",
+                "S",
+                Some("echo ok"),
+            )],
+        )];
+        // No repo_policy entry → defaults to Proprietary.
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["proprietary-repo"]),
+            &HashMap::new(),
+        );
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].model, "paid-junior");
+    }
+
+    /// A `FreeTrainsInput` model IS eligible on a repo whose `cost_policy`
+    /// is `Oss`. With identical tier/ceiling/efficiency, it is preferred
+    /// over the paid sibling by roster order (free-train listed first).
+    #[test]
+    fn cost_gate_free_trains_input_allowed_on_oss_repo() {
+        let roster = vec![
+            roster_entry_with_cost(
+                "free-train-junior",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Pi,
+                Cost::FreeTrainsInput,
+            ),
+            roster_entry_with_cost(
+                "paid-junior",
+                Tier::Junior,
+                Ceiling::S,
+                Efficiency::Lean,
+                Backend::Pi,
+                Cost::Paid,
+            ),
+        ];
+        let repos = vec![active_repo(
+            "oss-repo",
+            vec![issue(
+                "fan-out-item",
+                1,
+                "2026-01-01T00:00:00Z",
+                "junior",
+                "S",
+                Some("echo ok"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["oss-repo"]),
+            &repo_policy_map("oss-repo", CostPolicy::Oss),
+        );
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].model, "free-train-junior");
+    }
+
+    /// A bead carrying `data_policy: trains-ok` lifts the gate per-item:
+    /// a `FreeTrainsInput` model becomes eligible on a Proprietary repo
+    /// (e.g. a public-dataset task on a closed codebase).
+    #[test]
+    fn cost_gate_trains_ok_bead_opts_in_on_proprietary_repo() {
+        let roster = vec![roster_entry_with_cost(
+            "free-train-junior",
+            Tier::Junior,
+            Ceiling::S,
+            Efficiency::Lean,
+            Backend::Pi,
+            Cost::FreeTrainsInput,
+        )];
+        let repos = vec![active_repo(
+            "proprietary-repo",
+            vec![issue_with_trains_ok(
+                "opted-in-item",
+                1,
+                "2026-01-01T00:00:00Z",
+                "junior",
+                "S",
+                Some("echo ok"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["proprietary-repo"]),
+            &HashMap::new(),
+        );
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].model, "free-train-junior");
+    }
+
+    /// A `Free` (no-training) model is eligible on every repo policy
+    /// including Proprietary. The cost gate only excludes
+    /// `FreeTrainsInput`; `Free` and `Paid` are always eligible.
+    #[test]
+    fn cost_gate_free_no_train_allowed_on_proprietary_repo() {
+        let roster = vec![roster_entry_with_cost(
+            "free-junior",
+            Tier::Junior,
+            Ceiling::S,
+            Efficiency::Lean,
+            Backend::Pi,
+            Cost::Free,
+        )];
+        let repos = vec![active_repo(
+            "proprietary-repo",
+            vec![issue(
+                "fan-out-item",
+                1,
+                "2026-01-01T00:00:00Z",
+                "junior",
+                "S",
+                Some("echo ok"),
+            )],
+        )];
+        let plan = route(
+            &repos,
+            &roster,
+            &generous_budgets(),
+            &ratchet_unlocked(&["proprietary-repo"]),
+            &HashMap::new(),
+        );
+        assert_eq!(plan.dispatches.len(), 1);
+        assert_eq!(plan.dispatches[0].model, "free-junior");
     }
 
     // --- invariant 3: fail closed everywhere ---

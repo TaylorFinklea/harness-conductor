@@ -188,6 +188,8 @@ ceiling = "L"
 efficiency = "std"
 backend = "claude"
 dispatch_id = "claude-sonnet-5"
+provider = "anthropic"
+cost = "paid"
 
 [[roster]]
 name = "opus-4.8"
@@ -196,6 +198,8 @@ ceiling = "XL"
 efficiency = "heavy"
 backend = "claude"
 dispatch_id = "claude-opus-4-8"
+provider = "anthropic"
+cost = "paid"
 
 [[roster]]
 name = "gpt-5.5"
@@ -204,6 +208,8 @@ ceiling = "M"
 efficiency = "std"
 backend = "pi"
 dispatch_id = "openai-codex/gpt-5.5"
+provider = "openai-codex"
+cost = "paid"
 
 [[roster]]
 name = "minimax-m3"
@@ -212,6 +218,9 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "opencode-go/minimax-m3"
+provider = "opencode-go"
+cost = "paid"
+fallback = ["nw-glm-5.2-short", "nw-glm-5.2"]
 
 [[roster]]
 name = "qwen3.7-max"
@@ -220,6 +229,9 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "opencode-go/qwen3.7-max"
+provider = "opencode-go"
+cost = "paid"
+fallback = ["nw-glm-5.2-short", "nw-glm-5.2"]
 
 [[roster]]
 name = "glm-5.2"
@@ -228,14 +240,59 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "opencode-go/glm-5.2"
+provider = "opencode-go"
+cost = "paid"
+fallback = ["nw-glm-5.2-short", "nw-glm-5.2"]
 
 [[roster]]
-name = "gemini-3.5-flash"
+name = "glm-5.1"
 tier = "junior"
 ceiling = "S"
 efficiency = "lean"
-backend = "agy"
-dispatch_id = "Gemini 3.5 Flash (High)"
+backend = "pi"
+dispatch_id = "opencode-go/glm-5.1"
+provider = "opencode-go"
+cost = "free"
+
+[[roster]]
+name = "mimo-v2.5"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/mimo-v2.5"
+provider = "opencode-go"
+cost = "free"
+
+[[roster]]
+name = "qwen3.6-plus"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/qwen3.6-plus"
+provider = "opencode-go"
+cost = "free"
+
+[[roster]]
+name = "deepseek-v4-flash"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/deepseek-v4-flash"
+provider = "opencode-go"
+cost = "free"
+
+[[roster]]
+name = "gemini-3.5-flash-free"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "google-ai-studio/gemini-3.5-flash"
+provider = "google-ai-studio"
+cost = "free-trains-input"
 
 # NeuralWatt provider lane — distinct account from opencode-go (quota isolation).
 # Same base models; the fast (non-reasoning) variants land as Junior, the short
@@ -249,6 +306,8 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "neuralwatt/glm-5.2"
+provider = "neuralwatt"
+cost = "paid"
 
 [[roster]]
 name = "nw-glm-5.2-short"
@@ -257,6 +316,8 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "neuralwatt/glm-5.2-short"
+provider = "neuralwatt"
+cost = "paid"
 
 [[roster]]
 name = "nw-glm-5.2-fast"
@@ -265,6 +326,18 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "neuralwatt/glm-5.2-fast"
+provider = "neuralwatt"
+cost = "paid"
+
+[[roster]]
+name = "nw-glm-5.2-short-fast"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "neuralwatt/glm-5.2-short-fast"
+provider = "neuralwatt"
+cost = "paid"
 
 [[roster]]
 name = "nw-kimi-k2.6"
@@ -273,6 +346,8 @@ ceiling = "M"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "neuralwatt/kimi-k2.6"
+provider = "neuralwatt"
+cost = "paid"
 
 [[roster]]
 name = "nw-kimi-k2.6-fast"
@@ -281,3 +356,5 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "neuralwatt/kimi-k2.6-fast"
+provider = "neuralwatt"
+cost = "paid"
