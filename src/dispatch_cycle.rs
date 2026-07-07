@@ -10,12 +10,13 @@ use chrono::Utc;
 
 use crate::bd::{BdClient, Issue};
 use crate::bursar::{self, BudgetAction, BudgetDecision, BursarClient};
-use crate::config::{Backend, Ceiling, Config, RosterEntry, Tier};
+use crate::config::{Backend, Ceiling, Config, Cost, CostPolicy, RosterEntry, Tier};
 use crate::deck::{self, CalloutLevel, LiveUpdate, ReportStatus};
 use crate::dispatch::{self, CommitProbe, DispatchRequest, Exec};
-use crate::fields::{self, Triage};
+use crate::fields::{self, RoutingFields, Triage};
 use crate::ledger::{self, LedgerRow};
 use crate::plan::CyclePlan;
+use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
 
 const WORKER_TEMPLATE: &str = include_str!("../templates/worker-prompt.md");
@@ -408,7 +409,7 @@ fn dispatch_one<
         config: cfg.review.clone(),
         roster: cfg.roster.clone(),
         dispatched_model: active_roster.clone(),
-        item_tier_floor: extracted.tier_floor,
+        item_tier_floor: extracted.routing.tier_floor,
     };
     let outcome = verify::run_with_review(bd, exec, commits, &verify_request, &review)
         .map_err(|e| DispatchCycleError::message(format!("verify: {e}")))?;
@@ -454,6 +455,7 @@ fn dispatch_one<
 
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "keeps fallback runtime explicit at dispatch boundary"
 )]
 fn run_worker_chain<E, C, L, U>(
@@ -484,9 +486,17 @@ where
     U: BursarClient + ?Sized,
 {
     let chain = fallback_chain(&cfg.roster, initial_roster)?;
+    let repo_cost_policy = cfg.cost_policy_for(&item.repo);
     let mut attempts = 0_u64;
     let mut deferred = Vec::new();
     for (idx, roster) in chain.iter().enumerate() {
+        if let Some(rejection) =
+            triage::candidate_rejection(roster, &fields.routing, repo_cost_policy)
+        {
+            record_fallback_skip(report_path, item, roster, rejection, fields)?;
+            continue;
+        }
+
         if is_metered_worker_backend(roster.backend) {
             let provider = bursar_provider_for(roster);
             let decision =
@@ -494,7 +504,18 @@ where
             record_budget_decision(report_path, item, roster, &decision)?;
             if decision.action == BudgetAction::Defer {
                 deferred.push(decision.summary.clone());
-                let Some(next) = chain.get(idx + 1) else {
+                let Some(next) =
+                    next_eligible_roster(&chain, idx + 1, &fields.routing, repo_cost_policy)
+                else {
+                    record_remaining_ineligible(
+                        &chain,
+                        idx + 1,
+                        report_path,
+                        item,
+                        &fields.routing,
+                        repo_cost_policy,
+                        fields,
+                    )?;
                     return Ok(WorkerChainOutcome::Deferred(deferred.join("; ")));
                 };
                 patch_live(
@@ -546,7 +567,28 @@ where
                 attempts,
             }));
         };
-        let Some(next) = chain.get(idx + 1) else {
+        let Some(next) = next_eligible_roster(&chain, idx + 1, &fields.routing, repo_cost_policy)
+        else {
+            record_remaining_ineligible(
+                &chain,
+                idx + 1,
+                report_path,
+                item,
+                &fields.routing,
+                repo_cost_policy,
+                fields,
+            )?;
+            append_ledger(
+                ledger_path,
+                roster,
+                &item.repo,
+                issue,
+                fields,
+                "implement",
+                false,
+                cycle_id,
+                &format!("retryable worker failure ({reason}); no eligible fallback"),
+            )?;
             return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
                 roster: roster.clone(),
                 result,
@@ -578,7 +620,9 @@ where
             progress,
         )?;
     }
-    Err(DispatchCycleError::message("empty worker fallback chain"))
+    Err(DispatchCycleError::message(
+        "empty eligible worker fallback chain",
+    ))
 }
 
 fn is_metered_worker_backend(backend: Backend) -> bool {
@@ -632,6 +676,100 @@ fn record_budget_decision(
     .map_err(|e| DispatchCycleError::message(format!("report budget decision: {e}")))
 }
 
+fn next_eligible_roster<'a>(
+    chain: &'a [RosterEntry],
+    start: usize,
+    routing: &RoutingFields,
+    repo_cost_policy: CostPolicy,
+) -> Option<&'a RosterEntry> {
+    chain
+        .iter()
+        .skip(start)
+        .find(|roster| triage::candidate_rejection(roster, routing, repo_cost_policy).is_none())
+}
+
+fn record_remaining_ineligible(
+    chain: &[RosterEntry],
+    start: usize,
+    report_path: &Path,
+    item: &PlannedItem,
+    routing: &RoutingFields,
+    repo_cost_policy: CostPolicy,
+    fields: &ExtractedFields,
+) -> std::result::Result<(), DispatchCycleError> {
+    for roster in chain.iter().skip(start) {
+        if let Some(rejection) = triage::candidate_rejection(roster, routing, repo_cost_policy) {
+            record_fallback_skip(report_path, item, roster, rejection, fields)?;
+        }
+    }
+    Ok(())
+}
+
+fn record_fallback_skip(
+    report_path: &Path,
+    item: &PlannedItem,
+    roster: &RosterEntry,
+    rejection: CandidateRejection,
+    fields: &ExtractedFields,
+) -> std::result::Result<(), DispatchCycleError> {
+    if !report_path.exists() {
+        return Ok(());
+    }
+    let mut note = serde_json::json!({
+        "event": "fallback_skip",
+        "repo": item.repo,
+        "issue_id": item.issue_id,
+        "model": roster.name,
+        "tier_floor": tier_label(fields.routing.tier_floor),
+        "complexity": ceiling_label(fields.routing.complexity),
+        "data_policy_trains_ok": fields.routing.trains_ok,
+    });
+    if let Some(object) = note.as_object_mut() {
+        match rejection {
+            CandidateRejection::BelowTierFloor { required, actual } => {
+                object.insert("reason".to_string(), serde_json::json!("below-tier-floor"));
+                object.insert(
+                    "required_tier".to_string(),
+                    serde_json::json!(tier_label(required)),
+                );
+                object.insert(
+                    "actual_tier".to_string(),
+                    serde_json::json!(tier_label(actual)),
+                );
+            }
+            CandidateRejection::BelowCeiling { required, actual } => {
+                object.insert("reason".to_string(), serde_json::json!("below-ceiling"));
+                object.insert(
+                    "required_ceiling".to_string(),
+                    serde_json::json!(ceiling_label(required)),
+                );
+                object.insert(
+                    "actual_ceiling".to_string(),
+                    serde_json::json!(ceiling_label(actual)),
+                );
+            }
+            CandidateRejection::CostPolicy { policy, cost } => {
+                object.insert("reason".to_string(), serde_json::json!("cost-policy"));
+                object.insert(
+                    "repo_cost_policy".to_string(),
+                    serde_json::json!(cost_policy_label(policy)),
+                );
+                object.insert(
+                    "model_cost".to_string(),
+                    serde_json::json!(cost_label(cost)),
+                );
+            }
+        }
+    }
+    deck::append_callout(
+        report_path,
+        CalloutLevel::Warn,
+        "FALLBACK_SKIP",
+        &note.to_string(),
+    )
+    .map_err(|e| DispatchCycleError::message(format!("report fallback skip: {e}")))
+}
+
 fn fallback_chain(
     roster: &[RosterEntry],
     initial: &RosterEntry,
@@ -679,16 +817,38 @@ fn retryable_failure_reason(
 
 fn is_retryable_worker_stderr(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
-    stderr.contains("429")
+    contains_contextual_429(&stderr)
         || stderr.contains("quota")
         || stderr.contains("rate_limit")
         || stderr.contains("rate limit")
+        || stderr.contains("too many requests")
+}
+
+fn contains_contextual_429(stderr: &str) -> bool {
+    let normalized: String = stderr
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    tokens.iter().enumerate().any(|(idx, token)| {
+        if *token != "429" {
+            return false;
+        }
+        let previous = idx.checked_sub(1).and_then(|i| tokens.get(i).copied());
+        let previous_two = idx.checked_sub(2).and_then(|i| tokens.get(i).copied());
+        matches!(
+            previous,
+            Some("http" | "https" | "status" | "code" | "response")
+        ) || matches!(
+            (previous_two, previous),
+            (Some("status" | "http"), Some("code" | "status"))
+        )
+    })
 }
 
 struct ExtractedFields {
     verify_cmd: String,
-    complexity: String,
-    tier_floor: Tier,
+    routing: RoutingFields,
 }
 
 fn extract_dispatch_fields(
@@ -706,14 +866,13 @@ fn extract_dispatch_fields(
     };
     let verify_cmd = planned_verify_cmd
         .map(str::to_string)
-        .or(routing.verify_cmd)
+        .or_else(|| routing.verify_cmd.clone())
         .ok_or_else(|| {
             DispatchCycleError::message(format!("issue {} has no verify_cmd", issue.id))
         })?;
     Ok(ExtractedFields {
         verify_cmd,
-        complexity: ceiling_label(routing.complexity).to_string(),
-        tier_floor: routing.tier_floor,
+        routing,
     })
 }
 
@@ -743,7 +902,7 @@ fn append_ledger(
         blind_rank: None,
         judge: None,
         verify_passed,
-        complexity: fields.complexity.clone(),
+        complexity: ceiling_label(fields.routing.complexity).to_string(),
         project: repo.to_string(),
         bias_note: None,
         notes: format!("conductor {cycle_id}: {summary}"),
@@ -864,12 +1023,37 @@ fn timestamp() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+fn tier_label(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Lead => "lead",
+        Tier::Senior => "senior",
+        Tier::Junior => "junior",
+    }
+}
+
 fn ceiling_label(ceiling: Ceiling) -> &'static str {
     match ceiling {
         Ceiling::S => "S",
         Ceiling::M => "M",
         Ceiling::L => "L",
         Ceiling::Xl => "XL",
+    }
+}
+
+fn cost_label(cost: Cost) -> &'static str {
+    match cost {
+        Cost::Paid => "paid",
+        Cost::Free => "free",
+        Cost::FreeTrainsInput => "free-trains-input",
+    }
+}
+
+fn cost_policy_label(policy: CostPolicy) -> &'static str {
+    match policy {
+        CostPolicy::Proprietary => "proprietary",
+        CostPolicy::Internal => "internal",
+        CostPolicy::Oss => "oss",
+        CostPolicy::Public => "public",
     }
 }
 
@@ -970,11 +1154,9 @@ mod tests {
         )
         .expect_err("missing approval refuses");
         assert!(absent.is_not_answered());
-        assert!(
-            absent
-                .to_string()
-                .contains("dispatch-plan not yet answered")
-        );
+        assert!(absent
+            .to_string()
+            .contains("dispatch-plan not yet answered"));
     }
 
     #[test]
@@ -1080,21 +1262,17 @@ dispatch_id = "fake-worker"
             heartbeats.len() >= 2,
             "expected multiple live patches, got {heartbeats:?}"
         );
-        assert!(
-            heartbeats
-                .iter()
-                .any(|step| step.contains("worker sandbox-repo/sandbox-1"))
-        );
+        assert!(heartbeats
+            .iter()
+            .any(|step| step.contains("worker sandbox-repo/sandbox-1")));
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(report_path(&reports, cycle_id)).unwrap())
                 .unwrap();
         assert_eq!(report["status"], "done");
-        assert!(
-            report["live"]["step"]
-                .as_str()
-                .unwrap()
-                .contains("complete")
-        );
+        assert!(report["live"]["step"]
+            .as_str()
+            .unwrap()
+            .contains("complete"));
     }
 
     #[test]
@@ -1284,22 +1462,162 @@ dispatch_id = "fallback-worker"
         assert_eq!(rows.len(), 2, "failover row + final implement row");
         assert_eq!(rows[0]["model"], "primary-worker");
         assert_eq!(rows[0]["verify_passed"], false);
-        assert!(
-            rows[0]["notes"]
-                .as_str()
-                .expect("notes")
-                .contains("failover to fallback-worker")
-        );
+        assert!(rows[0]["notes"]
+            .as_str()
+            .expect("notes")
+            .contains("failover to fallback-worker"));
         assert_eq!(rows[1]["model"], "fallback-worker");
         assert_eq!(rows[1]["verify_passed"], true);
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end fallback eligibility fixture keeps its config inline"
+    )]
+    fn fallback_skips_ineligible_failover_targets_with_report_notes() {
+        let temp = TempDir::new("fallback-eligibility-sandbox");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "primary-worker"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "primary-worker"
+fallback = ["below-floor-worker", "below-ceiling-worker", "free-train-worker", "fallback-worker"]
+
+[[roster]]
+name = "below-floor-worker"
+tier = "junior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "below-floor-worker"
+
+[[roster]]
+name = "below-ceiling-worker"
+tier = "senior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "below-ceiling-worker"
+
+[[roster]]
+name = "free-train-worker"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "free-train-worker"
+cost = "free-trains-input"
+
+[[roster]]
+name = "fallback-worker"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fallback-worker"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-20260707-fallback-eligibility";
+        write_plan_with_proposal(
+            &state,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "primary-worker",
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let mut issue = sandbox_issue();
+        let metadata = issue.metadata.as_mut().expect("metadata");
+        metadata.insert("tier_floor".to_string(), json!("senior"));
+        metadata.insert("complexity".to_string(), json!("M"));
+        let bd = RecordingBdClient::new(issue);
+        let exec = FallbackExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let bursar = FakeBursarClient::unavailable();
+
+        let result = run_dispatch_cycle(
+            &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+            &bursar,
+        )
+        .expect("approved fallback dispatch succeeds after skipping ineligible entries");
+
+        assert_eq!(result.dispatched, 2, "primary attempt + eligible fallback");
+        assert_eq!(result.verified, 1);
+
+        let spawns = exec.spawns();
+        assert_eq!(
+            spawns.len(),
+            3,
+            "primary worker + eligible fallback + verify"
+        );
+        assert!(spawns[0].argv.contains(&"primary-worker".to_string()));
+        assert!(spawns[1].argv.contains(&"fallback-worker".to_string()));
+        assert!(!spawns
+            .iter()
+            .any(|spawn| spawn.argv.contains(&"below-floor-worker".to_string())));
+        assert!(!spawns
+            .iter()
+            .any(|spawn| spawn.argv.contains(&"below-ceiling-worker".to_string())));
+        assert!(!spawns
+            .iter()
+            .any(|spawn| spawn.argv.contains(&"free-train-worker".to_string())));
+
+        let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
+        assert!(ledger_line.contains("failover to fallback-worker"));
+
+        let report = std::fs::read_to_string(report_path(&reports, cycle_id)).expect("report json");
+        assert!(report.contains("fallback_skip"));
+        assert!(report.contains("below-tier-floor"));
+        assert!(report.contains("below-ceiling"));
+        assert!(report.contains("cost-policy"));
+        assert!(report.contains("free-train-worker"));
+    }
+
+    #[test]
     fn retryable_worker_stderr_classifier_matches_provider_limit_signals() {
         assert!(is_retryable_worker_stderr("HTTP 429: too many requests"));
+        assert!(is_retryable_worker_stderr("status code: 429"));
         assert!(is_retryable_worker_stderr("quota exceeded"));
         assert!(is_retryable_worker_stderr("provider returned rate_limit"));
         assert!(is_retryable_worker_stderr("provider returned rate limit"));
+        assert!(!is_retryable_worker_stderr("panicked at src/foo.rs:429:10"));
         assert!(!is_retryable_worker_stderr("syntax error in worker prompt"));
     }
 

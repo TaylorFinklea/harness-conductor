@@ -173,6 +173,39 @@ fn skip_code_for(reason: &SkipReason) -> Option<SkipCode> {
 // Candidate selection (Routing algorithm, step 2)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateRejection {
+    BelowTierFloor { required: Tier, actual: Tier },
+    BelowCeiling { required: Ceiling, actual: Ceiling },
+    CostPolicy { policy: CostPolicy, cost: Cost },
+}
+
+pub(crate) fn candidate_rejection(
+    roster: &RosterEntry,
+    routing: &RoutingFields,
+    repo_cost_policy: CostPolicy,
+) -> Option<CandidateRejection> {
+    if tier_rank(roster.tier) < tier_rank(routing.tier_floor) {
+        return Some(CandidateRejection::BelowTierFloor {
+            required: routing.tier_floor,
+            actual: roster.tier,
+        });
+    }
+    if ceiling_rank(roster.ceiling) < ceiling_rank(routing.complexity) {
+        return Some(CandidateRejection::BelowCeiling {
+            required: routing.complexity,
+            actual: roster.ceiling,
+        });
+    }
+    if !routing.trains_ok && !repo_cost_policy.allows(roster.cost) {
+        return Some(CandidateRejection::CostPolicy {
+            policy: repo_cost_policy,
+            cost: roster.cost,
+        });
+    }
+    None
+}
+
 /// Selects the routing target for one triaged item: roster entries with
 /// `tier ≥ tier_floor` and `ceiling ≥ complexity`, narrowed to the lowest
 /// qualifying tier, then the most efficient, then fewest dispatches so far
@@ -197,11 +230,7 @@ fn select_candidate<'a>(
     let mut qualifying: Vec<(usize, &RosterEntry)> = roster
         .iter()
         .enumerate()
-        .filter(|(_, r)| {
-            tier_rank(r.tier) >= tier_rank(routing.tier_floor)
-                && ceiling_rank(r.ceiling) >= ceiling_rank(routing.complexity)
-        })
-        .filter(|(_, r)| routing.trains_ok || repo_cost_policy.allows(r.cost))
+        .filter(|(_, r)| candidate_rejection(r, routing, repo_cost_policy).is_none())
         .collect();
     if qualifying.is_empty() {
         return None;
