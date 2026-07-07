@@ -160,6 +160,13 @@ fn normalize_cost(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
+fn normalize_fallback_chain(fallback: &[String]) -> Vec<String> {
+    fallback
+        .iter()
+        .map(|entry| normalize_model(entry))
+        .collect()
+}
+
 fn config_cost(cost: config::Cost) -> &'static str {
     match cost {
         config::Cost::Paid => "paid",
@@ -437,18 +444,21 @@ pub(crate) fn diff(
                         detail: format!("scorecard: {}, config: {cfg_cost}", sc_entry.cost),
                     });
                 }
+            }
 
-                if sc_entry.fallback != cfg_entry.fallback {
-                    report.items.push(DriftItem {
-                        kind: DriftKind::FallbackMismatch,
-                        model: sc_entry.model.clone(),
-                        detail: format!(
-                            "scorecard: [{}], config: [{}]",
-                            sc_entry.fallback.join(", "),
-                            cfg_entry.fallback.join(", ")
-                        ),
-                    });
-                }
+            if !sc_entry.fallback.is_empty()
+                && normalize_fallback_chain(&sc_entry.fallback)
+                    != normalize_fallback_chain(&cfg_entry.fallback)
+            {
+                report.items.push(DriftItem {
+                    kind: DriftKind::FallbackMismatch,
+                    model: sc_entry.model.clone(),
+                    detail: format!(
+                        "scorecard: [{}], config: [{}]",
+                        sc_entry.fallback.join(", "),
+                        cfg_entry.fallback.join(", ")
+                    ),
+                });
             }
         }
     }
@@ -717,6 +727,47 @@ Just some prose, no table at all.
         let kinds: Vec<DriftKind> = report.items.iter().map(|i| i.kind.clone()).collect();
         assert!(kinds.contains(&DriftKind::CostMismatch));
         assert!(kinds.contains(&DriftKind::FallbackMismatch));
+    }
+
+    #[test]
+    fn roster_drift_diff_fallback_mismatch_when_cost_blank() {
+        let sc = vec![ScorecardEntry {
+            model: "glm-5.2".to_string(),
+            dispatch_id: String::new(),
+            tier: "Senior".to_string(),
+            ceiling: "M".to_string(),
+            cost: String::new(),
+            fallback: vec!["other-fallback".to_string()],
+        }];
+        let mut cfg = vec![cfg_entry("glm-5.2", Tier::Senior, Ceiling::M)];
+        cfg[0].fallback = vec!["nw-glm-5.2-short".to_string()];
+
+        let report = diff(&sc, &cfg);
+
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].kind, DriftKind::FallbackMismatch);
+    }
+
+    #[test]
+    fn roster_drift_diff_fallback_agreement_case_insensitive() {
+        let sc = vec![ScorecardEntry {
+            model: "glm-5.2".to_string(),
+            dispatch_id: String::new(),
+            tier: "Senior".to_string(),
+            ceiling: "M".to_string(),
+            cost: "paid".to_string(),
+            fallback: vec!["NW-GLM-5.2-SHORT".to_string()],
+        }];
+        let mut cfg = vec![cfg_entry("glm-5.2", Tier::Senior, Ceiling::M)];
+        cfg[0].fallback = vec!["nw-glm-5.2-short".to_string()];
+
+        let report = diff(&sc, &cfg);
+
+        assert!(
+            !report.has_drift(),
+            "expected no drift, got: {:?}",
+            report.items
+        );
     }
 
     // --- diff: multiple drift types ---
