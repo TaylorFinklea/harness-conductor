@@ -23,5 +23,8 @@ This scorecard is missing a model that's in conductor.toml.
 | **nw-glm-5.2-short-fast** | neuralwatt/glm-5.2-short-fast | **Junior** | S | good | Test fixture |
 | **nw-kimi-k2.6** | neuralwatt/kimi-k2.6 | **Senior** | M | good | Test fixture |
 | **nw-kimi-k2.6-fast** | neuralwatt/kimi-k2.6-fast | **Junior** | S | good | Test fixture |
+| **ollama-glm-5.2** | ollama-cloud/glm-5.2 | **Senior** | M | good | Test fixture |
+| **ollama-kimi-k2.6** | ollama-cloud/kimi-k2.6 | **Senior** | M | good | Test fixture |
+| **ollama-minimax-m3** | ollama-cloud/minimax-m3 | **Senior** | M | good | Test fixture |
 
 Note: gemini-3.5-flash-free is missing (it's in conductor.toml but not here)

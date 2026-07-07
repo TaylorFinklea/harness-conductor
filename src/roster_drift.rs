@@ -774,7 +774,7 @@ Just some prose, no table at all.
     fn roster_drift_fixture_agreement() {
         let scorecard = load_fixture("scorecard-agreement.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 18);
+        assert_eq!(entries.len(), 21);
     }
 
     #[test]
@@ -789,7 +789,7 @@ Just some prose, no table at all.
     fn roster_drift_fixture_extra_in_config() {
         let scorecard = load_fixture("scorecard-extra-in-config.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 17);
+        assert_eq!(entries.len(), 20);
     }
 
     #[test]

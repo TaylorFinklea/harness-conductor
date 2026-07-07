@@ -1406,7 +1406,7 @@ mod tests {
     fn checked_in_config_parses_and_has_phase2_roster_entries() {
         let cfg = parse_str(include_str!("../conductor.toml"))
             .expect("checked-in conductor.toml must parse");
-        assert_eq!(cfg.roster.len(), 18);
+        assert_eq!(cfg.roster.len(), 21);
         // spec's exact roster table, in order.
         assert_eq!(cfg.roster[0].name, "sonnet-5");
         assert_eq!(cfg.roster[0].tier, Tier::Lead);
@@ -1419,70 +1419,99 @@ mod tests {
         assert_eq!(cfg.roster[1].name, "opus-4.8");
         assert_eq!(cfg.roster[1].ceiling, Ceiling::Xl);
         assert_eq!(cfg.roster[1].efficiency, Efficiency::Heavy);
-        assert_eq!(cfg.roster[6].name, "glm-5.1");
-        assert_eq!(cfg.roster[6].tier, Tier::Junior);
-        assert_eq!(cfg.roster[6].ceiling, Ceiling::S);
+        // ollama-cloud lane
+        assert_eq!(cfg.roster[6].name, "ollama-glm-5.2");
+        assert_eq!(cfg.roster[6].tier, Tier::Senior);
+        assert_eq!(cfg.roster[6].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[6].efficiency, Efficiency::Lean);
         assert_eq!(cfg.roster[6].backend, Backend::Pi);
-        assert_eq!(cfg.roster[6].dispatch_id, "opencode-go/glm-5.1");
-        assert_eq!(cfg.roster[6].provider, "opencode-go");
-        assert_eq!(cfg.roster[6].cost, Cost::Free);
-        assert!(cfg.roster[6].fallback.is_empty());
-        assert_eq!(cfg.roster[7].name, "mimo-v2.5");
-        assert_eq!(cfg.roster[7].dispatch_id, "opencode-go/mimo-v2.5");
-        assert_eq!(cfg.roster[7].cost, Cost::Free);
-        assert_eq!(cfg.roster[8].name, "qwen3.6-plus");
-        assert_eq!(cfg.roster[8].dispatch_id, "opencode-go/qwen3.6-plus");
-        assert_eq!(cfg.roster[8].cost, Cost::Free);
-        assert_eq!(cfg.roster[9].name, "deepseek-v4-flash");
-        assert_eq!(cfg.roster[9].dispatch_id, "opencode-go/deepseek-v4-flash");
+        assert_eq!(cfg.roster[6].dispatch_id, "ollama-cloud/glm-5.2");
+        assert_eq!(cfg.roster[6].provider, "ollama-cloud");
+        assert_eq!(cfg.roster[6].cost, Cost::Paid);
+        assert_eq!(cfg.roster[7].name, "ollama-kimi-k2.6");
+        assert_eq!(cfg.roster[7].tier, Tier::Senior);
+        assert_eq!(cfg.roster[7].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[7].efficiency, Efficiency::Lean);
+        assert_eq!(cfg.roster[7].backend, Backend::Pi);
+        assert_eq!(cfg.roster[7].dispatch_id, "ollama-cloud/kimi-k2.6");
+        assert_eq!(cfg.roster[7].provider, "ollama-cloud");
+        assert_eq!(cfg.roster[7].cost, Cost::Paid);
+        assert_eq!(cfg.roster[8].name, "ollama-minimax-m3");
+        assert_eq!(cfg.roster[8].tier, Tier::Senior);
+        assert_eq!(cfg.roster[8].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[8].efficiency, Efficiency::Lean);
+        assert_eq!(cfg.roster[8].backend, Backend::Pi);
+        assert_eq!(cfg.roster[8].dispatch_id, "ollama-cloud/minimax-m3");
+        assert_eq!(cfg.roster[8].provider, "ollama-cloud");
+        assert_eq!(cfg.roster[8].cost, Cost::Paid);
+        assert_eq!(cfg.roster[9].name, "glm-5.1");
+        assert_eq!(cfg.roster[9].tier, Tier::Junior);
+        assert_eq!(cfg.roster[9].ceiling, Ceiling::S);
+        assert_eq!(cfg.roster[9].backend, Backend::Pi);
+        assert_eq!(cfg.roster[9].dispatch_id, "opencode-go/glm-5.1");
+        assert_eq!(cfg.roster[9].provider, "opencode-go");
         assert_eq!(cfg.roster[9].cost, Cost::Free);
-        assert_eq!(cfg.roster[10].name, "gemini-3.5-flash-free");
-        assert_eq!(cfg.roster[10].tier, Tier::Junior);
-        assert_eq!(cfg.roster[10].ceiling, Ceiling::S);
-        assert_eq!(cfg.roster[10].backend, Backend::Pi);
+        assert!(cfg.roster[9].fallback.is_empty());
+        assert_eq!(cfg.roster[10].name, "mimo-v2.5");
+        assert_eq!(cfg.roster[10].dispatch_id, "opencode-go/mimo-v2.5");
+        assert_eq!(cfg.roster[10].cost, Cost::Free);
+        assert_eq!(cfg.roster[11].name, "qwen3.6-plus");
+        assert_eq!(cfg.roster[11].dispatch_id, "opencode-go/qwen3.6-plus");
+        assert_eq!(cfg.roster[11].cost, Cost::Free);
+        assert_eq!(cfg.roster[12].name, "deepseek-v4-flash");
+        assert_eq!(cfg.roster[12].dispatch_id, "opencode-go/deepseek-v4-flash");
+        assert_eq!(cfg.roster[12].cost, Cost::Free);
+        assert_eq!(cfg.roster[13].name, "gemini-3.5-flash-free");
+        assert_eq!(cfg.roster[13].tier, Tier::Junior);
+        assert_eq!(cfg.roster[13].ceiling, Ceiling::S);
+        assert_eq!(cfg.roster[13].backend, Backend::Pi);
         assert_eq!(
-            cfg.roster[10].dispatch_id,
+            cfg.roster[13].dispatch_id,
             "google-ai-studio/gemini-3.5-flash"
         );
-        assert_eq!(cfg.roster[10].provider, "google-ai-studio");
-        assert_eq!(cfg.roster[10].cost, Cost::FreeTrainsInput);
-        assert_eq!(cfg.roster[11].name, "agy-gemini-3.5-flash-free");
-        assert_eq!(cfg.roster[11].tier, Tier::Junior);
-        assert_eq!(cfg.roster[11].ceiling, Ceiling::S);
-        assert_eq!(cfg.roster[11].backend, Backend::Agy);
-        assert_eq!(cfg.roster[11].dispatch_id, "Gemini 3.5 Flash (High)");
-        assert_eq!(cfg.roster[11].provider, "agy");
-        assert_eq!(cfg.roster[11].cost, Cost::FreeTrainsInput);
-        // neuralwatt lane
-        assert_eq!(cfg.roster[12].name, "nw-glm-5.2");
-        assert_eq!(cfg.roster[12].tier, Tier::Senior);
-        assert_eq!(cfg.roster[12].ceiling, Ceiling::M);
-        assert_eq!(cfg.roster[12].efficiency, Efficiency::Lean);
-        assert_eq!(cfg.roster[12].backend, Backend::Pi);
-        assert_eq!(cfg.roster[12].dispatch_id, "neuralwatt/glm-5.2");
-        assert_eq!(cfg.roster[12].provider, "neuralwatt");
-        assert_eq!(cfg.roster[13].name, "nw-glm-5.2-short");
-        assert_eq!(cfg.roster[13].tier, Tier::Senior);
-        assert_eq!(cfg.roster[13].ceiling, Ceiling::M);
-        assert_eq!(cfg.roster[14].name, "nw-glm-5.2-fast");
+        assert_eq!(cfg.roster[13].provider, "google-ai-studio");
+        assert_eq!(cfg.roster[13].cost, Cost::FreeTrainsInput);
+        assert_eq!(cfg.roster[14].name, "agy-gemini-3.5-flash-free");
         assert_eq!(cfg.roster[14].tier, Tier::Junior);
         assert_eq!(cfg.roster[14].ceiling, Ceiling::S);
-        assert_eq!(cfg.roster[15].name, "nw-glm-5.2-short-fast");
-        assert_eq!(cfg.roster[15].tier, Tier::Junior);
-        assert_eq!(cfg.roster[15].ceiling, Ceiling::S);
-        assert_eq!(cfg.roster[16].name, "nw-kimi-k2.6");
+        assert_eq!(cfg.roster[14].backend, Backend::Agy);
+        assert_eq!(cfg.roster[14].dispatch_id, "Gemini 3.5 Flash (High)");
+        assert_eq!(cfg.roster[14].provider, "agy");
+        assert_eq!(cfg.roster[14].cost, Cost::FreeTrainsInput);
+        // neuralwatt lane
+        assert_eq!(cfg.roster[15].name, "nw-glm-5.2");
+        assert_eq!(cfg.roster[15].tier, Tier::Senior);
+        assert_eq!(cfg.roster[15].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[15].efficiency, Efficiency::Lean);
+        assert_eq!(cfg.roster[15].backend, Backend::Pi);
+        assert_eq!(cfg.roster[15].dispatch_id, "neuralwatt/glm-5.2");
+        assert_eq!(cfg.roster[15].provider, "neuralwatt");
+        assert_eq!(cfg.roster[16].name, "nw-glm-5.2-short");
         assert_eq!(cfg.roster[16].tier, Tier::Senior);
         assert_eq!(cfg.roster[16].ceiling, Ceiling::M);
-        assert_eq!(cfg.roster[17].name, "nw-kimi-k2.6-fast");
+        assert_eq!(cfg.roster[17].name, "nw-glm-5.2-fast");
         assert_eq!(cfg.roster[17].tier, Tier::Junior);
         assert_eq!(cfg.roster[17].ceiling, Ceiling::S);
+        assert_eq!(cfg.roster[18].name, "nw-glm-5.2-short-fast");
+        assert_eq!(cfg.roster[18].tier, Tier::Junior);
+        assert_eq!(cfg.roster[18].ceiling, Ceiling::S);
+        assert_eq!(cfg.roster[19].name, "nw-kimi-k2.6");
+        assert_eq!(cfg.roster[19].tier, Tier::Senior);
+        assert_eq!(cfg.roster[19].ceiling, Ceiling::M);
+        assert_eq!(cfg.roster[20].name, "nw-kimi-k2.6-fast");
+        assert_eq!(cfg.roster[20].tier, Tier::Junior);
+        assert_eq!(cfg.roster[20].ceiling, Ceiling::S);
         assert_eq!(
             cfg.roster
                 .iter()
                 .find(|r| r.name == "glm-5.2")
                 .expect("glm-5.2 row")
                 .fallback,
-            vec!["nw-glm-5.2-short".to_string(), "nw-glm-5.2".to_string()]
+            vec![
+                "ollama-glm-5.2".to_string(),
+                "nw-glm-5.2-short".to_string(),
+                "nw-glm-5.2".to_string()
+            ]
         );
         assert_eq!(cfg.repo_policies.len(), 0);
         // defaults
@@ -1501,7 +1530,7 @@ mod tests {
         assert_eq!(cfg.arena.parallel, 2);
         assert!(cfg.arena.auto_apply);
         assert_eq!(cfg.arena.min_score_x10, 40);
-        assert_eq!(cfg.arena.profiles.len(), 19);
+        assert_eq!(cfg.arena.profiles.len(), 25);
         assert_eq!(cfg.arena.profiles[0].name, "codex-gpt55");
         assert_eq!(cfg.arena.profiles[18].name, "opencode-nw-kimi-k26-fast");
         assert_eq!(cfg.arena.judges.len(), 3);
