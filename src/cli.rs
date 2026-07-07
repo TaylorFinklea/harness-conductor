@@ -453,6 +453,7 @@ fn print_scan_table(snapshots: &[crate::scan::RepoSnapshot]) {
                 Some(SkipReason::Excluded) => "excluded".to_string(),
                 Some(SkipReason::NotBeadsRepo) => "not-beads".to_string(),
                 Some(SkipReason::NotGitRepo) => "not-git".to_string(),
+                Some(SkipReason::ScanGap { .. }) => "scan-gap".to_string(),
                 None => "-".to_string(),
             };
 
@@ -814,6 +815,14 @@ mod tests {
             make_snapshot("b", 0, Some(SkipReason::Excluded)),
             make_snapshot("c", 0, Some(SkipReason::NotBeadsRepo)),
             make_snapshot("d", 0, Some(SkipReason::NotGitRepo)),
+            make_snapshot(
+                "e",
+                0,
+                Some(SkipReason::ScanGap {
+                    command: "bd ready --json".to_string(),
+                    message: "failed to parse JSON from `bd ready`: fixture".to_string(),
+                }),
+            ),
         ];
 
         print_scan_table(&snapshots);

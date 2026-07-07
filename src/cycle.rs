@@ -134,9 +134,7 @@ fn build_report(
     let ready_items: usize = snapshots.iter().map(|s| s.ready.len()).sum();
     let triaged_count = plan.proposals.len() + plan.dispatches.len();
     let flagged_count = plan.flags.len();
-    let triaged_pct = (triaged_count * 100)
-        .checked_div(ready_items)
-        .unwrap_or(0);
+    let triaged_pct = (triaged_count * 100).checked_div(ready_items).unwrap_or(0);
 
     blocks.push(Block::metrics(
         "Cycle Metrics",
@@ -191,6 +189,26 @@ fn build_callouts(plan: &Plan) -> Vec<Block> {
     let mut callouts = Vec::new();
 
     // --- Callout blocks for flags ---
+    let scan_gaps: Vec<String> = plan
+        .flags
+        .iter()
+        .filter_map(|f| match f {
+            Flag::ScanGap { repo, detail } => Some(format!("- {repo}: {detail}")),
+            _ => None,
+        })
+        .collect();
+    if !scan_gaps.is_empty() {
+        callouts.push(Block::callout(
+            CalloutLevel::Warn,
+            "SCAN-GAP",
+            format!(
+                "{} repos had bd ready --json parse gaps:\n{}",
+                scan_gaps.len(),
+                scan_gaps.join("\n")
+            ),
+        ));
+    }
+
     let untriaged: Vec<String> = plan
         .flags
         .iter()
@@ -280,6 +298,7 @@ fn repo_state_str(s: &RepoSnapshot) -> String {
             SkipReason::Excluded => "excluded".to_string(),
             SkipReason::NotBeadsRepo => "not-beads".to_string(),
             SkipReason::NotGitRepo => "not-git".to_string(),
+            SkipReason::ScanGap { .. } => "scan-gap".to_string(),
         };
     }
     match s.zero_state {
@@ -340,6 +359,7 @@ mod tests {
 
     struct FakeBdClient {
         ready: RefCell<HashMap<PathBuf, Vec<Issue>>>,
+        ready_errors: RefCell<HashMap<PathBuf, BdError>>,
         count: RefCell<HashMap<PathBuf, u64>>,
         blocked: RefCell<HashMap<PathBuf, Vec<Issue>>>,
     }
@@ -348,6 +368,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 ready: RefCell::new(HashMap::new()),
+                ready_errors: RefCell::new(HashMap::new()),
                 count: RefCell::new(HashMap::new()),
                 blocked: RefCell::new(HashMap::new()),
             }
@@ -357,19 +378,26 @@ mod tests {
             self.ready.borrow_mut().insert(repo.to_path_buf(), issues);
         }
 
+        fn set_ready_error(&self, repo: &Path, error: BdError) {
+            self.ready_errors
+                .borrow_mut()
+                .insert(repo.to_path_buf(), error);
+        }
+
         fn set_count(&self, repo: &Path, count: u64) {
             self.count.borrow_mut().insert(repo.to_path_buf(), count);
         }
 
         fn set_blocked(&self, repo: &Path, issues: Vec<Issue>) {
-            self.blocked
-                .borrow_mut()
-                .insert(repo.to_path_buf(), issues);
+            self.blocked.borrow_mut().insert(repo.to_path_buf(), issues);
         }
     }
 
     impl BdClient for FakeBdClient {
         fn ready(&self, repo: &Path) -> crate::bd::Result<Vec<Issue>> {
+            if let Some(error) = self.ready_errors.borrow().get(repo).cloned() {
+                return Err(error);
+            }
             self.ready
                 .borrow()
                 .get(repo)
@@ -409,12 +437,7 @@ mod tests {
             Err(BdError::new("close not implemented in fake"))
         }
 
-        fn comment(
-            &self,
-            _repo: &Path,
-            _id: &str,
-            _text: &str,
-        ) -> crate::bd::Result<Comment> {
+        fn comment(&self, _repo: &Path, _id: &str, _text: &str) -> crate::bd::Result<Comment> {
             Err(BdError::new("comment not implemented in fake"))
         }
 
@@ -476,12 +499,7 @@ mod tests {
         std::fs::write(&metadata, r#"{"backend":"dolt"}"#).expect("write metadata.json");
     }
 
-    fn make_issue_with_metadata(
-        id: &str,
-        priority: u32,
-        tier: &str,
-        complexity: &str,
-    ) -> Issue {
+    fn make_issue_with_metadata(id: &str, priority: u32, tier: &str, complexity: &str) -> Issue {
         let mut metadata = BTreeMap::new();
         metadata.insert("tier_floor".to_string(), json!(tier));
         metadata.insert("complexity".to_string(), json!(complexity));
@@ -538,6 +556,12 @@ mod tests {
         }
     }
 
+    fn ready_json_error(output: &str) -> BdError {
+        let err = serde_json::from_str::<Vec<Issue>>(output)
+            .expect_err("fixture must fail as bd ready issue JSON");
+        BdError::json("bd ready", &err)
+    }
+
     // --- The test ---
 
     fn assert_dry_run_report(result: &CycleResult, cycle_id: &str) {
@@ -559,10 +583,7 @@ mod tests {
 
         // --- Verify report blocks ---
         let blocks = report["blocks"].as_array().unwrap();
-        let types: Vec<&str> = blocks
-            .iter()
-            .map(|b| b["type"].as_str().unwrap())
-            .collect();
+        let types: Vec<&str> = blocks.iter().map(|b| b["type"].as_str().unwrap()).collect();
 
         assert!(types.contains(&"metrics"), "missing metrics block");
         assert!(types.contains(&"table"), "missing table block");
@@ -592,6 +613,92 @@ mod tests {
         let table = blocks.iter().find(|b| b["type"] == "table").unwrap();
         let table_rows = table["rows"].as_array().unwrap();
         assert_eq!(table_rows.len(), 3); // alpha, beta, gamma
+    }
+
+    #[test]
+    fn cycle_report_surfaces_scan_gaps() {
+        let fleet = TempDir::new("scan-gap-fleet");
+        let reports = TempDir::new("scan-gap-reports");
+        let state = TempDir::new("scan-gap-state");
+
+        let bad = fleet.path().join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        init_beads_repo(&bad);
+
+        let healthy = fleet.path().join("healthy");
+        std::fs::create_dir_all(&healthy).unwrap();
+        init_beads_repo(&healthy);
+
+        let config_src = format!(
+            r#"[scan]
+root = "{}"
+
+[[roster]]
+name = "test-senior"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "test/senior"
+"#,
+            fleet.path().display()
+        );
+        let cfg = config::parse_str(&config_src).unwrap();
+
+        let client = FakeBdClient::new();
+        client.set_ready_error(&bad, ready_json_error("{"));
+        client.set_ready(&healthy, vec![]);
+        client.set_count(&healthy, 0);
+        client.set_blocked(&healthy, vec![]);
+
+        let cycle_id = "cycle-20260702-121500";
+        let created_at = "2026-07-02T12:15:00Z";
+        let result = run_dry_run_with_timestamps(
+            &cfg,
+            &client,
+            reports.path(),
+            state.path(),
+            cycle_id,
+            created_at,
+        )
+        .unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&result.report_path).unwrap()).unwrap();
+        let blocks = report["blocks"].as_array().unwrap();
+
+        let metrics = blocks.iter().find(|b| b["type"] == "metrics").unwrap();
+        let flagged = metrics["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["label"] == "Flagged")
+            .unwrap();
+        assert_eq!(flagged["value"], "1");
+
+        let table = blocks.iter().find(|b| b["type"] == "table").unwrap();
+        let rows = table["rows"].as_array().unwrap();
+        let bad_row = rows
+            .iter()
+            .find(|row| row[0] == "bad")
+            .expect("bad repo row");
+        assert_eq!(bad_row[1], "-");
+        assert_eq!(bad_row[2], "scan-gap");
+
+        let scan_gap_callout = blocks
+            .iter()
+            .find(|b| b["type"] == "callout" && b["tag"] == "SCAN-GAP")
+            .expect("scan gap callout");
+        assert!(scan_gap_callout["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("bad"));
+
+        let plan_path = state.path().join("plans").join(format!("{cycle_id}.json"));
+        let plan: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(plan_path).unwrap()).unwrap();
+        assert_eq!(plan["flags"][0]["kind"], "scan-gap");
+        assert_eq!(plan["flags"][0]["repo"], "bad");
     }
 
     #[test]
@@ -701,10 +808,7 @@ dispatch_id = "test/junior"
         assert_eq!(journal["last_cycle"]["summary"]["verified"], 0);
 
         // --- Verify plan file ---
-        let plan_path = state
-            .path()
-            .join("plans")
-            .join(format!("{cycle_id}.json"));
+        let plan_path = state.path().join("plans").join(format!("{cycle_id}.json"));
         assert!(plan_path.is_file());
         let plan_bytes = std::fs::read(&plan_path).unwrap();
         let plan_json: serde_json::Value = serde_json::from_slice(&plan_bytes).unwrap();

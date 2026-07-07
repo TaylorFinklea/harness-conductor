@@ -143,6 +143,12 @@ fn flag_entry(flag: &Flag) -> FlagEntry {
             issue_id: issue_id.clone(),
             detail: format!("complexity {complexity:?} exceeds every qualifying model ceiling"),
         },
+        Flag::ScanGap { repo, detail } => FlagEntry {
+            kind: "scan-gap".to_string(),
+            repo: repo.clone(),
+            issue_id: String::new(),
+            detail: detail.clone(),
+        },
         Flag::RosterDrift => FlagEntry {
             kind: "roster-drift".to_string(),
             repo: String::new(),

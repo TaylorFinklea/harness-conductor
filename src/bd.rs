@@ -21,20 +21,36 @@ use serde_json::Value;
 
 pub(crate) type Result<T> = std::result::Result<T, BdError>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BdErrorKind {
+    Other,
+    Json,
+    Command,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct BdError {
     message: String,
+    kind: BdErrorKind,
 }
 
 impl BdError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: BdErrorKind::Other,
         }
     }
 
-    fn json(command: &str, source: &serde_json::Error) -> Self {
-        Self::new(format!("failed to parse JSON from `{command}`: {source}"))
+    pub(crate) fn json(command: &str, source: &serde_json::Error) -> Self {
+        Self {
+            message: format!("failed to parse JSON from `{command}`: {source}"),
+            kind: BdErrorKind::Json,
+        }
+    }
+
+    pub(crate) const fn is_json_parse(&self) -> bool {
+        matches!(self.kind, BdErrorKind::Json)
     }
 
     fn command(command: &str, status: Option<i32>, stdout: &str, stderr: &str) -> Self {
@@ -46,9 +62,10 @@ impl BdError {
         } else {
             detail
         };
-        Self::new(format!(
-            "bd command `{command}` failed with status {status}: {detail}"
-        ))
+        Self {
+            message: format!("bd command `{command}` failed with status {status}: {detail}"),
+            kind: BdErrorKind::Command,
+        }
     }
 }
 

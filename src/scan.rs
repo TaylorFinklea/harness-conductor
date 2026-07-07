@@ -46,6 +46,8 @@ pub(crate) enum SkipReason {
     NotBeadsRepo,
     /// Directory is not a git repo or has an unborn HEAD.
     NotGitRepo,
+    /// `bd ready --json` parsed as invalid or schema-drifted JSON for this repo.
+    ScanGap { command: String, message: String },
 }
 
 /// Zero-state distinction for repos with no ready work.
@@ -90,7 +92,10 @@ pub(crate) struct RepoSnapshot {
 /// # Errors
 ///
 /// Returns an error if `root` cannot be expanded or read.
-pub(crate) fn scan(config: &ScanConfig, client: &dyn BdClient) -> Result<Vec<RepoSnapshot>, ScanError> {
+pub(crate) fn scan(
+    config: &ScanConfig,
+    client: &dyn BdClient,
+) -> Result<Vec<RepoSnapshot>, ScanError> {
     let root = expand_tilde(&config.root)?;
 
     if !root.is_dir() {
@@ -104,7 +109,11 @@ pub(crate) fn scan(config: &ScanConfig, client: &dyn BdClient) -> Result<Vec<Rep
         .exclude
         .iter()
         .cloned()
-        .chain(crate::config::HARDCODED_EXCLUDE.iter().map(|s| (*s).to_string()))
+        .chain(
+            crate::config::HARDCODED_EXCLUDE
+                .iter()
+                .map(|s| (*s).to_string()),
+        )
         .collect();
 
     let mut snapshots = Vec::new();
@@ -179,7 +188,31 @@ fn scan_repo(path: &Path, name: &str, client: &dyn BdClient) -> RepoSnapshot {
     }
 
     // Query bd for ready, count, blocked
-    let ready = client.ready(path).unwrap_or_default();
+    let ready = match client.ready(path) {
+        Ok(ready) => ready,
+        Err(err) if err.is_json_parse() => {
+            let message = err.to_string();
+            eprintln!(
+                "scan gap: {}: bd ready --json parse failed: {message}",
+                path.display()
+            );
+            return RepoSnapshot {
+                path: path.to_path_buf(),
+                name: name.to_string(),
+                is_beads_repo: true,
+                skip_reason: Some(SkipReason::ScanGap {
+                    command: "bd ready --json".to_string(),
+                    message,
+                }),
+                ready: Vec::new(),
+                count: 0,
+                blocked: Vec::new(),
+                zero_state: ZeroState::NotApplicable,
+                freshness: read_freshness(path),
+            };
+        }
+        Err(_) => Vec::new(),
+    };
     let count = client.count(path).unwrap_or_default();
     let blocked = client.blocked(path).unwrap_or_default();
 
@@ -290,7 +323,8 @@ fn expand_tilde(path: &str) -> Result<PathBuf, ScanError> {
         return Ok(PathBuf::from(path));
     }
 
-    let home = std::env::var("HOME").map_err(|_| ScanError::new("HOME not set; cannot expand ~"))?;
+    let home =
+        std::env::var("HOME").map_err(|_| ScanError::new("HOME not set; cannot expand ~"))?;
     if home.is_empty() {
         return Err(ScanError::new("HOME is empty; cannot expand ~"));
     }
@@ -333,6 +367,7 @@ mod tests {
 
     struct FakeBdClient {
         ready: RefCell<HashMap<PathBuf, Vec<Issue>>>,
+        ready_errors: RefCell<HashMap<PathBuf, BdError>>,
         count: RefCell<HashMap<PathBuf, u64>>,
         blocked: RefCell<HashMap<PathBuf, Vec<Issue>>>,
     }
@@ -341,6 +376,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 ready: RefCell::new(HashMap::new()),
+                ready_errors: RefCell::new(HashMap::new()),
                 count: RefCell::new(HashMap::new()),
                 blocked: RefCell::new(HashMap::new()),
             }
@@ -348,6 +384,12 @@ mod tests {
 
         fn set_ready(&self, repo: &Path, issues: Vec<Issue>) {
             self.ready.borrow_mut().insert(repo.to_path_buf(), issues);
+        }
+
+        fn set_ready_error(&self, repo: &Path, error: BdError) {
+            self.ready_errors
+                .borrow_mut()
+                .insert(repo.to_path_buf(), error);
         }
 
         fn set_count(&self, repo: &Path, count: u64) {
@@ -361,6 +403,9 @@ mod tests {
 
     impl BdClient for FakeBdClient {
         fn ready(&self, repo: &Path) -> crate::bd::Result<Vec<Issue>> {
+            if let Some(error) = self.ready_errors.borrow().get(repo).cloned() {
+                return Err(error);
+            }
             self.ready
                 .borrow()
                 .get(repo)
@@ -465,6 +510,25 @@ mod tests {
             dependency_count: None,
             dependent_count: None,
             comment_count: None,
+        }
+    }
+
+    fn ready_json_error(output: &str) -> BdError {
+        let err = serde_json::from_str::<Vec<Issue>>(output)
+            .expect_err("fixture must fail as bd ready issue JSON");
+        BdError::json("bd ready", &err)
+    }
+
+    fn assert_scan_gap(snapshot: &RepoSnapshot, expected_message: &str) {
+        match &snapshot.skip_reason {
+            Some(SkipReason::ScanGap { command, message }) => {
+                assert_eq!(command, "bd ready --json");
+                assert!(
+                    message.contains(expected_message),
+                    "scan gap message {message:?} did not contain {expected_message:?}"
+                );
+            }
+            other => panic!("expected scan gap, got {other:?}"),
         }
     }
 
@@ -606,7 +670,10 @@ mod tests {
 
         let snapshots = scan(&config, &client).expect("scan succeeds");
 
-        let chez = snapshots.iter().find(|s| s.name == "chezmoi-config").unwrap();
+        let chez = snapshots
+            .iter()
+            .find(|s| s.name == "chezmoi-config")
+            .unwrap();
         assert_eq!(chez.skip_reason, Some(SkipReason::Excluded));
 
         let r1 = snapshots.iter().find(|s| s.name == "repo1").unwrap();
@@ -705,10 +772,7 @@ mod tests {
         let client = FakeBdClient::new();
         client.set_ready(
             &repo,
-            vec![
-                make_issue("ip1", "in_progress"),
-                make_issue("ip2", "open"),
-            ],
+            vec![make_issue("ip1", "in_progress"), make_issue("ip2", "open")],
         );
         client.set_count(&repo, 2);
         client.set_blocked(&repo, vec![]);
@@ -897,6 +961,76 @@ mod tests {
     }
 
     #[test]
+    fn scan_flags_malformed_ready_json_as_gap_and_keeps_other_repos() {
+        let temp = TempDir::new("malformed-ready-json");
+        let root = temp.path();
+
+        let bad = root.join("bad");
+        std::fs::create_dir_all(&bad).expect("mkdir bad");
+        init_beads_repo(&bad);
+
+        let good = root.join("good");
+        std::fs::create_dir_all(&good).expect("mkdir good");
+        init_beads_repo(&good);
+
+        let config = ScanConfig {
+            root: root.display().to_string(),
+            exclude: Vec::new(),
+        };
+
+        let client = FakeBdClient::new();
+        client.set_ready_error(&bad, ready_json_error("{"));
+        client.set_ready(&good, vec![make_issue("g1", "open")]);
+        client.set_count(&good, 1);
+        client.set_blocked(&good, vec![]);
+
+        let snapshots = scan(&config, &client).expect("scan succeeds despite one parse gap");
+
+        let bad_snapshot = snapshots.iter().find(|s| s.name == "bad").unwrap();
+        assert!(bad_snapshot.is_beads_repo);
+        assert_scan_gap(bad_snapshot, "failed to parse JSON from `bd ready`");
+        assert!(bad_snapshot.ready.is_empty());
+        assert_eq!(bad_snapshot.zero_state, ZeroState::NotApplicable);
+
+        let good_snapshot = snapshots.iter().find(|s| s.name == "good").unwrap();
+        assert_eq!(good_snapshot.skip_reason, None);
+        assert_eq!(good_snapshot.ready.len(), 1);
+    }
+
+    #[test]
+    fn scan_flags_valid_ready_schema_drift_as_gap_not_drained() {
+        let temp = TempDir::new("schema-drift-ready-json");
+        let root = temp.path();
+
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        init_beads_repo(&repo);
+
+        let config = ScanConfig {
+            root: root.display().to_string(),
+            exclude: Vec::new(),
+        };
+
+        let client = FakeBdClient::new();
+        client.set_ready_error(
+            &repo,
+            ready_json_error(
+                r#"[{"title":"missing id","status":"open","priority":1,"issue_type":"task","owner":"test","created_at":"2026-01-01T00:00:00Z","created_by":"test","updated_at":"2026-01-01T00:00:00Z"}]"#,
+            ),
+        );
+
+        let snapshots = scan(&config, &client).expect("scan succeeds despite schema gap");
+
+        let snapshot = snapshots.iter().find(|s| s.name == "repo").unwrap();
+        assert_scan_gap(snapshot, "missing field `id`");
+        assert!(snapshot.ready.is_empty());
+        assert_eq!(snapshot.zero_state, ZeroState::NotApplicable);
+
+        let json = serde_json::to_value(snapshot).expect("snapshot serializes");
+        assert_eq!(json["skip_reason"]["ScanGap"]["command"], "bd ready --json");
+    }
+
+    #[test]
     fn scan_survives_bd_errors() {
         let temp = TempDir::new("bd-errors");
         let root = temp.path();
@@ -947,7 +1081,10 @@ mod tests {
             ],
         );
         client.set_count(&repo, 5);
-        client.set_blocked(&repo, vec![make_issue("b1", "open"), make_issue("b2", "open")]);
+        client.set_blocked(
+            &repo,
+            vec![make_issue("b1", "open"), make_issue("b2", "open")],
+        );
 
         let snapshots = scan(&config, &client).expect("scan succeeds");
 
