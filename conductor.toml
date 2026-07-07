@@ -240,7 +240,7 @@ cost = "paid"
 [[roster]]
 name = "gpt-5.5"
 tier = "senior"
-ceiling = "M"
+ceiling = "L"
 efficiency = "std"
 backend = "pi"
 dispatch_id = "openai-codex/gpt-5.5"
