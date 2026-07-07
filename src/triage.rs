@@ -267,6 +267,10 @@ fn select_candidate<'a>(
 /// absent from the map default to `CostPolicy::Proprietary` (fail closed for
 /// `FreeTrainsInput` models). In production this is built from the config's
 /// `[[repo_policy]]` entries (see `Config::cost_policy_for`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "routing invariant flow is kept linear for auditability"
+)]
 pub(crate) fn route(
     repos: &[RepoSnapshot],
     roster: &[RosterEntry],

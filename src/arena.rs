@@ -320,6 +320,10 @@ impl CommandRunner {
 }
 
 /// Runs one Arena comparison.
+#[expect(
+    clippy::too_many_lines,
+    reason = "arena orchestration is clearer as one audited sequence"
+)]
 pub(crate) fn run(
     cfg: &Config,
     bd: &dyn BdClient,
@@ -800,6 +804,10 @@ fn run_candidates(
     Ok(out)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "candidate lifecycle is kept linear to preserve failure ordering"
+)]
 fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<CandidateRun> {
     let candidate_start = Instant::now();
     let worktree = ctx.work_root.join("worktrees").join(&profile.name);
@@ -887,10 +895,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
         stderr_path: verify_stderr,
     })?;
     let verify_duration_ms = Some(elapsed_ms(verify_start));
-    if !verify_run.success {
-        summary.eligible = false;
-        summary.reason = format!("verify_cmd exited {}", status_summary(verify_run.code));
-    } else {
+    if verify_run.success {
         // Verify passed — check for uncommitted changes and auto-commit if needed
         let dirty = git_stdout(&worktree, ["status", "--porcelain"])?;
         let post_verify_head = git_stdout(&worktree, ["rev-parse", "HEAD"])?;
@@ -904,7 +909,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
                 }
                 Err(e) => {
                     summary.eligible = false;
-                    summary.reason = format!("failed to auto-commit agent changes: {}", e);
+                    summary.reason = format!("failed to auto-commit agent changes: {e}");
                 }
             }
         } else if head == ctx.base_head {
@@ -916,6 +921,9 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
             summary.eligible = false;
             summary.reason = "worktree dirty after verify_cmd".to_string();
         }
+    } else {
+        summary.eligible = false;
+        summary.reason = format!("verify_cmd exited {}", status_summary(verify_run.code));
     }
 
     let patch = if head == ctx.base_head {
@@ -1336,6 +1344,10 @@ fn apply_winner(ctx: &RunContext, candidate: &CandidateRun) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ledger rows mirror arena result dimensions explicitly"
+)]
 fn append_ledger_rows(
     ledger_path: &Path,
     repo: &Path,
@@ -1640,7 +1652,7 @@ fn classify_ralph_failure(stderr: &str) -> Option<RalphFailureCause> {
 }
 
 fn extract_json_string_field(haystack: &str, key: &str) -> Option<String> {
-    let search = format!(r#""{}""#, key);
+    let search = format!(r#""{key}""#);
     let pos = haystack.find(&search)?;
     let mut rest = &haystack[pos + search.len()..];
     rest = rest.trim_start();
@@ -1703,10 +1715,7 @@ fn commit_on_behalf_of_agent(
     git_checked(worktree, ["add", "-A"])?;
 
     // Commit with a message that identifies the agent and issue
-    let commit_msg = format!(
-        "arena: {} implementation by {} (auto-committed)",
-        issue_id, profile_name
-    );
+    let commit_msg = format!("arena: {issue_id} implementation by {profile_name} (auto-committed)");
     git_checked(worktree, ["commit", "-m", &commit_msg])?;
 
     // Return the new HEAD
@@ -1734,7 +1743,7 @@ fn parse_tokens_used(stderr: &str) -> Option<u64> {
             let value = lines.find(|line| !line.trim().is_empty())?;
             let digits = value
                 .chars()
-                .filter(|ch| ch.is_ascii_digit())
+                .filter(char::is_ascii_digit)
                 .collect::<String>();
             return (!digits.is_empty())
                 .then(|| digits.parse::<u64>().ok())

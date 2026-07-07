@@ -118,17 +118,12 @@ pub(crate) enum Backend {
 /// `FreeTrainsInput` models a free provider that trains on submitted input
 /// (e.g. Google AI Studio free tier); it is excluded from proprietary/internal
 /// repos unless a bead opts in via `data_policy: trains-ok`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Cost {
+    #[default]
     Paid,
     Free,
     FreeTrainsInput,
-}
-
-impl Default for Cost {
-    fn default() -> Self {
-        Cost::Paid
-    }
 }
 
 impl FromStr for Cost {
@@ -148,18 +143,13 @@ impl FromStr for Cost {
 /// Per-repo data Policy. `Proprietary`/`Internal` exclude `FreeTrainsInput`
 /// models; `Oss`/`Public` allow them. A repo absent from `[[repo_policy]]`
 /// defaults to `Proprietary` (fail closed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum CostPolicy {
+    #[default]
     Proprietary,
     Internal,
     Oss,
     Public,
-}
-
-impl Default for CostPolicy {
-    fn default() -> Self {
-        CostPolicy::Proprietary
-    }
 }
 
 impl FromStr for CostPolicy {
@@ -180,10 +170,13 @@ impl FromStr for CostPolicy {
 impl CostPolicy {
     /// Whether a model of the given `Cost` is eligible under this policy.
     pub(crate) fn allows(self, cost: Cost) -> bool {
-        match (self, cost) {
-            (CostPolicy::Proprietary | CostPolicy::Internal, Cost::FreeTrainsInput) => false,
-            _ => true,
-        }
+        !matches!(
+            (self, cost),
+            (
+                CostPolicy::Proprietary | CostPolicy::Internal,
+                Cost::FreeTrainsInput
+            )
+        )
     }
 }
 
@@ -248,7 +241,7 @@ pub(crate) struct RosterEntry {
     /// per-repo eligibility; orthogonal to `Tier`.
     pub(crate) cost: Cost,
     /// Ordered list of roster entry names to try on a classified retryable
-    /// failure (429 / quota / rate_limit). Empty by default. Walked by the
+    /// failure (429 / quota / `rate_limit`). Empty by default. Walked by the
     /// dispatcher (Phase 3); triage picks ONE model and the chain only kicks
     /// in at runtime. Names must exist in the roster (validated at parse).
     pub(crate) fallback: Vec<String>,
@@ -1408,6 +1401,10 @@ mod tests {
     // --- the checked-in config ---
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checked-in roster fixture intentionally asserts many fields inline"
+    )]
     fn checked_in_config_parses_and_has_phase2_roster_entries() {
         let cfg = parse_str(include_str!("../conductor.toml"))
             .expect("checked-in conductor.toml must parse");
