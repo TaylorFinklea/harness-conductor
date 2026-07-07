@@ -530,6 +530,7 @@ mod tests {
             max_dispatches_per_cycle: max_cycle,
             max_active_per_repo: max_repo,
             max_external_dispatches: max_external,
+            use_bursar: true,
             item_wall_clock_mins: 45,
             cycle_wall_clock_mins: 90,
         }

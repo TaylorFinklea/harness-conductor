@@ -645,6 +645,7 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     };
 
     let bd = crate::bd::CommandBdClient::new();
+    let bursar = crate::bursar::CommandBursarClient::new();
     let exec = crate::dispatch::CommandExec;
     let commits = crate::dispatch::GitCommitProbe;
     let live = crate::dispatch_cycle::DeckLiveSink;
@@ -660,6 +661,7 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         &cycle_id,
         &options,
         &live,
+        &bursar,
     ) {
         Ok(result) => match result.gate {
             crate::dispatch_cycle::ApprovalGate::Approved => {

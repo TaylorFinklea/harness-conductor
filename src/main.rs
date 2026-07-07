@@ -2,6 +2,7 @@
 
 mod arena;
 mod bd;
+mod bursar;
 mod cli;
 mod config;
 mod cycle;

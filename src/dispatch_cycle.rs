@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 
 use crate::bd::{BdClient, Issue};
-use crate::config::{Ceiling, Config, RosterEntry, Tier};
-use crate::deck::{self, LiveUpdate, ReportStatus};
+use crate::bursar::{self, BudgetAction, BudgetDecision, BursarClient};
+use crate::config::{Backend, Ceiling, Config, RosterEntry, Tier};
+use crate::deck::{self, CalloutLevel, LiveUpdate, ReportStatus};
 use crate::dispatch::{self, CommitProbe, DispatchRequest, Exec};
 use crate::fields::{self, Triage};
 use crate::ledger::{self, LedgerRow};
@@ -114,6 +115,7 @@ pub(crate) fn run_dispatch_cycle<
     E: Exec + ?Sized,
     C: CommitProbe + ?Sized,
     L: LiveSink + ?Sized,
+    U: BursarClient + ?Sized,
 >(
     cfg: &Config,
     bd: &B,
@@ -125,6 +127,7 @@ pub(crate) fn run_dispatch_cycle<
     cycle_id: &str,
     options: &DispatchCycleOptions,
     live: &L,
+    bursar: &U,
 ) -> std::result::Result<DispatchCycleResult, DispatchCycleError> {
     let run_dir = deck::report_run_dir(reports_home, cycle_id)
         .map_err(|e| DispatchCycleError::message(format!("report path: {e}")))?;
@@ -174,6 +177,7 @@ pub(crate) fn run_dispatch_cycle<
             cycle_start,
             item,
             None,
+            bursar,
         )?;
         dispatched += attempt.dispatches;
         match attempt.decision {
@@ -242,6 +246,11 @@ struct WorkerAttempt {
     attempts: u64,
 }
 
+enum WorkerChainOutcome {
+    Ran(WorkerAttempt),
+    Deferred(String),
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -252,6 +261,7 @@ fn dispatch_one<
     E: Exec + ?Sized,
     C: CommitProbe + ?Sized,
     L: LiveSink + ?Sized,
+    U: BursarClient + ?Sized,
 >(
     cfg: &Config,
     bd: &B,
@@ -266,6 +276,7 @@ fn dispatch_one<
     cycle_start: Instant,
     item: &PlannedItem,
     progress: Option<f64>,
+    bursar: &U,
 ) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
     let repo_path = repo_path(cfg, &item.repo)?;
     let roster = cfg
@@ -304,7 +315,7 @@ fn dispatch_one<
         .head(&repo_path)
         .map_err(|e| DispatchCycleError::message(format!("git head before worker: {e}")))?;
     let worker_step = format!("worker {}/{}", item.repo, item.issue_id);
-    let worker_attempt = run_worker_chain(
+    let worker_outcome = run_worker_chain(
         cfg,
         exec,
         commits,
@@ -323,6 +334,7 @@ fn dispatch_one<
         &prompt,
         &worker_step,
         progress,
+        bursar,
     )
     .map_err(|e| {
         let _ = bd.release(&repo_path, &item.issue_id);
@@ -344,6 +356,35 @@ fn dispatch_one<
         );
         DispatchCycleError::message(format!("dispatch: {e}"))
     })?;
+    let worker_attempt = match worker_outcome {
+        WorkerChainOutcome::Ran(worker_attempt) => worker_attempt,
+        WorkerChainOutcome::Deferred(summary) => {
+            let _ = bd.release(&repo_path, &item.issue_id);
+            let _ = bd.comment(
+                &repo_path,
+                &item.issue_id,
+                &format!(
+                    "conductor: {cycle_id} {} budget deferred: {summary}",
+                    item.issue_id
+                ),
+            );
+            append_ledger(
+                ledger_path,
+                roster,
+                &item.repo,
+                &claimed,
+                &extracted,
+                "implement",
+                false,
+                cycle_id,
+                &format!("budget deferred: {summary}"),
+            )?;
+            return Ok(DispatchOneResult {
+                decision: VerifyDecision::Failed,
+                dispatches: 0,
+            });
+        }
+    };
     let active_roster = worker_attempt.roster;
 
     patch_live(
@@ -415,7 +456,7 @@ fn dispatch_one<
     clippy::too_many_arguments,
     reason = "keeps fallback runtime explicit at dispatch boundary"
 )]
-fn run_worker_chain<E, C, L>(
+fn run_worker_chain<E, C, L, U>(
     cfg: &Config,
     exec: &E,
     commits: &C,
@@ -434,15 +475,42 @@ fn run_worker_chain<E, C, L>(
     prompt: &str,
     worker_step: &str,
     progress: Option<f64>,
-) -> std::result::Result<WorkerAttempt, DispatchCycleError>
+    bursar_client: &U,
+) -> std::result::Result<WorkerChainOutcome, DispatchCycleError>
 where
     E: Exec + ?Sized,
     C: CommitProbe + ?Sized,
     L: LiveSink + ?Sized,
+    U: BursarClient + ?Sized,
 {
     let chain = fallback_chain(&cfg.roster, initial_roster)?;
     let mut attempts = 0_u64;
+    let mut deferred = Vec::new();
     for (idx, roster) in chain.iter().enumerate() {
+        if is_metered_worker_backend(roster.backend) {
+            let provider = bursar_provider_for(roster);
+            let decision =
+                bursar::evaluate_budget(bursar_client, &provider, cfg.budgets.use_bursar);
+            record_budget_decision(report_path, item, roster, &decision)?;
+            if decision.action == BudgetAction::Defer {
+                deferred.push(decision.summary.clone());
+                let Some(next) = chain.get(idx + 1) else {
+                    return Ok(WorkerChainOutcome::Deferred(deferred.join("; ")));
+                };
+                patch_live(
+                    live,
+                    report_path,
+                    cycle_start,
+                    format!(
+                        "budget defer {}/{}: {} -> {}",
+                        item.repo, item.issue_id, roster.name, next.name
+                    ),
+                    progress,
+                )?;
+                continue;
+            }
+        }
+
         attempts += 1;
         let request = DispatchRequest {
             repo: repo_path.to_path_buf(),
@@ -472,18 +540,18 @@ where
         .map_err(|e| DispatchCycleError::message(e.to_string()))?;
 
         let Some(reason) = retryable_failure_reason(&result)? else {
-            return Ok(WorkerAttempt {
+            return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
                 roster: roster.clone(),
                 result,
                 attempts,
-            });
+            }));
         };
         let Some(next) = chain.get(idx + 1) else {
-            return Ok(WorkerAttempt {
+            return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
                 roster: roster.clone(),
                 result,
                 attempts,
-            });
+            }));
         };
         append_ledger(
             ledger_path,
@@ -511,6 +579,57 @@ where
         )?;
     }
     Err(DispatchCycleError::message("empty worker fallback chain"))
+}
+
+fn is_metered_worker_backend(backend: Backend) -> bool {
+    matches!(backend, Backend::Pi | Backend::Agy)
+}
+
+fn bursar_provider_for(roster: &RosterEntry) -> String {
+    let raw = if !roster.provider.is_empty() {
+        roster.provider.as_str()
+    } else if roster.backend == Backend::Agy {
+        "agy"
+    } else {
+        roster
+            .dispatch_id
+            .split_once('/')
+            .map_or(roster.dispatch_id.as_str(), |(provider, _)| provider)
+    };
+    match raw {
+        "openai-codex" => "codex".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn record_budget_decision(
+    report_path: &Path,
+    item: &PlannedItem,
+    roster: &RosterEntry,
+    decision: &BudgetDecision,
+) -> std::result::Result<(), DispatchCycleError> {
+    if !report_path.exists() {
+        return Ok(());
+    }
+    let level = match decision.action {
+        BudgetAction::Proceed | BudgetAction::StaticCaps => CalloutLevel::Info,
+        BudgetAction::SpendCautiously | BudgetAction::Defer => CalloutLevel::Warn,
+    };
+    deck::append_callout(
+        report_path,
+        level,
+        "BURSAR",
+        &format!(
+            "bursar budget decision: {}/{} → {} ({})\n- model: {}\n- {}",
+            item.repo,
+            item.issue_id,
+            decision.action.label(),
+            decision.provider,
+            roster.name,
+            decision.summary
+        ),
+    )
+    .map_err(|e| DispatchCycleError::message(format!("report budget decision: {e}")))
 }
 
 fn fallback_chain(
@@ -767,6 +886,7 @@ mod tests {
     use serde_json::json;
 
     use crate::bd::{BdClient, BdError, CommandBdClient, Comment, Issue};
+    use crate::bursar::{test_support::FakeBursarClient, ProviderState};
     use crate::config;
     use crate::deck::{Block, Report, ReportStatus};
     use crate::dispatch::{
@@ -795,6 +915,7 @@ mod tests {
         let commits = PanicCommits;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let bursar = FakeBursarClient::unavailable();
 
         let approved = run_dispatch_cycle(
             &cfg,
@@ -807,6 +928,7 @@ mod tests {
             "cycle-approved",
             &options,
             &live,
+            &bursar,
         )
         .expect("approved empty plan succeeds");
         assert_eq!(approved.gate, ApprovalGate::Approved);
@@ -823,6 +945,7 @@ mod tests {
             "cycle-changes",
             &options,
             &live,
+            &bursar,
         )
         .expect("changes-requested closes without running");
         assert_eq!(changes.gate, ApprovalGate::ChangesRequested);
@@ -843,6 +966,7 @@ mod tests {
             "cycle-absent",
             &options,
             &live,
+            &bursar,
         )
         .expect_err("missing approval refuses");
         assert!(absent.is_not_answered());
@@ -906,9 +1030,11 @@ dispatch_id = "fake-worker"
         let commits = GitCommitProbe;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let bursar = FakeBursarClient::unavailable();
 
         let result = run_dispatch_cycle(
             &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+            &bursar,
         )
         .expect("approved sandbox dispatch succeeds");
 
@@ -1031,9 +1157,11 @@ dispatch_id = "senior-reviewer"
         let commits = GitCommitProbe;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let bursar = FakeBursarClient::unavailable();
 
         let result = run_dispatch_cycle(
             &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+            &bursar,
         )
         .expect("approved sandbox dispatch with review succeeds");
 
@@ -1129,9 +1257,11 @@ dispatch_id = "fallback-worker"
         let commits = GitCommitProbe;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let bursar = FakeBursarClient::unavailable();
 
         let result = run_dispatch_cycle(
             &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+            &bursar,
         )
         .expect("approved fallback dispatch succeeds");
 
@@ -1171,6 +1301,162 @@ dispatch_id = "fallback-worker"
         assert!(is_retryable_worker_stderr("provider returned rate_limit"));
         assert!(is_retryable_worker_stderr("provider returned rate limit"));
         assert!(!is_retryable_worker_stderr("syntax error in worker prompt"));
+    }
+
+    #[test]
+    fn bursar_budget_healthy_provider_proceeds_and_reports_decision() {
+        let run = run_bursar_budget_case(
+            "healthy",
+            &FakeBursarClient::with_provider_status("opencode-go", ProviderState::Ok, Some(42.0)),
+        );
+
+        assert_eq!(run.result.dispatched, 1);
+        assert_eq!(run.result.verified, 1);
+        assert_eq!(run.exec.spawns().len(), 2, "worker + verify");
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("bursar budget decision"));
+        assert!(report.contains("opencode-go"));
+        assert!(report.contains("proceed"));
+    }
+
+    #[test]
+    fn bursar_budget_unknown_provider_spends_cautiously_and_reports_decision() {
+        let run = run_bursar_budget_case(
+            "unknown",
+            &FakeBursarClient::with_provider_status("opencode-go", ProviderState::Unknown, None),
+        );
+
+        assert_eq!(run.result.dispatched, 1);
+        assert_eq!(run.result.verified, 1);
+        assert_eq!(
+            run.exec.spawns().len(),
+            2,
+            "unknown still spends cautiously"
+        );
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("spend-cautiously"));
+        assert!(report.contains("opencode-go"));
+    }
+
+    #[test]
+    fn bursar_budget_near_exhausted_provider_defers_and_reports_decision() {
+        let run = run_bursar_budget_case(
+            "near-exhausted",
+            &FakeBursarClient::with_provider_status("opencode-go", ProviderState::Ok, Some(96.0)),
+        );
+
+        assert_eq!(run.result.dispatched, 0);
+        assert_eq!(run.result.verified, 0);
+        assert_eq!(run.result.failed, 1);
+        assert!(run.exec.spawns().is_empty(), "deferred before worker spawn");
+        assert_eq!(run.bd.release_count(), 1, "deferred bead is released");
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("defer"));
+        assert!(report.contains("96.0%"));
+    }
+
+    #[test]
+    fn bursar_budget_absent_binary_falls_back_to_static_caps_cleanly() {
+        let run = run_bursar_budget_case("absent", &FakeBursarClient::unavailable());
+
+        assert_eq!(run.result.dispatched, 1);
+        assert_eq!(run.result.verified, 1);
+        assert_eq!(
+            run.exec.spawns().len(),
+            2,
+            "worker + verify under static caps"
+        );
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("static-caps"));
+        assert!(report.contains("bursar unavailable"));
+    }
+
+    struct BursarBudgetRun {
+        _temp: TempDir,
+        reports: PathBuf,
+        cycle_id: String,
+        result: DispatchCycleResult,
+        bd: RecordingBdClient,
+        exec: SandboxExec,
+    }
+
+    fn run_bursar_budget_case(label: &str, bursar: &FakeBursarClient) -> BursarBudgetRun {
+        let temp = TempDir::new(&format!("bursar-budget-{label}"));
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/fake-worker"
+provider = "opencode-go"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = format!("cycle-20260707-bursar-{label}");
+        write_plan_with_proposal(
+            &state,
+            &cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+        );
+        write_report(&reports, &cycle_id);
+        write_response(&reports, &cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = SandboxExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+
+        let result = run_dispatch_cycle(
+            &cfg, &bd, &exec, &commits, &reports, &state, &ledger, &cycle_id, &options, &live,
+            bursar,
+        )
+        .expect("approved bursar budget dispatch runs");
+
+        BursarBudgetRun {
+            _temp: temp,
+            reports,
+            cycle_id,
+            result,
+            bd,
+            exec,
+        }
+    }
+
+    fn report_json_string(reports: &Path, cycle_id: &str) -> String {
+        std::fs::read_to_string(report_path(reports, cycle_id)).expect("report json")
     }
 
     fn fixture_config(root: &Path) -> &str {
@@ -1531,6 +1817,14 @@ dispatch_id = "fake-worker"
                 .borrow()
                 .iter()
                 .filter(|event| matches!(event, BdEvent::Close { .. }))
+                .count()
+        }
+
+        fn release_count(&self) -> usize {
+            self.events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, BdEvent::Release { .. }))
                 .count()
         }
     }

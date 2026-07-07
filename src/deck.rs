@@ -516,6 +516,39 @@ pub(crate) fn patch_status(report_path: &Path, status: ReportStatus) -> Result<(
     atomic_write_bytes(report_path, &output)
 }
 
+/// Appends a callout block to an existing manifest, preserving unmodeled JSON fields elsewhere.
+pub(crate) fn append_callout(
+    report_path: &Path,
+    level: CalloutLevel,
+    tag: &str,
+    markdown: &str,
+) -> Result<()> {
+    let bytes =
+        fs::read(report_path).map_err(|e| DeckError::io("failed to read", report_path, &e))?;
+    let mut manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| DeckError::json("failed to parse report", &e))?;
+    let Some(root) = manifest.as_object_mut() else {
+        return Err(DeckError::new("report manifest must be a JSON object"));
+    };
+    let blocks = root
+        .entry("blocks".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !blocks.is_array() {
+        *blocks = Value::Array(Vec::new());
+    }
+    let Some(blocks) = blocks.as_array_mut() else {
+        return Err(DeckError::new("internal: blocks was not an array"));
+    };
+    let block = serde_json::to_value(Block::callout(level, tag, markdown))
+        .map_err(|e| DeckError::json("failed to serialize callout", &e))?;
+    blocks.push(block);
+
+    let mut output = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| DeckError::json("failed to serialize patched report", &e))?;
+    output.push(b'\n');
+    atomic_write_bytes(report_path, &output)
+}
+
 /// Patches only the manifest's `live` object, preserving unmodeled JSON fields elsewhere.
 pub(crate) fn patch_live(report_path: &Path, live: &LiveUpdate) -> Result<()> {
     let bytes =

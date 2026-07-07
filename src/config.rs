@@ -274,6 +274,7 @@ pub(crate) struct Budgets {
     pub(crate) max_dispatches_per_cycle: u32,
     pub(crate) max_active_per_repo: u32,
     pub(crate) max_external_dispatches: u32,
+    pub(crate) use_bursar: bool,
     pub(crate) item_wall_clock_mins: u32,
     pub(crate) cycle_wall_clock_mins: u32,
 }
@@ -284,6 +285,7 @@ impl Default for Budgets {
             max_dispatches_per_cycle: 8,
             max_active_per_repo: 1,
             max_external_dispatches: 4,
+            use_bursar: true,
             item_wall_clock_mins: 45,
             cycle_wall_clock_mins: 90,
         }
@@ -872,6 +874,9 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
             }
             "max_external_dispatches" => {
                 b.max_external_dispatches = expect_u32("budgets.max_external_dispatches", val)?;
+            }
+            "use_bursar" => {
+                b.use_bursar = expect_bool("budgets.use_bursar", val)?;
             }
             "item_wall_clock_mins" => {
                 b.item_wall_clock_mins = expect_u32("budgets.item_wall_clock_mins", val)?;
@@ -1521,6 +1526,7 @@ mod tests {
         assert_eq!(cfg.budgets.max_dispatches_per_cycle, 8);
         assert_eq!(cfg.budgets.max_active_per_repo, 1);
         assert_eq!(cfg.budgets.max_external_dispatches, 4);
+        assert!(cfg.budgets.use_bursar);
         assert_eq!(cfg.budgets.item_wall_clock_mins, 45);
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 90);
         assert_eq!(cfg.verify.judge, "opencode-go/qwen3.7-max");
@@ -1552,6 +1558,7 @@ exclude = [\"chezmoi-config\", \"scratch\"]
 max_dispatches_per_cycle = 3
 max_active_per_repo = 2
 max_external_dispatches = 1
+use_bursar = false
 item_wall_clock_mins = 20
 cycle_wall_clock_mins = 60
 
@@ -1598,6 +1605,7 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.budgets.max_dispatches_per_cycle, 3);
         assert_eq!(cfg.budgets.max_active_per_repo, 2);
         assert_eq!(cfg.budgets.max_external_dispatches, 1);
+        assert!(!cfg.budgets.use_bursar);
         assert_eq!(cfg.budgets.item_wall_clock_mins, 20);
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 60);
         assert_eq!(cfg.verify.judge, "opencode-go/kimi-k2.7-code");
@@ -1627,6 +1635,7 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.budgets.max_dispatches_per_cycle, 8);
         assert_eq!(cfg.budgets.max_active_per_repo, 1);
         assert_eq!(cfg.budgets.max_external_dispatches, 4);
+        assert!(cfg.budgets.use_bursar);
         assert_eq!(cfg.budgets.item_wall_clock_mins, 45);
         assert_eq!(cfg.budgets.cycle_wall_clock_mins, 90);
         assert_eq!(cfg.verify.judge, "opencode-go/qwen3.7-max");
