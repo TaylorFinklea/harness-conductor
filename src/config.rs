@@ -315,6 +315,37 @@ impl Default for ReviewConfig {
     }
 }
 
+/// Auto-dispatch ceiling for the ratchet mechanism (conductor-v1-spec §
+/// Ratchet + ADR 2026-07-03 on `conductor-m6`).
+///
+/// The MECHANISM auto-dispatches when `tier_floor ∈ {senior, junior}` AND
+/// `complexity ≤ M` AND a runnable `verify_cmd` exists AND the repo has
+/// earned unlock (3 consecutive clean cycles). The CONFIG can be narrower
+/// than the mechanism's hard ceiling; the month-1 default here is junior /
+/// S. Widening toward the spec ceiling is a HUMAN config change backed by
+/// ratchet evidence (per the ADR — see `.docs/ai/decisions.md`).
+///
+/// `clean_cycles_to_unlock` defaults to 3 (spec-pinned); exposed as a
+/// config knob so tests can vary it without touching code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RatchetCeiling {
+    pub(crate) max_tier_floor: Tier,
+    pub(crate) max_complexity: Ceiling,
+    pub(crate) clean_cycles_to_unlock: u32,
+}
+
+impl Default for RatchetCeiling {
+    fn default() -> Self {
+        Self {
+            // Month-1 default (ADR 2026-07-03): junior + S, narrower than
+            // the spec ceiling. Widening is a human config change.
+            max_tier_floor: Tier::Junior,
+            max_complexity: Ceiling::S,
+            clean_cycles_to_unlock: 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ArenaProfile {
     pub(crate) name: String,
@@ -360,6 +391,9 @@ pub(crate) struct Config {
     pub(crate) budgets: Budgets,
     pub(crate) verify: VerifyConfig,
     pub(crate) review: ReviewConfig,
+    /// Auto-dispatch ceiling for the ratchet (conductor-m6). Defaults to
+    /// the month-1 narrow posture (junior / S) — see `RatchetCeiling`.
+    pub(crate) ratchet: RatchetCeiling,
     pub(crate) arena: ArenaConfig,
     pub(crate) roster: Vec<RosterEntry>,
     /// Per-repo `[[repo_policy]]` entries; absent repos default to
@@ -796,6 +830,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "budgets"
                 | "verify"
                 | "review"
+                | "ratchet"
                 | "arena"
                 | "arena_profile"
                 | "arena_judge"
@@ -814,6 +849,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
     let budgets = parse_budgets(doc.get("budgets"))?;
     let verify = parse_verify(doc.get("verify"))?;
     let review = parse_review(doc.get("review"))?;
+    let ratchet = parse_ratchet(doc.get("ratchet"))?;
     let arena = parse_arena(
         doc.get("arena"),
         doc.get("arena_profile"),
@@ -827,6 +863,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         budgets,
         verify,
         review,
+        ratchet,
         arena,
         roster,
         repo_policies,
@@ -912,6 +949,34 @@ fn parse_review(node: Option<&Node>) -> Result<ReviewConfig> {
             "enabled" => r.enabled = expect_bool("review.enabled", val)?,
             "min_tier_gap" => r.min_tier_gap = expect_u32("review.min_tier_gap", val)?,
             other => return Err(ConfigError::new(format!("unknown review key: {other}"))),
+        }
+    }
+    Ok(r)
+}
+
+fn parse_ratchet(node: Option<&Node>) -> Result<RatchetCeiling> {
+    let t = match node {
+        None => return Ok(RatchetCeiling::default()),
+        Some(Node::Table(t)) => t,
+        Some(_) => return Err(ConfigError::new("ratchet must be a table")),
+    };
+    let mut r = RatchetCeiling::default();
+    for (key, val) in t {
+        match key.as_str() {
+            "max_tier_floor" => {
+                r.max_tier_floor = expect_str("ratchet.max_tier_floor", val)?
+                    .parse::<Tier>()
+                    .map_err(|e| ConfigError::new(format!("ratchet.max_tier_floor: {e}")))?;
+            }
+            "max_complexity" => {
+                r.max_complexity = expect_str("ratchet.max_complexity", val)?
+                    .parse::<Ceiling>()
+                    .map_err(|e| ConfigError::new(format!("ratchet.max_complexity: {e}")))?;
+            }
+            "clean_cycles_to_unlock" => {
+                r.clean_cycles_to_unlock = expect_u32("ratchet.clean_cycles_to_unlock", val)?;
+            }
+            other => return Err(ConfigError::new(format!("unknown ratchet key: {other}"))),
         }
     }
     Ok(r)
@@ -1053,8 +1118,15 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
         for key in t.keys() {
             if !matches!(
                 key.as_str(),
-                "name" | "tier" | "ceiling" | "efficiency" | "backend" | "dispatch_id"
-                    | "provider" | "cost" | "fallback"
+                "name"
+                    | "tier"
+                    | "ceiling"
+                    | "efficiency"
+                    | "backend"
+                    | "dispatch_id"
+                    | "provider"
+                    | "cost"
+                    | "fallback"
             ) {
                 return Err(ConfigError::new(format!(
                     "unknown roster key in entry {i}: {key}"
@@ -1129,8 +1201,8 @@ fn parse_repo_policies(node: Option<&Node>, roster: &[RosterEntry]) -> Result<Ve
             }
         }
         let repo = get_required_str_at("repo_policy", t, i, "repo")?;
-        let cost_policy = get_required_str_at("repo_policy", t, i, "cost_policy")?
-            .parse::<CostPolicy>()?;
+        let cost_policy =
+            get_required_str_at("repo_policy", t, i, "cost_policy")?.parse::<CostPolicy>()?;
         if !seen.insert(repo.clone()) {
             return Err(ConfigError::new(format!(
                 "duplicate repo_policy repo: {repo}"
@@ -1530,6 +1602,11 @@ mod tests {
         assert!(!cfg.verify.always_orchestra);
         assert!(cfg.review.enabled);
         assert_eq!(cfg.review.min_tier_gap, 1);
+        // ratchet: month-1 default-narrow posture (ADR 2026-07-03) since
+        // the checked-in conductor.toml does not set [ratchet].
+        assert_eq!(cfg.ratchet.max_tier_floor, Tier::Junior);
+        assert_eq!(cfg.ratchet.max_complexity, Ceiling::S);
+        assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
         assert_eq!(cfg.arena.parallel, 2);
         assert!(cfg.arena.auto_apply);
         assert_eq!(cfg.arena.min_score_x10, 40);
@@ -1566,6 +1643,13 @@ always_orchestra = true
 [review]
 enabled = false
 min_tier_gap = 2
+
+[ratchet]
+# Widened posture (spec ceiling) — the human config change that unlocks
+# senior/M auto-dispatch for repos that have earned unlock.
+max_tier_floor = \"senior\"
+max_complexity = \"M\"
+clean_cycles_to_unlock = 3
 
 [arena]
 parallel = 2
@@ -1609,6 +1693,9 @@ dispatch_id = \"claude-sonnet-5\"
         assert!(cfg.verify.always_orchestra);
         assert!(!cfg.review.enabled);
         assert_eq!(cfg.review.min_tier_gap, 2);
+        assert_eq!(cfg.ratchet.max_tier_floor, Tier::Senior);
+        assert_eq!(cfg.ratchet.max_complexity, Ceiling::M);
+        assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
         assert_eq!(cfg.arena.parallel, 2);
         assert!(!cfg.arena.auto_apply);
         assert_eq!(cfg.arena.min_score_x10, 45);
@@ -1639,6 +1726,10 @@ dispatch_id = \"claude-sonnet-5\"
         assert!(!cfg.verify.always_orchestra);
         assert!(cfg.review.enabled);
         assert_eq!(cfg.review.min_tier_gap, 1);
+        // ratchet default-narrow posture (ADR 2026-07-03).
+        assert_eq!(cfg.ratchet.max_tier_floor, Tier::Junior);
+        assert_eq!(cfg.ratchet.max_complexity, Ceiling::S);
+        assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
         assert_eq!(cfg.arena.parallel, 2);
         assert!(cfg.arena.auto_apply);
         assert_eq!(cfg.arena.min_score_x10, 40);
@@ -1739,6 +1830,26 @@ dispatch_id = \"claude-sonnet-5\"
             ("unknown verify key", "[verify]\nfoo = \"x\"\n".to_string()),
             ("unknown review key", "[review]\nfoo = 1\n".to_string()),
             (
+                "unknown ratchet key",
+                "[ratchet]\nfoo = 1\n".to_string(),
+            ),
+            (
+                "unknown ratchet tier",
+                "[ratchet]\nmax_tier_floor = \"boss\"\n".to_string(),
+            ),
+            (
+                "unknown ratchet complexity",
+                "[ratchet]\nmax_complexity = \"XX\"\n".to_string(),
+            ),
+            (
+                "wrong type ratchet clean_cycles",
+                "[ratchet]\nclean_cycles_to_unlock = \"three\"\n".to_string(),
+            ),
+            (
+                "wrong type ratchet",
+                "[ratchet]\nmax_tier_floor = 1\n".to_string(),
+            ),
+            (
                 "unknown roster key",
                 format!("{}extra = \"x\"\n", full_entry()),
             ),
@@ -1797,6 +1908,39 @@ dispatch_id = \"claude-sonnet-5\"
     #[test]
     fn chezmoi_config_is_hardcoded_excluded() {
         assert!(HARDCODED_EXCLUDE.contains(&"chezmoi-config"));
+    }
+
+    // --- ratchet ceiling (conductor-m6) ---
+
+    #[test]
+    fn ratchet_default_is_narrow_month1_posture() {
+        // When [ratchet] is absent, the config defaults to the month-1
+        // narrow posture: junior / S, 3 clean cycles to unlock (per
+        // ADR 2026-07-03). The mechanism is shipped at the spec ceiling,
+        // but the config default is intentionally narrower.
+        let cfg = parse_str("autonomy = \"ratchet\"\n").expect("minimal");
+        assert_eq!(cfg.ratchet.max_tier_floor, Tier::Junior);
+        assert_eq!(cfg.ratchet.max_complexity, Ceiling::S);
+        assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
+    }
+
+    #[test]
+    fn ratchet_config_can_be_widened_to_spec_ceiling() {
+        // The widening to the spec ceiling ({senior, junior}, <= M) is a
+        // HUMAN config change (ADR 2026-07-03). Verify the parser accepts
+        // the widened posture.
+        let src = "\
+autonomy = \"ratchet\"
+
+[ratchet]
+max_tier_floor = \"senior\"
+max_complexity = \"M\"
+clean_cycles_to_unlock = 3
+";
+        let cfg = parse_str(src).expect("widened ratchet");
+        assert_eq!(cfg.ratchet.max_tier_floor, Tier::Senior);
+        assert_eq!(cfg.ratchet.max_complexity, Ceiling::M);
+        assert_eq!(cfg.ratchet.clean_cycles_to_unlock, 3);
     }
 
     // --- preflight ---
