@@ -8,7 +8,6 @@ This scorecard has a different ceiling for sonnet-5 than conductor.toml.
 |---|---|---|---|---|---|
 | **sonnet-5** | claude-sonnet-5 | **Lead** | XL | high | Ceiling mismatch: config says L |
 | **opus-4.8** | claude-opus-4-8 | **Lead** | XL | high | Test fixture |
-| **gpt-5.5** | openai-codex/gpt-5.5 | **Senior** | L | high | Test fixture |
 | **minimax-m3** | opencode-go/minimax-m3 | **Senior** | M | high | Test fixture |
 | **qwen3.7-max** | opencode-go/qwen3.7-max | **Senior** | M | high | Test fixture |
 | **glm-5.2** | opencode-go/glm-5.2 | **Senior** | M | good | Test fixture |

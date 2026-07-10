@@ -2007,9 +2007,9 @@ mod tests {
     #[test]
     fn ralph_spawn_uses_harness_specific_model_env() {
         let profile = ArenaProfile {
-            name: "codex-gpt55".to_string(),
+            name: "codex-gpt56-terra".to_string(),
             harness: ArenaHarness::Codex,
-            model: "gpt-5.5".to_string(),
+            model: "gpt-5.6-terra".to_string(),
             provider_group: "openai-codex".to_string(),
             reasoning_effort: Some(ReasoningEffort::Xhigh),
         };
@@ -2021,7 +2021,10 @@ mod tests {
         assert_eq!(
             spawn.env,
             vec![
-                ("RALPH_CODEX_MODEL".to_string(), "gpt-5.5".to_string()),
+                (
+                    "RALPH_CODEX_MODEL".to_string(),
+                    "gpt-5.6-terra".to_string(),
+                ),
                 (
                     "RALPH_CODEX_REASONING_EFFORT".to_string(),
                     "xhigh".to_string(),
@@ -2182,7 +2185,7 @@ mod tests {
             ["cand-a", "cand-b"],
         )];
         let failures = vec![JudgeFailure::new(
-            "gpt55",
+            "terra",
             "exit 1: rate limit or quota exceeded",
         )];
 
@@ -2191,9 +2194,9 @@ mod tests {
 
         assert_eq!(decision.winner_profile.as_deref(), Some("cand-a"));
         assert!(decision.auto_apply);
-        assert_eq!(judge_label(&judgements, &failures), "nw-glm52;failed:gpt55");
+        assert_eq!(judge_label(&judgements, &failures), "nw-glm52;failed:terra");
         assert!(decision.reasons.iter().any(|reason| {
-            reason == "judge gpt55 skipped: exit 1: rate limit or quota exceeded"
+            reason == "judge terra skipped: exit 1: rate limit or quota exceeded"
         }));
     }
 
@@ -2216,7 +2219,7 @@ mod tests {
             .map(|candidate| candidate.summary.clone())
             .collect::<Vec<_>>();
         let failures = vec![JudgeFailure::new(
-            "gpt55",
+            "terra",
             "exit 1: rate limit or quota exceeded",
         )];
         let mut decision = decide_winner(&summaries, &[], 40);
@@ -2244,7 +2247,7 @@ mod tests {
                 .iter()
                 .any(|block| {
                     block["title"] == "Judge Failures"
-                        && block["rows"][0][0] == "gpt55"
+                        && block["rows"][0][0] == "terra"
                         && block["rows"][0][1] == "exit 1: rate limit or quota exceeded"
                 })
         );
@@ -2253,7 +2256,7 @@ mod tests {
     #[test]
     fn strict_gate_selects_only_unique_safe_threshold_winner() {
         let candidates = vec![
-            CandidateSummary::eligible("cand-a", "codex", "gpt-5.5"),
+            CandidateSummary::eligible("cand-a", "codex", "gpt-5.6-terra"),
             CandidateSummary::eligible("cand-b", "pi", "opencode-go/qwen3.7-max"),
         ];
         let judgements = vec![
@@ -2279,7 +2282,7 @@ mod tests {
     #[test]
     fn strict_gate_rejects_unsafe_or_tied_candidates() {
         let candidates = vec![
-            CandidateSummary::eligible("cand-a", "codex", "gpt-5.5"),
+            CandidateSummary::eligible("cand-a", "codex", "gpt-5.6-terra"),
             CandidateSummary::eligible("cand-b", "pi", "opencode-go/qwen3.7-max"),
         ];
         let unsafe_judgements = vec![JudgeVerdict {

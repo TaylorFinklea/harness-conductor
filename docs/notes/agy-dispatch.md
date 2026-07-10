@@ -128,7 +128,7 @@ efficiency = "lean"
 the roster has no `junior` tier at all, so per the tiered-routing rules
 junior items either:
 
-- escalate to `senior` (closest match — `gpt-5.5`, `minimax-m3`,
+- escalate to `senior` (closest match — `gpt-5.6-luna`, `minimax-m3`,
   `qwen3.7-max`, `glm-5.2`), or
 - flag as `tier_floor: lead` and queue for human triage.
 

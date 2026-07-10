@@ -8,7 +8,6 @@ This scorecard matches conductor.toml exactly.
 |---|---|---|---|---|---|
 | **sonnet-5** | claude-sonnet-5 | **Lead** | L | high | Test fixture |
 | **opus-4.8** | claude-opus-4-8 | **Lead** | XL | high | Test fixture |
-| **gpt-5.5** | openai-codex/gpt-5.5 | **Senior** | L | high | Test fixture |
 | **gpt-5.6-sol** | gpt-5.6-sol | **Lead** | XL | high | Test fixture |
 | **gpt-5.6-terra** | gpt-5.6-terra | **Lead** | XL | high | Test fixture |
 | **gpt-5.6-luna-junior** | gpt-5.6-luna | **Junior** | S | high | Test fixture |

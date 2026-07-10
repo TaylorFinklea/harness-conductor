@@ -45,25 +45,6 @@ min_score_x10 = 40
 keep_worktrees = false
 
 [[arena_profile]]
-name = "codex-gpt55"
-harness = "codex"
-model = "gpt-5.5"
-provider_group = "openai-codex"
-reasoning_effort = "xhigh"
-
-[[arena_profile]]
-name = "pi-gpt55"
-harness = "pi"
-model = "openai-codex/gpt-5.5"
-provider_group = "openai-codex"
-
-[[arena_profile]]
-name = "opencode-gpt55"
-harness = "opencode"
-model = "openai-codex/gpt-5.5"
-provider_group = "openai-codex"
-
-[[arena_profile]]
 name = "pi-glm52"
 harness = "pi"
 model = "opencode-go/glm-5.2"
@@ -235,11 +216,6 @@ backend = "pi"
 dispatch_id = "opencode-go/qwen3.7-max"
 
 [[arena_judge]]
-name = "gpt55"
-backend = "pi"
-dispatch_id = "openai-codex/gpt-5.5"
-
-[[arena_judge]]
 name = "nw-glm52"
 backend = "pi"
 dispatch_id = "neuralwatt/glm-5.2"
@@ -266,16 +242,6 @@ efficiency = "heavy"
 backend = "claude"
 dispatch_id = "claude-opus-4-8"
 provider = "anthropic"
-cost = "paid"
-
-[[roster]]
-name = "gpt-5.5"
-tier = "senior"
-ceiling = "L"
-efficiency = "std"
-backend = "pi"
-dispatch_id = "openai-codex/gpt-5.5"
-provider = "openai-codex"
 cost = "paid"
 
 [[roster]]
