@@ -539,6 +539,7 @@ where
             bead_id: item.issue_id.clone(),
             backend: roster.backend,
             dispatch_id: roster.dispatch_id.clone(),
+            reasoning_effort: roster.reasoning_effort,
             prompt: prompt.to_string(),
         };
         let result = dispatch::run_with_heartbeat(
@@ -626,7 +627,7 @@ where
 }
 
 fn is_metered_worker_backend(backend: Backend) -> bool {
-    matches!(backend, Backend::Pi | Backend::Agy)
+    matches!(backend, Backend::Pi | Backend::Agy | Backend::Codex)
 }
 
 fn bursar_provider_for(roster: &RosterEntry) -> String {
@@ -896,6 +897,9 @@ fn append_ledger(
         model: roster.name.clone(),
         harness: None,
         profile: None,
+        reasoning_effort: roster
+            .reasoning_effort
+            .map(|effort| effort.as_str().to_string()),
         role: role.to_string(),
         task: issue.id.clone(),
         score_1_5: None,
@@ -2371,5 +2375,26 @@ dispatch_id = "fake-worker"
         fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
             Ok(self.wait_result)
         }
+    }
+
+    #[test]
+    fn codex_workers_are_metered_and_use_the_codex_bursar_provider() {
+        let cfg = config::parse_str(
+            "\
+[[roster]]
+name = \"gpt-5.6-sol\"
+tier = \"lead\"
+ceiling = \"XL\"
+efficiency = \"heavy\"
+backend = \"codex\"
+dispatch_id = \"gpt-5.6-sol\"
+reasoning_effort = \"max\"
+provider = \"openai-codex\"
+",
+        )
+        .expect("Codex roster parses");
+
+        assert!(is_metered_worker_backend(Backend::Codex));
+        assert_eq!(bursar_provider_for(&cfg.roster[0]), "codex");
     }
 }

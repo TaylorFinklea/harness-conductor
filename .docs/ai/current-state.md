@@ -1,7 +1,7 @@
 # current-state.md — harness-conductor
 
 Branch: main
-`cargo test` green (172 unit + 1 worker prompt). Arena harness scorecard plan complete. No active plan.
+`cargo test` green (236 unit + 1 worker prompt). GPT-5.6 Codex roster rollout complete locally. No active plan.
 
 ## Plan
 

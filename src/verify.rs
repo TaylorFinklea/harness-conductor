@@ -360,9 +360,11 @@ fn review_spawn(
         crate::dispatch::argv_for_backend(
             reviewer.backend,
             &reviewer.dispatch_id,
+            reviewer.reasoning_effort,
             prompt,
             &request.repo,
-        ),
+        )
+        .map_err(|error| VerifyError::new(error.to_string()))?,
     )
 }
 
@@ -1382,6 +1384,7 @@ mod tests {
             efficiency,
             backend,
             dispatch_id: dispatch_id.to_string(),
+            reasoning_effort: None,
             provider: String::new(),
             cost: Cost::Paid,
             fallback: Vec::new(),

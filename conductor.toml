@@ -20,7 +20,7 @@ exclude = []
 # Ceilings, not targets (invariant 7). Hitting any budget stops the cycle.
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
-# Combined cap for metered external backends (pi + agy).
+# Combined cap for metered external backends (pi + agy + codex).
 max_external_dispatches = 4
 item_wall_clock_mins = 45
 cycle_wall_clock_mins = 90
@@ -49,6 +49,7 @@ name = "codex-gpt55"
 harness = "codex"
 model = "gpt-5.5"
 provider_group = "openai-codex"
+reasoning_effort = "xhigh"
 
 [[arena_profile]]
 name = "pi-gpt55"
@@ -197,6 +198,36 @@ name = "opencode-ollama-minimax-m3"
 harness = "opencode"
 model = "ollama-cloud/minimax-m3"
 provider_group = "ollama-cloud"
+
+# GPT-5.6 Codex profiles carry their effort explicitly so Arena results do
+# not depend on the machine's global Codex setting.
+[[arena_profile]]
+name = "codex-gpt56-sol"
+harness = "codex"
+model = "gpt-5.6-sol"
+provider_group = "openai-codex"
+reasoning_effort = "max"
+
+[[arena_profile]]
+name = "codex-gpt56-terra"
+harness = "codex"
+model = "gpt-5.6-terra"
+provider_group = "openai-codex"
+reasoning_effort = "xhigh"
+
+[[arena_profile]]
+name = "codex-gpt56-luna-junior"
+harness = "codex"
+model = "gpt-5.6-luna"
+provider_group = "openai-codex"
+reasoning_effort = "medium"
+
+[[arena_profile]]
+name = "codex-gpt56-luna-senior"
+harness = "codex"
+model = "gpt-5.6-luna"
+provider_group = "openai-codex"
+reasoning_effort = "high"
 
 [[arena_judge]]
 name = "qwen37max"
@@ -433,4 +464,50 @@ efficiency = "lean"
 backend = "pi"
 dispatch_id = "neuralwatt/kimi-k2.6-fast"
 provider = "neuralwatt"
+cost = "paid"
+
+# GPT-5.6 Codex lane. Luna has separate stable row names by canonical effort
+# so scorecard drift can distinguish its Junior and Senior capability bands.
+[[roster]]
+name = "gpt-5.6-sol"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "codex"
+dispatch_id = "gpt-5.6-sol"
+reasoning_effort = "max"
+provider = "openai-codex"
+cost = "paid"
+
+[[roster]]
+name = "gpt-5.6-terra"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "codex"
+dispatch_id = "gpt-5.6-terra"
+reasoning_effort = "xhigh"
+provider = "openai-codex"
+cost = "paid"
+
+[[roster]]
+name = "gpt-5.6-luna-junior"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "codex"
+dispatch_id = "gpt-5.6-luna"
+reasoning_effort = "medium"
+provider = "openai-codex"
+cost = "paid"
+
+[[roster]]
+name = "gpt-5.6-luna-senior"
+tier = "senior"
+ceiling = "L"
+efficiency = "std"
+backend = "codex"
+dispatch_id = "gpt-5.6-luna"
+reasoning_effort = "high"
+provider = "openai-codex"
 cost = "paid"

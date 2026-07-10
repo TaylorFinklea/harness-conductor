@@ -1,4 +1,4 @@
-//! backend runners (pi/agy/claude) behind a trait (Exec) + timeout/kill
+//! backend runners (pi/agy/claude/codex) behind a trait (Exec) + timeout/kill
 
 // Built ahead of the M4 integration path; unit tests exercise this module directly.
 #![allow(dead_code)]
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::Backend;
+use crate::config::{Backend, ReasoningEffort};
 
 const PI_THINKING: &str = "xhigh";
 const KILL_GRACE: Duration = Duration::from_secs(3);
@@ -45,6 +45,7 @@ pub(crate) struct DispatchRequest {
     pub(crate) bead_id: String,
     pub(crate) backend: Backend,
     pub(crate) dispatch_id: String,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) prompt: String,
 }
 
@@ -216,9 +217,10 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
         argv: argv_for_backend(
             request.backend,
             &request.dispatch_id,
+            request.reasoning_effort,
             &request.prompt,
             &request.repo,
-        ),
+        )?,
         cwd: request.repo.clone(),
         stdin: StdinMode::Null,
         stdout_path,
@@ -229,10 +231,11 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
 pub(crate) fn argv_for_backend(
     backend: Backend,
     dispatch_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
     prompt: &str,
     repo: &Path,
-) -> Vec<String> {
-    match backend {
+) -> Result<Vec<String>> {
+    Ok(match backend {
         Backend::Pi => strings([
             "pi",
             "--model",
@@ -243,6 +246,20 @@ pub(crate) fn argv_for_backend(
             "-p",
             prompt,
         ]),
+        Backend::Codex => {
+            let effort = reasoning_effort.ok_or_else(|| {
+                DispatchError::new("Codex dispatch requires an explicit reasoning_effort")
+            })?;
+            vec![
+                "codex".to_string(),
+                "exec".to_string(),
+                "--model".to_string(),
+                dispatch_id.to_string(),
+                "--config".to_string(),
+                format!("model_reasoning_effort=\"{}\"", effort.as_str()),
+                prompt.to_string(),
+            ]
+        }
         Backend::Agy => vec![
             "agy".to_string(),
             "-p".to_string(),
@@ -254,7 +271,7 @@ pub(crate) fn argv_for_backend(
             "--dangerously-skip-permissions".to_string(),
         ],
         Backend::Claude => strings(["claude", "-p", prompt, "--model", dispatch_id]),
-    }
+    })
 }
 
 fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
@@ -545,6 +562,39 @@ mod tests {
     }
 
     #[test]
+    fn codex_backend_uses_per_run_reasoning_override() {
+        let temp = TempDir::new("codex-argv");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let exec = FakeExec::success("worker stdout\n", "");
+        let commits = FakeCommits::new([Some("before"), Some("after")]);
+        let mut request = request(&repo, Backend::Codex, "gpt-5.6-sol");
+        request.reasoning_effort = Some(ReasoningEffort::Max);
+
+        run(
+            &exec,
+            &commits,
+            &request,
+            temp.path(),
+            Duration::from_secs(45),
+        )
+        .expect("dispatch succeeds");
+
+        assert_eq!(
+            exec.spawned().argv,
+            vec![
+                "codex",
+                "exec",
+                "--model",
+                "gpt-5.6-sol",
+                "--config",
+                "model_reasoning_effort=\"max\"",
+                PROMPT,
+            ]
+        );
+    }
+
+    #[test]
     fn agy_backend_uses_pinned_argv_with_load_bearing_add_dir() {
         let temp = TempDir::new("agy-argv");
         let repo = temp.path().join("repo");
@@ -732,6 +782,7 @@ mod tests {
             bead_id: "bead-1".to_string(),
             backend,
             dispatch_id: dispatch_id.to_string(),
+            reasoning_effort: None,
             prompt: PROMPT.to_string(),
         }
     }

@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde::Deserialize;
 
 use crate::bd::{BdClient, Issue};
-use crate::config::{self, Ceiling, Config, Tier};
+use crate::config::{self, Ceiling, Config, ReasoningEffort, Tier};
 use crate::deck::{self, Bar, Block, CalloutLevel, Metric, Report, ReportStatus};
 use crate::dispatch;
 use crate::fields::{self, Triage};
@@ -61,6 +61,14 @@ impl ArenaHarness {
             ArenaHarness::Pi => "RALPH_PI_MODEL",
         }
     }
+
+    #[must_use]
+    pub(crate) const fn reasoning_env(self) -> Option<&'static str> {
+        match self {
+            Self::Codex => Some("RALPH_CODEX_REASONING_EFFORT"),
+            Self::Claude | Self::Opencode | Self::Pi => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +77,7 @@ pub(crate) struct ArenaProfile {
     pub(crate) harness: ArenaHarness,
     pub(crate) model: String,
     pub(crate) provider_group: String,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +89,13 @@ pub(crate) struct RalphSpawn {
 
 #[must_use]
 pub(crate) fn ralph_spawn_request(profile: &ArenaProfile, repo: &Path) -> RalphSpawn {
+    let mut env = vec![(
+        profile.harness.model_env().to_string(),
+        profile.model.clone(),
+    )];
+    if let (Some(key), Some(effort)) = (profile.harness.reasoning_env(), profile.reasoning_effort) {
+        env.push((key.to_string(), effort.as_str().to_string()));
+    }
     RalphSpawn {
         argv: vec![
             "ralph".to_string(),
@@ -89,10 +105,7 @@ pub(crate) fn ralph_spawn_request(profile: &ArenaProfile, repo: &Path) -> RalphS
             profile.harness.as_str().to_string(),
         ],
         cwd: repo.to_path_buf(),
-        env: vec![(
-            profile.harness.model_env().to_string(),
-            profile.model.clone(),
-        )],
+        env,
     }
 }
 
@@ -101,6 +114,7 @@ pub(crate) struct CandidateSummary {
     pub(crate) profile: String,
     pub(crate) harness: String,
     pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) eligible: bool,
     pub(crate) reason: String,
 }
@@ -112,6 +126,7 @@ impl CandidateSummary {
             profile: profile.to_string(),
             harness: harness.to_string(),
             model: model.to_string(),
+            reasoning_effort: None,
             eligible: true,
             reason: String::new(),
         }
@@ -659,6 +674,7 @@ fn arena_profile_from_config(profile: &config::ArenaProfile) -> Result<ArenaProf
         harness: ArenaHarness::try_from(profile.harness.as_str())?,
         model: profile.model.clone(),
         provider_group: profile.provider_group.clone(),
+        reasoning_effort: profile.reasoning_effort,
     })
 }
 
@@ -848,6 +864,7 @@ fn run_one_candidate(ctx: &RunContext, profile: &ArenaProfile) -> Result<Candida
 
     let mut summary =
         CandidateSummary::eligible(&profile.name, profile.harness.as_str(), &profile.model);
+    summary.reasoning_effort = profile.reasoning_effort;
     if !ralph_run.success {
         summary.eligible = false;
         let reason = match fs::read_to_string(&stderr) {
@@ -1109,7 +1126,14 @@ fn judge_command_spec(
     // root (outside the real repo), passed as the repo arg so agy's `--add-dir`
     // also points away from ctx.repo. (bead conductor-2ti)
     let cwd = judge_cwd(ctx);
-    let command_line = dispatch::argv_for_backend(judge.backend, &judge.dispatch_id, prompt, &cwd);
+    let command_line = dispatch::argv_for_backend(
+        judge.backend,
+        &judge.dispatch_id,
+        judge.reasoning_effort,
+        prompt,
+        &cwd,
+    )
+    .map_err(|error| ArenaError::new(error.to_string()))?;
     let Some((program, command_args)) = command_line.split_first() else {
         return Err(ArenaError::new("judge argv was empty"));
     };
@@ -1375,6 +1399,10 @@ fn append_ledger_rows(
                 model: candidate.summary.model.clone(),
                 harness: Some(candidate.summary.harness.clone()),
                 profile: Some(candidate.summary.profile.clone()),
+                reasoning_effort: candidate
+                    .summary
+                    .reasoning_effort
+                    .map(|effort| effort.as_str().to_string()),
                 role: "arena-candidate".to_string(),
                 task: ctx.bead.clone(),
                 score_1_5: avg.map(|score| f64::from(score) / 10.0),
@@ -1983,6 +2011,7 @@ mod tests {
             harness: ArenaHarness::Codex,
             model: "gpt-5.5".to_string(),
             provider_group: "openai-codex".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Xhigh),
         };
 
         let spawn = ralph_spawn_request(&profile, std::path::Path::new("/repo"));
@@ -1991,8 +2020,58 @@ mod tests {
         assert_eq!(spawn.cwd, std::path::PathBuf::from("/repo"));
         assert_eq!(
             spawn.env,
-            vec![("RALPH_CODEX_MODEL".to_string(), "gpt-5.5".to_string())]
+            vec![
+                ("RALPH_CODEX_MODEL".to_string(), "gpt-5.5".to_string()),
+                (
+                    "RALPH_CODEX_REASONING_EFFORT".to_string(),
+                    "xhigh".to_string(),
+                ),
+            ]
         );
+    }
+
+    #[test]
+    fn arena_ledger_rows_include_profile_reasoning_effort() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let ledger_path =
+            std::env::temp_dir().join(format!("arena-ledger-reasoning-{nanos}.jsonl"));
+        let mut summary = CandidateSummary::eligible("luna-junior", "codex", "gpt-5.6-luna");
+        summary.reasoning_effort = Some(ReasoningEffort::Medium);
+        let candidate = CandidateRun {
+            summary,
+            worktree: std::path::PathBuf::from("/tmp/luna-junior"),
+            commit: Some("abc123".to_string()),
+            patch: String::new(),
+            duration_ms: None,
+            ralph_duration_ms: None,
+            verify_duration_ms: None,
+            tokens_used: None,
+        };
+        let decision = ArenaDecision {
+            winner_profile: Some("luna-junior".to_string()),
+            auto_apply: false,
+            reasons: Vec::new(),
+        };
+
+        append_ledger_rows(
+            &ledger_path,
+            std::path::Path::new("/repo"),
+            &fixture_run_context(),
+            &[candidate],
+            &[],
+            &[],
+            &decision,
+            false,
+        )
+        .expect("ledger row writes");
+
+        let content = std::fs::read_to_string(&ledger_path).expect("read ledger");
+        let row: serde_json::Value = serde_json::from_str(content.trim()).expect("ledger JSON");
+        assert_eq!(row["reasoning_effort"], "medium");
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
@@ -2350,15 +2429,17 @@ mod tests {
     fn judge_command_spec_uses_throwaway_cwd_for_every_backend() {
         let ctx = fixture_run_context();
         let throwaway = ctx.work_root.join("judge-cwd");
-        for backend in [
-            crate::config::Backend::Pi,
-            crate::config::Backend::Claude,
-            crate::config::Backend::Agy,
+        for (backend, reasoning_effort) in [
+            (crate::config::Backend::Pi, None),
+            (crate::config::Backend::Claude, None),
+            (crate::config::Backend::Agy, None),
+            (crate::config::Backend::Codex, Some(ReasoningEffort::Max)),
         ] {
             let judge = crate::config::ArenaJudge {
                 name: "j".to_string(),
                 backend,
                 dispatch_id: "id".to_string(),
+                reasoning_effort,
             };
             let spec = judge_command_spec(
                 &ctx,
@@ -2386,6 +2467,7 @@ mod tests {
             name: "agy-judge".to_string(),
             backend: crate::config::Backend::Agy,
             dispatch_id: "Gemini 3.5 Flash (High)".to_string(),
+            reasoning_effort: None,
         };
         let spec = judge_command_spec(
             &ctx,
@@ -2418,6 +2500,38 @@ mod tests {
                 .iter()
                 .any(|a| a == &ctx.repo.display().to_string()),
             "agy argv must not reference the real repo at all"
+        );
+    }
+
+    #[test]
+    fn judge_command_spec_codex_passes_explicit_reasoning_effort() {
+        let ctx = fixture_run_context();
+        let judge = crate::config::ArenaJudge {
+            name: "terra-judge".to_string(),
+            backend: crate::config::Backend::Codex,
+            dispatch_id: "gpt-5.6-terra".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Xhigh),
+        };
+
+        let spec = judge_command_spec(
+            &ctx,
+            &judge,
+            "p",
+            &ctx.log_dir.join("j.out"),
+            &ctx.log_dir.join("j.err"),
+        )
+        .expect("spec builds");
+
+        assert_eq!(
+            spec.args,
+            vec![
+                "exec",
+                "--model",
+                "gpt-5.6-terra",
+                "--config",
+                "model_reasoning_effort=\"xhigh\"",
+                "p",
+            ]
         );
     }
 

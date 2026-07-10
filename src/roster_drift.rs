@@ -1,7 +1,7 @@
 //! Scorecard-vs-`conductor.toml` roster drift detector.
 //!
 //! Parses the "Live Roster" markdown table in `~/.claude/model-scorecard.md`
-//! (columns: Model, Dispatch ID, Tier, Ceiling, Reliability) and diffs it
+//! (columns: Model, Dispatch ID, Reasoning, Tier, Ceiling, Reliability) and diffs it
 //! against `conductor.toml`'s roster. Reports missing models, extra models,
 //! and tier/ceiling mismatches.
 //!
@@ -55,6 +55,9 @@ pub(crate) struct ScorecardEntry {
     pub(crate) model: String,
     /// Dispatch ID from the Dispatch ID column.
     pub(crate) dispatch_id: String,
+    /// Optional Codex reasoning effort from the Reasoning column. `None`
+    /// means the scorecard uses the legacy table shape without that column.
+    pub(crate) reasoning_effort: Option<String>,
     /// Tier from the Tier column (e.g. "Lead", "Senior + Junior").
     pub(crate) tier: String,
     /// Ceiling from the Ceiling column (e.g. "XL (via decomposition)").
@@ -95,6 +98,8 @@ pub(crate) enum DriftKind {
     CostMismatch,
     /// Fallback chain differs between scorecard and config.
     FallbackMismatch,
+    /// Codex reasoning effort differs between scorecard and config.
+    ReasoningMismatch,
 }
 
 impl fmt::Display for DriftKind {
@@ -106,6 +111,7 @@ impl fmt::Display for DriftKind {
             Self::CeilingMismatch => f.write_str("ceiling mismatch"),
             Self::CostMismatch => f.write_str("cost mismatch"),
             Self::FallbackMismatch => f.write_str("fallback mismatch"),
+            Self::ReasoningMismatch => f.write_str("reasoning mismatch"),
         }
     }
 }
@@ -158,6 +164,13 @@ fn normalize_ceiling(s: &str) -> String {
 
 fn normalize_cost(s: &str) -> String {
     s.trim().to_lowercase()
+}
+
+fn normalize_reasoning_effort(s: &str) -> String {
+    match s.trim() {
+        "" | "-" | "—" => String::new(),
+        value => value.to_lowercase(),
+    }
 }
 
 fn normalize_fallback_chain(fallback: &[String]) -> Vec<String> {
@@ -239,6 +252,7 @@ pub(crate) fn parse_scorecard(content: &str) -> Result<Vec<ScorecardEntry>> {
         .get("ceiling")
         .ok_or_else(|| RosterDriftError::new("missing required column: Ceiling"))?;
     let dispatch_col = col_map.get("dispatch id").copied();
+    let reasoning_col = col_map.get("reasoning").copied();
     let cost_col = col_map.get("cost").copied();
     let fallback_col = col_map.get("fallback").copied();
 
@@ -265,6 +279,11 @@ pub(crate) fn parse_scorecard(content: &str) -> Result<Vec<ScorecardEntry>> {
             .and_then(|col| cells.get(col))
             .map(|c| clean_cell(c))
             .unwrap_or_default();
+        let reasoning_effort = reasoning_col.and_then(|col| {
+            cells
+                .get(col)
+                .map(|cell| normalize_reasoning_effort(&clean_cell(cell)))
+        });
         let tier = cells
             .get(tier_col)
             .map(|c| clean_cell(c))
@@ -283,6 +302,7 @@ pub(crate) fn parse_scorecard(content: &str) -> Result<Vec<ScorecardEntry>> {
         entries.push(ScorecardEntry {
             model,
             dispatch_id,
+            reasoning_effort,
             tier,
             ceiling,
             cost,
@@ -460,6 +480,20 @@ pub(crate) fn diff(
                     ),
                 });
             }
+
+            if let Some(sc_reasoning_effort) = &sc_entry.reasoning_effort {
+                let cfg_reasoning_effort = cfg_entry
+                    .reasoning_effort
+                    .map(config::ReasoningEffort::as_str)
+                    .unwrap_or_default();
+                if normalize_reasoning_effort(sc_reasoning_effort) != cfg_reasoning_effort {
+                    report.items.push(DriftItem {
+                        kind: DriftKind::ReasoningMismatch,
+                        model: sc_entry.model.clone(),
+                        detail: format!("scorecard: {sc_reasoning_effort}, config: {cfg_reasoning_effort}"),
+                    });
+                }
+            }
         }
     }
 
@@ -492,7 +526,7 @@ pub(crate) fn print_report(report: &DriftReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{self, Backend, Ceiling, Efficiency, Tier};
+    use crate::config::{self, Backend, Ceiling, Efficiency, ReasoningEffort, Tier};
 
     fn cfg_entry(name: &str, tier: Tier, ceiling: Ceiling) -> config::RosterEntry {
         config::RosterEntry {
@@ -502,6 +536,7 @@ mod tests {
             efficiency: Efficiency::Std,
             backend: Backend::Pi,
             dispatch_id: format!("dispatch-{name}"),
+            reasoning_effort: None,
             provider: String::new(),
             cost: config::Cost::Paid,
             fallback: Vec::new(),
@@ -512,6 +547,7 @@ mod tests {
         ScorecardEntry {
             model: model.to_string(),
             dispatch_id: String::new(),
+            reasoning_effort: None,
             tier: tier.to_string(),
             ceiling: ceiling.to_string(),
             cost: String::new(),
@@ -586,6 +622,21 @@ mod tests {
             entries[0].fallback,
             vec!["nw-glm-5.2-short".to_string(), "nw-glm-5.2".to_string()]
         );
+    }
+
+    #[test]
+    fn roster_drift_parse_reads_reasoning_column() {
+        let md = "\
+## Live Roster
+
+| Model | Dispatch ID | Reasoning | Tier | Ceiling |
+|---|---|---|---|---|
+| **gpt-5.6-sol** | `gpt-5.6-sol` | max | **Lead** | XL |
+";
+
+        let entries = parse_scorecard(md).expect("scorecard parses");
+
+        assert_eq!(entries[0].reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]
@@ -714,6 +765,7 @@ Just some prose, no table at all.
         let sc = vec![ScorecardEntry {
             model: "glm-5.2".to_string(),
             dispatch_id: String::new(),
+            reasoning_effort: None,
             tier: "Senior".to_string(),
             ceiling: "M".to_string(),
             cost: "free".to_string(),
@@ -734,6 +786,7 @@ Just some prose, no table at all.
         let sc = vec![ScorecardEntry {
             model: "glm-5.2".to_string(),
             dispatch_id: String::new(),
+            reasoning_effort: None,
             tier: "Senior".to_string(),
             ceiling: "M".to_string(),
             cost: String::new(),
@@ -753,6 +806,7 @@ Just some prose, no table at all.
         let sc = vec![ScorecardEntry {
             model: "glm-5.2".to_string(),
             dispatch_id: String::new(),
+            reasoning_effort: None,
             tier: "Senior".to_string(),
             ceiling: "M".to_string(),
             cost: "paid".to_string(),
@@ -768,6 +822,23 @@ Just some prose, no table at all.
             "expected no drift, got: {:?}",
             report.items
         );
+    }
+
+    #[test]
+    fn roster_drift_diff_reasoning_mismatch() {
+        let sc = vec![ScorecardEntry {
+            reasoning_effort: Some("xhigh".to_string()),
+            ..sc_entry("gpt-5.6-terra", "Lead", "XL")
+        }];
+        let mut cfg = vec![cfg_entry("gpt-5.6-terra", Tier::Lead, Ceiling::Xl)];
+        cfg[0].backend = Backend::Codex;
+        cfg[0].dispatch_id = "gpt-5.6-terra".to_string();
+        cfg[0].reasoning_effort = Some(ReasoningEffort::Max);
+
+        let report = diff(&sc, &cfg);
+
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].kind, DriftKind::ReasoningMismatch);
     }
 
     // --- diff: multiple drift types ---
@@ -825,7 +896,7 @@ Just some prose, no table at all.
     fn roster_drift_fixture_agreement() {
         let scorecard = load_fixture("scorecard-agreement.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 21);
+        assert_eq!(entries.len(), 25);
     }
 
     #[test]
@@ -840,7 +911,7 @@ Just some prose, no table at all.
     fn roster_drift_fixture_extra_in_config() {
         let scorecard = load_fixture("scorecard-extra-in-config.md");
         let entries = parse_scorecard(&scorecard).expect("Failed to parse fixture");
-        assert_eq!(entries.len(), 20);
+        assert_eq!(entries.len(), 24);
     }
 
     #[test]

@@ -111,6 +111,51 @@ pub(crate) enum Backend {
     Claude,
     Pi,
     Agy,
+    Codex,
+}
+
+/// Closed Codex reasoning effort values. Codex roster entries must declare an
+/// effort so a dispatch cannot inherit a machine-specific global default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
+            _ => Err(ConfigError::new(format!(
+                "unknown reasoning_effort {s:?} (expected low|medium|high|xhigh|max|ultra)"
+            ))),
+        }
+    }
 }
 
 /// Cost axis on a roster entry — orthogonal to `Tier`. A free model can sit
@@ -194,8 +239,9 @@ impl FromStr for Backend {
             "claude" => Ok(Backend::Claude),
             "pi" => Ok(Backend::Pi),
             "agy" => Ok(Backend::Agy),
+            "codex" => Ok(Backend::Codex),
             _ => Err(ConfigError::new(format!(
-                "unknown backend {s:?} (expected claude|pi|agy)"
+                "unknown backend {s:?} (expected claude|pi|agy|codex)"
             ))),
         }
     }
@@ -232,6 +278,9 @@ pub(crate) struct RosterEntry {
     pub(crate) efficiency: Efficiency,
     pub(crate) backend: Backend,
     pub(crate) dispatch_id: String,
+    /// Explicit Codex reasoning effort. Required for `backend = "codex"`
+    /// and rejected for other backends so dispatch cannot silently ignore it.
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
     /// Which provider/account this model lives on (mirrors
     /// `arena_profile.provider_group`; unify on a single name in a later
     /// phase). Empty string when unset (defaults to "" so existing rows
@@ -352,6 +401,7 @@ pub(crate) struct ArenaProfile {
     pub(crate) harness: String,
     pub(crate) model: String,
     pub(crate) provider_group: String,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +409,7 @@ pub(crate) struct ArenaJudge {
     pub(crate) name: String,
     pub(crate) backend: Backend,
     pub(crate) dispatch_id: String,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone)]
@@ -1034,7 +1085,7 @@ fn parse_arena_profiles(node: Option<&Node>) -> Result<Vec<ArenaProfile>> {
         for key in t.keys() {
             if !matches!(
                 key.as_str(),
-                "name" | "harness" | "model" | "provider_group"
+                "name" | "harness" | "model" | "provider_group" | "reasoning_effort"
             ) {
                 return Err(ConfigError::new(format!(
                     "unknown arena_profile key in entry {i}: {key}"
@@ -1050,6 +1101,14 @@ fn parse_arena_profiles(node: Option<&Node>) -> Result<Vec<ArenaProfile>> {
         }
         let model = get_required_str_at("arena_profile", t, i, "model")?;
         let provider_group = get_required_str_at("arena_profile", t, i, "provider_group")?;
+        let reasoning_effort = parse_reasoning_effort("arena_profile", t, i)?;
+        validate_reasoning_effort(
+            "arena_profile",
+            i,
+            harness == "codex",
+            &model,
+            reasoning_effort,
+        )?;
         if !seen.insert(name.clone()) {
             return Err(ConfigError::new(format!(
                 "duplicate arena_profile name: {name}"
@@ -1060,6 +1119,7 @@ fn parse_arena_profiles(node: Option<&Node>) -> Result<Vec<ArenaProfile>> {
             harness,
             model,
             provider_group,
+            reasoning_effort,
         });
     }
     Ok(out)
@@ -1079,7 +1139,10 @@ fn parse_arena_judges(node: Option<&Node>) -> Result<Vec<ArenaJudge>> {
     let mut out = Vec::with_capacity(entries.len());
     for (i, t) in entries.iter().enumerate() {
         for key in t.keys() {
-            if !matches!(key.as_str(), "name" | "backend" | "dispatch_id") {
+            if !matches!(
+                key.as_str(),
+                "name" | "backend" | "dispatch_id" | "reasoning_effort"
+            ) {
                 return Err(ConfigError::new(format!(
                     "unknown arena_judge key in entry {i}: {key}"
                 )));
@@ -1088,6 +1151,14 @@ fn parse_arena_judges(node: Option<&Node>) -> Result<Vec<ArenaJudge>> {
         let name = get_required_str_at("arena_judge", t, i, "name")?;
         let backend = get_required_str_at("arena_judge", t, i, "backend")?.parse::<Backend>()?;
         let dispatch_id = get_required_str_at("arena_judge", t, i, "dispatch_id")?;
+        let reasoning_effort = parse_reasoning_effort("arena_judge", t, i)?;
+        validate_reasoning_effort(
+            "arena_judge",
+            i,
+            backend == Backend::Codex,
+            &dispatch_id,
+            reasoning_effort,
+        )?;
         if !seen.insert(name.clone()) {
             return Err(ConfigError::new(format!(
                 "duplicate arena_judge name: {name}"
@@ -1097,6 +1168,7 @@ fn parse_arena_judges(node: Option<&Node>) -> Result<Vec<ArenaJudge>> {
             name,
             backend,
             dispatch_id,
+            reasoning_effort,
         });
     }
     Ok(out)
@@ -1127,6 +1199,7 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
                     | "provider"
                     | "cost"
                     | "fallback"
+                    | "reasoning_effort"
             ) {
                 return Err(ConfigError::new(format!(
                     "unknown roster key in entry {i}: {key}"
@@ -1139,6 +1212,14 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
         let efficiency = get_required_str(t, i, "efficiency")?.parse::<Efficiency>()?;
         let backend = get_required_str(t, i, "backend")?.parse::<Backend>()?;
         let dispatch_id = get_required_str(t, i, "dispatch_id")?;
+        let reasoning_effort = parse_reasoning_effort("roster", t, i)?;
+        validate_reasoning_effort(
+            "roster",
+            i,
+            backend == Backend::Codex,
+            &dispatch_id,
+            reasoning_effort,
+        )?;
         let provider = match t.get("provider") {
             Some(Node::Str(s)) => s.clone(),
             Some(_) => {
@@ -1171,12 +1252,56 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
             efficiency,
             backend,
             dispatch_id,
+            reasoning_effort,
             provider,
             cost,
             fallback,
         });
     }
     Ok(out)
+}
+
+fn parse_reasoning_effort(
+    table: &str,
+    t: &HashMap<String, Node>,
+    i: usize,
+) -> Result<Option<ReasoningEffort>> {
+    match t.get("reasoning_effort") {
+        Some(Node::Str(value)) => value.parse().map(Some),
+        Some(_) => Err(ConfigError::new(format!(
+            "{table} entry {i} field reasoning_effort must be a string"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn validate_reasoning_effort(
+    table: &str,
+    i: usize,
+    uses_codex: bool,
+    model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Result<()> {
+    if !uses_codex {
+        if reasoning_effort.is_some() {
+            return Err(ConfigError::new(format!(
+                "{table} entry {i} reasoning_effort is only valid for Codex"
+            )));
+        }
+        return Ok(());
+    }
+
+    let effort = reasoning_effort.ok_or_else(|| {
+        ConfigError::new(format!(
+            "{table} entry {i} Codex dispatch requires reasoning_effort"
+        ))
+    })?;
+    if model == "gpt-5.6-luna" && effort == ReasoningEffort::Ultra {
+        return Err(ConfigError::new(format!(
+            "{table} entry {i} model gpt-5.6-luna does not support reasoning_effort ultra"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_repo_policies(node: Option<&Node>, roster: &[RosterEntry]) -> Result<Vec<RepoPolicy>> {
@@ -1426,6 +1551,15 @@ mod tests {
         s
     }
 
+    fn codex_roster_entry(model: &str, reasoning_effort: Option<&str>) -> String {
+        let effort = reasoning_effort.map_or_else(String::new, |value| {
+            format!("reasoning_effort = \"{value}\"\n")
+        });
+        format!(
+            "[[roster]]\nname = \"{model}\"\ntier = \"lead\"\nceiling = \"XL\"\nefficiency = \"heavy\"\nbackend = \"codex\"\ndispatch_id = \"{model}\"\n{effort}"
+        )
+    }
+
     fn assert_err(label: &str, src: &str) {
         let res = parse_str(src);
         assert!(res.is_err(), "expected error for {label}, got Ok: {res:?}");
@@ -1480,7 +1614,7 @@ mod tests {
     fn checked_in_config_parses_and_has_phase2_roster_entries() {
         let cfg = parse_str(include_str!("../conductor.toml"))
             .expect("checked-in conductor.toml must parse");
-        assert_eq!(cfg.roster.len(), 21);
+        assert_eq!(cfg.roster.len(), 25);
         // spec's exact roster table, in order.
         assert_eq!(cfg.roster[0].name, "sonnet-5");
         assert_eq!(cfg.roster[0].tier, Tier::Lead);
@@ -1575,6 +1709,37 @@ mod tests {
         assert_eq!(cfg.roster[20].name, "nw-kimi-k2.6-fast");
         assert_eq!(cfg.roster[20].tier, Tier::Junior);
         assert_eq!(cfg.roster[20].ceiling, Ceiling::S);
+        let sol = cfg
+            .roster
+            .iter()
+            .find(|row| row.name == "gpt-5.6-sol")
+            .expect("Sol roster row");
+        assert_eq!(sol.tier, Tier::Lead);
+        assert_eq!(sol.ceiling, Ceiling::Xl);
+        assert_eq!(sol.backend, Backend::Codex);
+        assert_eq!(sol.reasoning_effort, Some(ReasoningEffort::Max));
+        let terra = cfg
+            .roster
+            .iter()
+            .find(|row| row.name == "gpt-5.6-terra")
+            .expect("Terra roster row");
+        assert_eq!(terra.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        let luna_junior = cfg
+            .roster
+            .iter()
+            .find(|row| row.name == "gpt-5.6-luna-junior")
+            .expect("Luna Junior roster row");
+        assert_eq!(luna_junior.tier, Tier::Junior);
+        assert_eq!(luna_junior.ceiling, Ceiling::S);
+        assert_eq!(luna_junior.reasoning_effort, Some(ReasoningEffort::Medium));
+        let luna_senior = cfg
+            .roster
+            .iter()
+            .find(|row| row.name == "gpt-5.6-luna-senior")
+            .expect("Luna Senior roster row");
+        assert_eq!(luna_senior.tier, Tier::Senior);
+        assert_eq!(luna_senior.ceiling, Ceiling::L);
+        assert_eq!(luna_senior.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(
             cfg.roster
                 .iter()
@@ -1610,8 +1775,12 @@ mod tests {
         assert_eq!(cfg.arena.parallel, 2);
         assert!(cfg.arena.auto_apply);
         assert_eq!(cfg.arena.min_score_x10, 40);
-        assert_eq!(cfg.arena.profiles.len(), 25);
+        assert_eq!(cfg.arena.profiles.len(), 29);
         assert_eq!(cfg.arena.profiles[0].name, "codex-gpt55");
+        assert_eq!(
+            cfg.arena.profiles[0].reasoning_effort,
+            Some(ReasoningEffort::Xhigh)
+        );
         assert_eq!(cfg.arena.profiles[18].name, "opencode-nw-kimi-k26-fast");
         assert_eq!(cfg.arena.judges.len(), 3);
         assert_eq!(cfg.arena.judges[0].name, "qwen37max");
@@ -1662,6 +1831,7 @@ name = \"codex-gpt55\"
 harness = \"codex\"
 model = \"gpt-5.5\"
 provider_group = \"openai-codex\"
+reasoning_effort = \"xhigh\"
 
 [[arena_judge]]
 name = \"qwen-judge\"
@@ -1704,6 +1874,10 @@ dispatch_id = \"claude-sonnet-5\"
         assert_eq!(cfg.arena.profiles[0].name, "codex-gpt55");
         assert_eq!(cfg.arena.profiles[0].harness, "codex");
         assert_eq!(cfg.arena.profiles[0].model, "gpt-5.5");
+        assert_eq!(
+            cfg.arena.profiles[0].reasoning_effort,
+            Some(ReasoningEffort::Xhigh)
+        );
         assert_eq!(cfg.arena.judges.len(), 1);
         assert_eq!(cfg.arena.judges[0].dispatch_id, "opencode-go/qwen3.7-max");
         assert_eq!(cfg.roster.len(), 1);
@@ -1783,13 +1957,26 @@ dispatch_id = \"claude-sonnet-5\"
         for (exp, s) in effs {
             assert_eq!(s.parse::<Efficiency>().unwrap(), exp);
         }
-        let backs: [(Backend, &str); 3] = [
+        let backs: [(Backend, &str); 4] = [
             (Backend::Claude, "claude"),
             (Backend::Pi, "pi"),
             (Backend::Agy, "agy"),
+            (Backend::Codex, "codex"),
         ];
         for (exp, s) in backs {
             assert_eq!(s.parse::<Backend>().unwrap(), exp);
+        }
+        let efforts: [(ReasoningEffort, &str); 6] = [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+            (ReasoningEffort::Ultra, "ultra"),
+        ];
+        for (exp, s) in efforts {
+            assert_eq!(s.parse::<ReasoningEffort>().unwrap(), exp);
+            assert_eq!(exp.as_str(), s);
         }
         assert_eq!("propose".parse::<Autonomy>().unwrap(), Autonomy::Propose);
         assert_eq!("ratchet".parse::<Autonomy>().unwrap(), Autonomy::Ratchet);
@@ -1901,6 +2088,84 @@ dispatch_id = \"claude-sonnet-5\"
         for (label, src) in cases {
             assert_err(label, src);
         }
+    }
+
+    #[test]
+    fn codex_reasoning_effort_is_explicit_and_model_validated() {
+        for (label, source, should_parse) in [
+            (
+                "Sol accepts ultra",
+                codex_roster_entry("gpt-5.6-sol", Some("ultra")),
+                true,
+            ),
+            (
+                "Terra accepts low",
+                codex_roster_entry("gpt-5.6-terra", Some("low")),
+                true,
+            ),
+            (
+                "Luna accepts max",
+                codex_roster_entry("gpt-5.6-luna", Some("max")),
+                true,
+            ),
+            (
+                "Codex requires effort",
+                codex_roster_entry("gpt-5.6-sol", None),
+                false,
+            ),
+            (
+                "Luna rejects ultra",
+                codex_roster_entry("gpt-5.6-luna", Some("ultra")),
+                false,
+            ),
+            (
+                "unknown effort is rejected",
+                codex_roster_entry("gpt-5.6-sol", Some("maximum")),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                parse_str(&source).is_ok(),
+                should_parse,
+                "unexpected result for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_arena_profiles_and_judges_require_explicit_effort() {
+        let valid = "\
+[[arena_profile]]
+name = \"sol\"
+harness = \"codex\"
+model = \"gpt-5.6-sol\"
+provider_group = \"openai-codex\"
+reasoning_effort = \"max\"
+
+[[arena_judge]]
+name = \"terra\"
+backend = \"codex\"
+dispatch_id = \"gpt-5.6-terra\"
+reasoning_effort = \"xhigh\"
+";
+        let cfg = parse_str(valid).expect("valid explicit Codex Arena config");
+        assert_eq!(
+            cfg.arena.profiles[0].reasoning_effort,
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            cfg.arena.judges[0].reasoning_effort,
+            Some(ReasoningEffort::Xhigh)
+        );
+
+        let invalid = "\
+[[arena_profile]]
+name = \"missing-effort\"
+harness = \"codex\"
+model = \"gpt-5.6-sol\"
+provider_group = \"openai-codex\"
+";
+        assert_err("Codex Arena profile requires effort", invalid);
     }
 
     // --- hardcoded exclude (invariant 5) ---

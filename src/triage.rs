@@ -374,7 +374,8 @@ pub(crate) fn route(
 
                 // Step 4 + invariant 4/7: apply every budget as a hard
                 // ceiling; excess is skipped(budget), never silently dropped.
-                let is_external = matches!(chosen.backend, Backend::Pi | Backend::Agy);
+                let is_external =
+                    matches!(chosen.backend, Backend::Pi | Backend::Agy | Backend::Codex);
                 let repo_count = *dispatch_count_by_repo.get(repo_name).unwrap_or(&0);
                 let over_cycle_ceiling = global_dispatch_count >= budgets.max_dispatches_per_cycle;
                 let over_repo_ceiling = repo_count >= budgets.max_active_per_repo;
@@ -499,6 +500,7 @@ mod tests {
             efficiency,
             backend,
             dispatch_id: format!("dispatch-{name}"),
+            reasoning_effort: None,
             provider: String::new(),
             cost: Cost::Paid,
             fallback: Vec::new(),
@@ -1164,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn invariant_7_max_external_dispatches_ceiling_caps_pi_and_agy_combined() {
+    fn invariant_7_max_external_dispatches_ceiling_caps_pi_agy_and_codex_combined() {
         let roster = vec![
             roster_entry(
                 "pi-model",
@@ -1179,6 +1181,13 @@ mod tests {
                 Ceiling::S,
                 Efficiency::Lean,
                 Backend::Agy,
+            ),
+            roster_entry(
+                "codex-model",
+                Tier::Senior,
+                Ceiling::M,
+                Efficiency::Lean,
+                Backend::Codex,
             ),
         ];
         let repos = vec![
@@ -1204,17 +1213,28 @@ mod tests {
                     Some("t"),
                 )],
             ),
+            active_repo(
+                "repo3",
+                vec![issue(
+                    "i3",
+                    3,
+                    "2026-01-03T00:00:00Z",
+                    "senior",
+                    "M",
+                    Some("t"),
+                )],
+            ),
         ];
-        let b = budgets(100, 100, 1); // max_external_dispatches = 1 (pi + agy combined)
+        let b = budgets(100, 100, 1); // max_external_dispatches = 1 (pi + agy + codex)
         let plan = route(
             &repos,
             &roster,
             &b,
-            &ratchet_unlocked(&["repo1", "repo2"]),
+            &ratchet_unlocked(&["repo1", "repo2", "repo3"]),
             &HashMap::new(),
         );
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.skips.len(), 1);
+        assert_eq!(plan.skips.len(), 2);
         assert_eq!(plan.skips[0].reason, SkipCode::Budget);
     }
 

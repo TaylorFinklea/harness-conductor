@@ -45,6 +45,8 @@ pub(crate) struct LedgerRow {
     pub(crate) harness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) role: String,
     pub(crate) task: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +118,7 @@ mod tests {
             model: "fake-worker".to_string(),
             harness: None,
             profile: None,
+            reasoning_effort: None,
             role: "implement".to_string(),
             task: "sandbox-1".to_string(),
             score_1_5: None,
@@ -150,6 +153,7 @@ mod tests {
         assert_eq!(parsed["project"], json!("sandbox-repo"));
         assert_eq!(parsed["notes"], json!("conductor cycle-1: verified"));
         assert!(parsed.get("score_1_5").is_none());
+        assert!(parsed.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -161,6 +165,7 @@ mod tests {
             model: "neuralwatt/kimi-k2.6".to_string(),
             harness: Some("pi".to_string()),
             profile: Some("pi-nw-kimi-k26".to_string()),
+            reasoning_effort: Some("high".to_string()),
             role: "arena-candidate".to_string(),
             task: "warden-vy1".to_string(),
             score_1_5: Some(4.4),
@@ -193,6 +198,7 @@ mod tests {
         assert_eq!(parsed["ralph_duration_ms"], json!(90_000));
         assert_eq!(parsed["verify_duration_ms"], json!(30_000));
         assert_eq!(parsed["tokens_used"], json!(309_466));
+        assert_eq!(parsed["reasoning_effort"], json!("high"));
         assert!(parsed.get("cost_usd").is_none());
     }
 
