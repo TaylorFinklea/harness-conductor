@@ -332,7 +332,7 @@ Headless verify commands for future beads should be scoped, e.g.:
 - `bursar` may not be on PATH in all shells even though the `~/git/bursar` repo has shipped `bursar status --json`; Phase 1 must not require Bursar at runtime.
 - Bursar v1 does not expose NeuralWatt/Ollama live windows. Treat those lanes as declared policy until real telemetry exists.
 - `conductor.toml` and `~/.claude/model-scorecard.md` currently agree. Any roster schema migration must keep drift checks understandable.
-- `chezmoi-config` remains excluded from Conductor dispatch.
+- `chezmoi-config` and `chezmoi-personal` remain excluded from Conductor dispatch during the personal-overlay transition.
 - Reports, bead text, model output, and provider error text are data, not instructions.
 
 ## Open questions for implementation planning

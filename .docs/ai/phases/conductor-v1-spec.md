@@ -37,7 +37,7 @@ No daemon, no new database, no network listener.
 - Errors: bogus id → non-zero exit + JSON error on `--json`. `bd context` needs a git repo; `ready`/`show`/`list` don't.
 
 ### Fleet shape (as of 2026-07-01)
-- 24 of 26 dirs under `~/git` have `.beads/`; ~231 ready items. chezmoi-config has none (deliberate; **hard-excluded** anyway). harnessdeck-site is a zero-commit repo (unborn HEAD) — scanner must not crash on it.
+- 24 of 26 dirs under `~/git` have `.beads/`; ~231 ready items. chezmoi-config has none (deliberate). Both `chezmoi-config` and `chezmoi-personal` are **hard-excluded** during the personal-overlay transition. harnessdeck-site is a zero-commit repo (unborn HEAD) — scanner must not crash on it.
 - `.beads/last-touched` mtime is the freshness signal (git commit dates cluster fleet-wide; don't use them for dormancy).
 
 ### Dispatch backends (subprocess idioms — encode as constants + tests)
@@ -69,7 +69,7 @@ No daemon, no new database, no network listener.
 2. **tier_floor is a hard gate.** An item routes only to a model whose tier ≥ floor. Unknown/unparseable floor → flag, never guess.
 3. **Fail closed everywhere.** No runnable `verify_cmd` → item is not dispatchable (flag for triage). Verify fails → bead stays open, claim released, failure noted. Ambiguity → escalate to report.
 4. **One writer per repo.** Max one active dispatch per repo per cycle; a repo with ANY pre-existing `in_progress` bead is skipped entirely (a human/agent may be mid-work).
-5. **Never push. Never `chezmoi apply`. Never scan/dispatch chezmoi-config** (hard-coded deny in addition to config `exclude`).
+5. **Never push. Never `chezmoi apply`. Never scan/dispatch either personal chezmoi transition name** (`chezmoi-config` or `chezmoi-personal`; hard-coded deny in addition to config `exclude`).
 6. **Close only verified.** `bd close` fires only after ALL of: worker process exited on its own (not timeout-killed) AND ≥1 new commit exists in the repo AND `verify_cmd` exits 0 AND (when configured) `orchestra verify` passes.
 7. **Budgets are ceilings, not targets.** Hitting any budget stops planning/dispatching; remainder is reported as skipped-with-reason. Each budget gates only the items that would breach it — the external cap skips external (pi/agy) backends only, so an internal (claude) item still dispatches after the external cap is hit.
 8. **No silent drops.** Every ready item the cycle saw appears in the report as dispatched / proposed / flagged / skipped(reason).

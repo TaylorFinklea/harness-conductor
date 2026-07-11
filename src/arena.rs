@@ -724,7 +724,7 @@ fn preflight_repo(repo: &Path) -> Result<()> {
     };
     if crate::config::HARDCODED_EXCLUDE.contains(&name) {
         return Err(ArenaError::new(
-            "arena refuses to run against hard-excluded chezmoi-config",
+            "arena refuses to run against a hard-excluded personal chezmoi repository",
         ));
     }
     if !repo.join(".git").exists() {
@@ -1899,6 +1899,18 @@ fn pct(part: usize, total: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_rejects_personal_chezmoi_transition_names() {
+        for name in ["chezmoi-config", "chezmoi-personal"] {
+            let error =
+                preflight_repo(Path::new(name)).expect_err("personal chezmoi repo is denied");
+            assert_eq!(
+                error.to_string(),
+                "arena refuses to run against a hard-excluded personal chezmoi repository"
+            );
+        }
+    }
 
     fn fixture_run_context() -> RunContext {
         RunContext {

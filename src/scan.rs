@@ -1,7 +1,7 @@
 //! fleet enumeration (walk ~/git, .beads/metadata.json detection, exclusions, unborn-HEAD safe)
 //!
 //! Scans the configured root directory (depth 1, tilde-expanded) for beads repos,
-//! applying exclusions (config list + hardcoded chezmoi-config deny). For each
+//! applying exclusions (config list + hardcoded personal chezmoi transition deny). For each
 //! beads repo, queries bd via the injected `&dyn BdClient` to gather ready list,
 //! count, blocked items, and distinguishes the two zero-states (drained vs blocked).
 //! Computes freshness from `.beads/last-touched` mtime (fresh/recent/stale buckets).
@@ -646,13 +646,15 @@ mod tests {
     }
 
     #[test]
-    fn scan_applies_hardcoded_chezmoi_config_exclusion() {
+    fn scan_applies_hardcoded_personal_chezmoi_exclusions() {
         let temp = TempDir::new("hardcoded-exclude");
         let root = temp.path();
 
-        let chezmoi = root.join("chezmoi-config");
-        std::fs::create_dir_all(&chezmoi).expect("mkdir chezmoi-config");
-        init_beads_repo(&chezmoi);
+        for name in ["chezmoi-config", "chezmoi-personal"] {
+            let chezmoi = root.join(name);
+            std::fs::create_dir_all(&chezmoi).expect("mkdir personal chezmoi repo");
+            init_beads_repo(&chezmoi);
+        }
 
         let repo1 = root.join("repo1");
         std::fs::create_dir_all(&repo1).expect("mkdir repo1");
@@ -670,11 +672,13 @@ mod tests {
 
         let snapshots = scan(&config, &client).expect("scan succeeds");
 
-        let chez = snapshots
-            .iter()
-            .find(|s| s.name == "chezmoi-config")
-            .unwrap();
-        assert_eq!(chez.skip_reason, Some(SkipReason::Excluded));
+        for name in ["chezmoi-config", "chezmoi-personal"] {
+            let chezmoi = snapshots
+                .iter()
+                .find(|snapshot| snapshot.name == name)
+                .unwrap();
+            assert_eq!(chezmoi.skip_reason, Some(SkipReason::Excluded));
+        }
 
         let r1 = snapshots.iter().find(|s| s.name == "repo1").unwrap();
         assert!(r1.is_beads_repo);

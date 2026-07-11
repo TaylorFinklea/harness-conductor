@@ -24,7 +24,7 @@
 //! 3. Fail closed — no runnable `verify_cmd` ⇒ not dispatchable (falls back to proposal).
 //! 4. One writer per repo — a pre-existing `in_progress` bead skips the whole
 //!    repo; `budgets.max_active_per_repo` caps auto-dispatches per repo per cycle.
-//! 5. Never dispatch an excluded repo (chezmoi-config's hard-coded deny, in depth).
+//! 5. Never dispatch an excluded repo (personal chezmoi hard-coded deny, in depth).
 //! 6. Close only verified — every dispatch carries the `verify_cmd` precondition
 //!    that downstream verification requires before any `bd close`.
 //! 7. Budgets are ceilings, not targets — excess is `skipped(budget)`.
@@ -1037,10 +1037,10 @@ mod tests {
         assert_eq!(plan.skips[0].reason, SkipCode::Budget);
     }
 
-    // --- invariant 5: never dispatch chezmoi-config (excluded, defense in depth) ---
+    // --- invariant 5: never dispatch a personal chezmoi repo (defense in depth) ---
 
     #[test]
-    fn invariant_5_excluded_repo_like_chezmoi_config_is_never_dispatched() {
+    fn invariant_5_excluded_personal_chezmoi_repo_is_never_dispatched() {
         let roster = vec![roster_entry(
             "any-model",
             Tier::Lead,
@@ -1049,7 +1049,7 @@ mod tests {
             Backend::Claude,
         )];
         let repos = vec![skipped_repo(
-            "chezmoi-config",
+            "chezmoi-personal",
             SkipReason::Excluded,
             vec![issue(
                 "sneaky",
@@ -1064,7 +1064,7 @@ mod tests {
             &repos,
             &roster,
             &generous_budgets(),
-            &ratchet_unlocked(&["chezmoi-config"]),
+            &ratchet_unlocked(&["chezmoi-personal"]),
             &HashMap::new(),
         );
         assert!(plan.dispatches.is_empty());

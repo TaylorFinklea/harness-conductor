@@ -11,9 +11,9 @@ autonomy = "propose"
 [scan]
 # Fleet root. The scanner walks this for .beads/metadata.json.
 root = "~/git"
-# Config-driven exclusions (repo directory names). NOTE: chezmoi-config is
-# ALSO hard-denied in code (config.rs HARDCODED_EXCLUDE), independent of this
-# list — never scan/dispatch chezmoi-config (invariant 5).
+# Config-driven exclusions (repo directory names). NOTE: both personal chezmoi
+# transition names are hard-denied in code (config.rs HARDCODED_EXCLUDE),
+# independent of this list — never scan/dispatch either (invariant 5).
 exclude = []
 
 [budgets]

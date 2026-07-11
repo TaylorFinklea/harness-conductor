@@ -464,8 +464,8 @@ impl Config {
 }
 
 // Repos hard-excluded from scanning regardless of the config `[scan] exclude`
-// list (invariant 5: never scan/dispatch chezmoi-config).
-pub(crate) const HARDCODED_EXCLUDE: &[&str] = &["chezmoi-config"];
+// list (invariant 5: never scan/dispatch personal chezmoi transition repos).
+pub(crate) const HARDCODED_EXCLUDE: &[&str] = &["chezmoi-config", "chezmoi-personal"];
 
 // ---------------------------------------------------------------------------
 // Minimal TOML subset parser
@@ -2170,6 +2170,11 @@ provider_group = \"openai-codex\"
     #[test]
     fn chezmoi_config_is_hardcoded_excluded() {
         assert!(HARDCODED_EXCLUDE.contains(&"chezmoi-config"));
+    }
+
+    #[test]
+    fn chezmoi_personal_is_hardcoded_excluded() {
+        assert!(HARDCODED_EXCLUDE.contains(&"chezmoi-personal"));
     }
 
     // --- ratchet ceiling (conductor-m6) ---
