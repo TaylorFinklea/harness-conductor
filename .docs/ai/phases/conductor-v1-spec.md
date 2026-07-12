@@ -1,7 +1,7 @@
 # Conductor v1 — spec
 
 **Status**: approved design (user, 2026-07-01) — brainstormed with Fable 5, implemented by the fleet.
-**Repo**: `~/git/harness-conductor` (binary name: `conductor`). The design prompt's `~/git/conductor` path does not exist; this repo is the home.
+**Repo**: `~/git/conductor` (binary name: `conductor`).
 **Runtime**: Rust (user-delegated decision; rationale in decisions.md 2026-07-01).
 
 ## Mission

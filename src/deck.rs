@@ -888,7 +888,7 @@ mod tests {
                     "queue",
                     vec!["repo", "ready", "state"],
                     vec![
-                        vec!["harness-conductor", "6", "ready"],
+                        vec!["conductor", "6", "ready"],
                         vec!["tesela", "0", "blocked"],
                     ],
                 ),

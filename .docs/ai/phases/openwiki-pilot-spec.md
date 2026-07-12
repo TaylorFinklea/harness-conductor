@@ -1,7 +1,7 @@
 # OpenWiki pilot — spec
 
 **Status**: ready — bead filed (2026-07-07)
-**Owning repo**: `~/git/harness-conductor` (pilot target; portable to `~/git/harness-deck`)
+**Owning repo**: `~/git/conductor` (pilot target; portable to `~/git/harness-deck`)
 **Tracking bead**: `conductor-1qh`
 **tier_floor**: `senior` · **complexity**: `M`
 
@@ -36,7 +36,7 @@ OpenWiki (from repo README / `openwiki/quickstart.md` / `openwiki/cli/usage.md`,
 - Writes: `openwiki/**` (committed), `openwiki/.last-update.json`, `~/.openwiki/.env` (creds — avoid), and may inject pointers into `AGENTS.md`/`CLAUDE.md`.
 - Ships an example Action that runs `openwiki --update --print` daily and **opens a PR** (branch `openwiki/update`), not a direct commit.
 
-Target repo (`harness-conductor`):
+Target repo (`conductor`):
 
 - Rust; backlog in **beads** (`bd` 1.0.5); `.docs/ai/` with `decisions.md` + `phases/`.
 - **No root `AGENTS.md`/`CLAUDE.md`** → OpenWiki's injection has nothing curated to clobber (de-risked). If it *creates* those files, review before keeping.
@@ -55,7 +55,7 @@ Keys stay in Keychain (see `~/AGENTS.md` § API Keys); export into the env for t
 ## Steps
 
 1. `npm install -g openwiki`.
-2. From `~/git/harness-conductor`, export the chosen key into the env (Preferred or Fallback). Do not let onboarding persist a key.
+2. From `~/git/conductor`, export the chosen key into the env (Preferred or Fallback). Do not let onboarding persist a key.
 3. `openwiki --init --print` (`--print` = non-interactive; avoids writing `~/.openwiki/.env`).
 4. Inspect generated `openwiki/` against actual `src/` — accurate, or hallucinated architecture?
 5. Review any diff OpenWiki makes to `AGENTS.md`/`CLAUDE.md`. Keep pointers minimal and non-conflicting with `.docs/ai/`; revert intrusive edits.
@@ -103,7 +103,7 @@ Separate bead(s):
 ## Filing
 
 ```bash
-bd create "Pilot OpenWiki on harness-conductor (eval, keychain-safe)" -t task -p 2 \
+bd create "Pilot OpenWiki on conductor (eval, keychain-safe)" -t task -p 2 \
   -d "Evaluation pilot per .docs/ai/phases/openwiki-pilot-spec.md: install OpenWiki, one --init pass with a keychain-sourced key (no ~/.openwiki/.env), commit generated openwiki/ docs, draft adopt/reject ADR in .docs/ai/decisions.md. Adopt call is the user's."
 # then, using the returned id:
 bd update <id> \

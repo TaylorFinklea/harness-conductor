@@ -1,7 +1,7 @@
 # Roster/router explainability refactor — spec
 
 **Status**: approved design (user, 2026-07-06)
-**Owning repo**: `~/git/harness-conductor`
+**Owning repo**: `~/git/conductor`
 **Tracking bead**: `conductor-9eb` for this spec; implementation beads to be split after spec review.
 
 ## Goal
@@ -307,7 +307,7 @@ Integration / CLI checks:
 - `conductor config check --config conductor.toml`
 - `conductor roster list --config conductor.toml`
 - `conductor roster explain minimax-m3 --config conductor.toml`
-- `conductor route explain --repo harness-conductor --bead <fixture>` against a fake or safe fixture bead
+- `conductor route explain --repo conductor --bead <fixture>` against a fake or safe fixture bead
 - `conductor cycle --dry-run --config conductor.toml` produces a report with candidate tables and no selection drift in Phase 1
 
 Headless verify commands for future beads should be scoped, e.g.:
