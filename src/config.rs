@@ -1753,7 +1753,29 @@ mod tests {
                 "nw-glm-5.2".to_string()
             ]
         );
-        assert_eq!(cfg.repo_policies.len(), 0);
+        // Cost-axis repo policy. A repo ABSENT from this table defaults to
+        // `proprietary` (fail closed), so the table is the only way a
+        // free-train model may ever see a repo's code. Every entry was
+        // verified PUBLIC on GitHub (2026-07-13).
+        assert_eq!(cfg.repo_policies.len(), 11);
+        assert!(
+            cfg.repo_policies
+                .iter()
+                .all(|p| p.cost_policy == CostPolicy::Oss),
+            "every repo_policy row must be `oss`: a `proprietary` row is a silent no-op \
+             (it is already the default), so writing one signals an intent the config \
+             does not actually express"
+        );
+        // The invariant worth pinning is not the count — it is that known-private
+        // repos never appear here. A row added for either would admit free-train
+        // providers to closed source, which the fail-closed default exists to prevent.
+        for private_repo in ["patchstand", "seedkeep"] {
+            assert!(
+                !cfg.repo_policies.iter().any(|p| p.repo == private_repo),
+                "{private_repo} is PRIVATE on GitHub and must stay absent from \
+                 [[repo_policy]] so it keeps the fail-closed `proprietary` default"
+            );
+        }
         // defaults
         assert_eq!(cfg.autonomy, Autonomy::Propose);
         assert_eq!(cfg.scan.root, "~/git");

@@ -16,6 +16,62 @@ root = "~/git"
 # independent of this list — never scan/dispatch either (invariant 5).
 exclude = []
 
+# Per-repo data policy — gates the cost axis. `proprietary`/`internal` exclude
+# `free-trains-input` models; `oss`/`public` admit them. A repo ABSENT from this
+# table defaults to `proprietary` (fail closed), so listing a repo here is the
+# only way a free-train model may ever see its code.
+#
+# Every entry below was verified PUBLIC on GitHub (`gh repo view --json
+# visibility`) on 2026-07-13 — their code is already on the open internet, so a
+# free-train provider ingesting it is not an incremental disclosure.
+#
+# Deliberately ABSENT (verified PRIVATE, must stay fail-closed): `patchstand`,
+# `seedkeep`. Do not add a repo here without re-checking its visibility; the
+# whole point of the default is that silence means "assume secret".
+[[repo_policy]]
+repo = "bursar"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "conductor"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "envoy"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "foreman"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "gauntlet"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "guildhall"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "hindsight"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "provenance"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "simmersmith"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "tesela"
+cost_policy = "oss"
+
+[[repo_policy]]
+repo = "warden"
+cost_policy = "oss"
+
 [budgets]
 # Ceilings, not targets (invariant 7). Hitting any budget stops the cycle.
 max_dispatches_per_cycle = 8
