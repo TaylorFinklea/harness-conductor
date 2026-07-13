@@ -62,3 +62,49 @@
 **Decision**: Add `backend = "codex"` and require `reasoning_effort` on every Codex roster row, Arena profile, and Arena judge. Dispatch invokes `codex exec --model <id> --config model_reasoning_effort=\"<effort>\"`, never inheriting a local global setting. Sol is Lead/XL at `max`; Terra is Lead/XL at `xhigh`; Luna has stable Junior/S `medium` and Senior/L `high` roster rows. Luna accepts through `max` but rejects `ultra`; Sol and Terra accept all closed effort values through `ultra`. Codex counts against the existing metered-external cap and uses Bursar's `codex` provider key.
 **Alternatives considered**: Route GPT-5.6 through Pi; use one global Codex effort; represent Luna variants with parenthetical display labels.
 **Rationale**: Pi's thinking grammar cannot express the new `max`/`ultra` options, global settings make runs non-reproducible, and parenthetical labels collapse under scorecard normalization. Distinct stable Luna names plus an explicit Reasoning drift column keep routing, Arena, ledger, and scorecard evidence auditable.
+
+## [2026-07-13] Provider state is fail-closed at plan and dispatch
+
+**Context**: Bursar status was checked only at dispatch, missing Bursar fell
+back to static caps, and a persisted 429 with no percentage could still be
+retried.
+**Decision**: Consume only Bursar status@2. Exhausted, unknown, missing,
+malformed, stale, and unsupported status defer when Bursar is enabled;
+`use_bursar=false` is the sole explicit static-caps override. Persist provider
+decisions in plans, recheck before launch, and write classified runtime 429s
+back before fallback. Details: `phases/provider-trust-integration-spec.md`.
+**Alternatives considered**: Keep late warnings; fail open for unknown; encode
+quota guesses in roster policy.
+**Rationale**: Dispatch trust depends on provider truth being part of the
+approved route. Explicit static mode remains available without letting missing
+infrastructure silently change policy.
+
+## [2026-07-13] Adversarial review is an isolated N-plus-one Conductor workflow
+
+**Context**: Cross-provider architecture critiques were valuable but required
+repeated prompts and ad-hoc model selection. Putting the logic in a skill would
+duplicate Conductor's roster, provider, approval, ledger, and report policy.
+**Decision**: Add a separate read-only `adversarial-review` command: N Senior
+or Lead reviewers on N distinct providers plus one additional Lead judge. It
+shares only closed-roster/provider/report/ledger primitives with Conductor and
+does no cycle, bd, git, worktree, or apply operation. The approval pins the
+artifact hash, panel, fallbacks, judge, and limits. Details:
+`phases/adversarial-design-review-spec.md`.
+**Alternatives considered**: Prose-only cross-harness skill; separate review
+driver; fold review into normal cycle or Arena.
+**Rationale**: A dedicated command is independently testable and inspectable
+without creating a second router or increasing the normal cycle's black-box
+surface.
+
+## [2026-07-13] Approval scope is persisted and cannot widen at dispatch
+
+**Context**: `conductor-xa5` showed that one fleet-wide approval could launch
+every proposal observed under `~/git`.
+**Decision**: Unscoped approval may launch only the existing dispatch bucket.
+Explicit repo/item selectors are persisted in the plan and approval may cover
+proposals only inside that immutable scope. Dispatch cannot add selectors or
+substitute items. Details: `phases/bounded-dispatch-approval-spec.md`.
+**Alternatives considered**: Keep blanket approval; parse free-form approval
+notes; add dispatch-time selectors that were not part of the plan.
+**Rationale**: An approval is meaningful only when its maximum blast radius is
+visible and immutable before the user grants it.
