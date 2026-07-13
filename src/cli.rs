@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -409,8 +409,18 @@ fn run_scan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         print_scan_table(&snapshots);
     }
 
-    let has_flags = snapshots.iter().any(|s| s.skip_reason.is_some());
-    if has_flags {
+    scan_exit_code(&snapshots)
+}
+
+fn scan_exit_code(snapshots: &[crate::scan::RepoSnapshot]) -> ExitCode {
+    use crate::scan::SkipReason;
+
+    // Ordinary skips (not-beads, excluded, in-progress, not-git) are expected
+    // fleet composition, not failures. Only a real ScanGap is reportable.
+    let has_scan_gap = snapshots
+        .iter()
+        .any(|s| matches!(s.skip_reason, Some(SkipReason::ScanGap { .. })));
+    if has_scan_gap {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -768,6 +778,36 @@ mod tests {
         assert!(json.contains("repo-a"));
         assert!(json.contains("repo-b"));
         assert!(json.contains("Excluded"));
+    }
+
+    #[test]
+    fn scan_exit_code_is_success_for_ordinary_skips() {
+        let snapshots = vec![
+            make_snapshot("a", 3, None),
+            make_snapshot("b", 0, Some(SkipReason::NotBeadsRepo)),
+            make_snapshot("c", 0, Some(SkipReason::Excluded)),
+            make_snapshot("d", 0, Some(SkipReason::InProgress)),
+            make_snapshot("e", 0, Some(SkipReason::NotGitRepo)),
+        ];
+
+        assert_eq!(scan_exit_code(&snapshots), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn scan_exit_code_fails_only_on_scan_gap() {
+        let snapshots = vec![
+            make_snapshot("a", 3, None),
+            make_snapshot(
+                "b",
+                0,
+                Some(SkipReason::ScanGap {
+                    command: "bd ready --json".to_string(),
+                    message: "boom".to_string(),
+                }),
+            ),
+        ];
+
+        assert_eq!(scan_exit_code(&snapshots), ExitCode::from(1));
     }
 
     #[test]

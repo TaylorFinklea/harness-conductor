@@ -1678,7 +1678,7 @@ dispatch_id = "fallback-worker"
     }
 
     #[test]
-    fn bursar_budget_absent_binary_falls_back_to_static_caps_cleanly() {
+    fn bursar_budget_absent_binary_spends_cautiously_cleanly() {
         let run = run_bursar_budget_case("absent", &FakeBursarClient::unavailable());
 
         assert_eq!(run.result.dispatched, 1);
@@ -1686,11 +1686,12 @@ dispatch_id = "fallback-worker"
         assert_eq!(
             run.exec.spawns().len(),
             2,
-            "worker + verify under static caps"
+            "worker + verify under spend-cautiously"
         );
         let report = report_json_string(&run.reports, &run.cycle_id);
-        assert!(report.contains("static-caps"));
+        assert!(report.contains("spend-cautiously"));
         assert!(report.contains("bursar unavailable"));
+        assert!(!report.contains("static-caps"));
     }
 
     struct BursarBudgetRun {

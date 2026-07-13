@@ -196,8 +196,8 @@ pub(crate) fn evaluate_budget<C: BursarClient + ?Sized>(
         Err(error) if error.is_unavailable() => {
             return decision(
                 provider,
-                BudgetAction::StaticCaps,
-                format!("{provider}: static-caps — bursar unavailable ({error})"),
+                BudgetAction::SpendCautiously,
+                format!("{provider}: spend-cautiously — bursar unavailable ({error})"),
             );
         }
         Err(error) => {
@@ -346,5 +346,26 @@ pub(crate) mod test_support {
         fn status(&self) -> Result<StatusReport> {
             self.result.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::FakeBursarClient;
+
+    #[test]
+    fn evaluate_budget_unavailable_bursar_spends_cautiously_not_static_caps() {
+        let client = FakeBursarClient::unavailable();
+
+        let decision = evaluate_budget(&client, "opencode-go", true);
+
+        // A missing bursar binary is not less uncertain than a bursar that ran
+        // and reported "unknown" — it must inherit the same cautious floor,
+        // never the permissive static-caps path (that path is reserved for
+        // the explicit `budgets.use_bursar = false` override).
+        assert_ne!(decision.action, BudgetAction::StaticCaps);
+        assert_eq!(decision.action, BudgetAction::SpendCautiously);
+        assert!(decision.summary.contains("bursar unavailable"));
     }
 }

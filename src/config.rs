@@ -1418,6 +1418,7 @@ const PATH_TOOLS: &[&str] = &[
     "orchestra",
     "bun",
     "harness-deck",
+    "bursar",
 ];
 
 #[derive(Debug, Clone)]
@@ -2227,6 +2228,7 @@ clean_cycles_to_unlock = 3
         assert!(!check(&checks, "orchestra").ok);
         assert!(!check(&checks, "bun").ok);
         assert!(!check(&checks, "harness-deck").ok);
+        assert!(!check(&checks, "bursar").ok);
         assert!(check(&checks, "state dir").ok);
     }
 
