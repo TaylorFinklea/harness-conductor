@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -23,6 +23,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
         Some("cycle") => run_cycle(&mut it),
         Some("dispatch") => run_dispatch(&mut it),
         Some("roster") => run_roster(&mut it),
+        Some("route") => run_route(&mut it),
         Some("scan") => run_scan(&mut it),
         Some("status") => run_status(&mut it),
         Some(cmd) => {
@@ -30,6 +31,139 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             print_usage();
             ExitCode::from(2)
         }
+    }
+}
+
+fn run_route(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    match it.next().as_deref() {
+        Some("explain") => run_route_explain(it),
+        None => {
+            eprintln!("usage: conductor route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]");
+            ExitCode::from(2)
+        }
+        Some(sub) => {
+            eprintln!("unknown route subcommand: {sub}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteExplainOptions {
+    repo: PathBuf,
+    tier_floor: crate::config::Tier,
+    complexity: crate::config::Ceiling,
+    intent: Option<crate::route::RouteIntent>,
+    json: bool,
+    config: PathBuf,
+}
+
+fn parse_route_explain_options(args: &[String]) -> Result<RouteExplainOptions, String> {
+    let mut repo = None;
+    let mut tier_floor = None;
+    let mut complexity = None;
+    let mut intent = None;
+    let mut json = false;
+    let mut config_path = PathBuf::from("conductor.toml");
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--repo" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--repo requires a path".to_string())?;
+                repo = Some(PathBuf::from(value));
+            }
+            "--tier-floor" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--tier-floor requires lead, senior, or junior".to_string())?;
+                tier_floor = Some(
+                    value
+                        .parse()
+                        .map_err(|error: crate::config::ConfigError| error.to_string())?,
+                );
+            }
+            "--complexity" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--complexity requires S, M, L, or XL".to_string())?;
+                complexity = Some(
+                    value
+                        .parse()
+                        .map_err(|error: crate::config::ConfigError| error.to_string())?,
+                );
+            }
+            "--intent" => {
+                let value = it.next().ok_or_else(|| {
+                    "--intent requires cheap-work or outside-perspective".to_string()
+                })?;
+                intent = Some(
+                    value
+                        .parse()
+                        .map_err(|error: crate::route::RouteError| error.to_string())?,
+                );
+            }
+            "--json" => json = true,
+            "--config" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_string())?;
+                config_path = PathBuf::from(value);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(RouteExplainOptions {
+        repo: repo.ok_or_else(|| "route explain requires --repo <path>".to_string())?,
+        tier_floor: tier_floor
+            .ok_or_else(|| "route explain requires --tier-floor <value>".to_string())?,
+        complexity: complexity
+            .ok_or_else(|| "route explain requires --complexity <value>".to_string())?,
+        intent,
+        json,
+        config: config_path,
+    })
+}
+
+fn run_route_explain(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let args: Vec<String> = it.collect();
+    let options = match parse_route_explain_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("route explain: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let config = match config::load(&options.config) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let bursar = crate::bursar::CommandBursarClient::new();
+    let output = route_explain_output(&config, &options, &bursar);
+    println!("{output}");
+    ExitCode::SUCCESS
+}
+
+fn route_explain_output(
+    config: &crate::config::Config,
+    options: &RouteExplainOptions,
+    bursar: &dyn crate::bursar::BursarClient,
+) -> String {
+    let routing = crate::fields::RoutingFields {
+        tier_floor: options.tier_floor,
+        complexity: options.complexity,
+        verify_cmd: None,
+        trains_ok: false,
+    };
+    let advice = crate::route::explain(config, &options.repo, &routing, options.intent, bursar);
+    if options.json {
+        serde_json::to_string_pretty(&advice.to_json()).expect("route advice JSON is serializable")
+    } else {
+        advice.human()
     }
 }
 
@@ -711,6 +845,106 @@ mod tests {
     use super::*;
     use crate::scan::{Freshness, RepoSnapshot, SkipReason, ZeroState};
     use std::path::PathBuf;
+
+    #[test]
+    fn route_explain_accepts_read_only_provider_advice_arguments() {
+        let options = parse_route_explain_options(&[
+            "--repo".to_string(),
+            "/tmp/chezmoi-personal".to_string(),
+            "--tier-floor".to_string(),
+            "senior".to_string(),
+            "--complexity".to_string(),
+            "M".to_string(),
+            "--intent".to_string(),
+            "outside-perspective".to_string(),
+            "--json".to_string(),
+            "--config".to_string(),
+            "fixture.toml".to_string(),
+        ])
+        .expect("valid route explain arguments");
+
+        assert_eq!(options.repo, PathBuf::from("/tmp/chezmoi-personal"));
+        assert_eq!(options.tier_floor, crate::config::Tier::Senior);
+        assert_eq!(options.complexity, crate::config::Ceiling::M);
+        assert_eq!(
+            options.intent,
+            Some(crate::route::RouteIntent::OutsidePerspective)
+        );
+        assert!(options.json);
+        assert_eq!(options.config, PathBuf::from("fixture.toml"));
+    }
+
+    #[test]
+    fn route_explain_render_path_has_no_scan_bd_or_mutation_seam() {
+        let source = include_str!("cli.rs");
+        let route_body = source
+            .split("fn run_route_explain")
+            .nth(1)
+            .expect("route command exists")
+            .split("\nfn ")
+            .next()
+            .expect("route command body exists");
+        assert!(!route_body.contains("scan::scan"));
+        assert!(!route_body.contains("CommandBdClient"));
+        assert!(!route_body.contains("claim"));
+        assert!(!route_body.contains("dispatch"));
+        assert!(!route_body.contains("write"));
+    }
+
+    #[test]
+    fn route_explain_renders_human_and_json_from_the_shared_advice() {
+        let config = crate::config::parse_str(
+            r#"
+[budgets]
+use_bursar = false
+
+[[roster]]
+name = "fixture-model"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fixture-dispatch"
+provider = "fixture-provider"
+"#,
+        )
+        .expect("fixture config parses");
+        let human = parse_route_explain_options(&[
+            "--repo".to_string(),
+            "/tmp/advice-repo".to_string(),
+            "--tier-floor".to_string(),
+            "senior".to_string(),
+            "--complexity".to_string(),
+        ])
+        .expect_err("incomplete options are rejected");
+        assert!(human.contains("--complexity"));
+
+        let options = parse_route_explain_options(&[
+            "--repo".to_string(),
+            "/tmp/advice-repo".to_string(),
+            "--tier-floor".to_string(),
+            "senior".to_string(),
+            "--complexity".to_string(),
+            "M".to_string(),
+        ])
+        .expect("complete options parse");
+        let bursar = crate::bursar::test_support::FakeBursarClient::unavailable();
+        let human = route_explain_output(&config, &options, &bursar);
+        assert!(human.contains("selected: fixture-model"));
+        assert!(human.contains("backend=pi"));
+        assert!(human.contains("dispatch_id=fixture-dispatch"));
+        assert!(human.contains("provider=fixture-provider"));
+        assert!(human.contains("action=static-caps"));
+        assert!(human.contains("CANDIDATE AUDIT"));
+
+        let json_options = RouteExplainOptions {
+            json: true,
+            ..options
+        };
+        let json = route_explain_output(&config, &json_options, &bursar);
+        assert!(json.contains("\"selected\""));
+        assert!(json.contains("\"audit\""));
+    }
 
     fn make_snapshot(name: &str, ready_count: usize, skip: Option<SkipReason>) -> RepoSnapshot {
         let is_beads_repo =

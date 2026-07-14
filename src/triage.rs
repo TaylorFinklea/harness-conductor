@@ -223,37 +223,13 @@ fn select_candidate<'a>(
     repo_cost_policy: CostPolicy,
     dispatch_count_by_model: &HashMap<String, u32>,
 ) -> Option<&'a RosterEntry> {
-    // `repo` is consumed by Phase 3's dispatcher to log failover context;
-    // the cost gate uses `repo_cost_policy` directly. Silence the dead-store
-    // here rather than dropping the parameter (keeps the call site stable).
-    let _ = repo;
-    let mut qualifying: Vec<(usize, &RosterEntry)> = roster
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| candidate_rejection(r, routing, repo_cost_policy).is_none())
-        .collect();
-    if qualifying.is_empty() {
-        return None;
-    }
-
-    let min_tier = qualifying.iter().map(|(_, r)| tier_rank(r.tier)).min()?;
-    qualifying.retain(|(_, r)| tier_rank(r.tier) == min_tier);
-
-    let min_efficiency = qualifying
-        .iter()
-        .map(|(_, r)| efficiency_rank(r.efficiency))
-        .min()?;
-    qualifying.retain(|(_, r)| efficiency_rank(r.efficiency) == min_efficiency);
-
-    let min_dispatches = qualifying
-        .iter()
-        .map(|(_, r)| *dispatch_count_by_model.get(&r.name).unwrap_or(&0))
-        .min()?;
-    qualifying
-        .retain(|(_, r)| *dispatch_count_by_model.get(&r.name).unwrap_or(&0) == min_dispatches);
-
-    qualifying.sort_by_key(|(i, _)| *i);
-    qualifying.first().map(|(_, r)| *r)
+    crate::route::select_legacy(
+        roster,
+        routing,
+        repo,
+        repo_cost_policy,
+        dispatch_count_by_model,
+    )
 }
 
 // ---------------------------------------------------------------------------

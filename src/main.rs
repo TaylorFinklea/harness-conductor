@@ -14,6 +14,7 @@ mod ledger;
 mod plan;
 mod ratchet;
 mod roster_drift;
+mod route;
 mod scan;
 mod state;
 mod triage;
