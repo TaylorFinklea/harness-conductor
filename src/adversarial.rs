@@ -8,9 +8,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::BTreeMap, collections::HashSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::bursar::{self, Availability, BudgetAction, BudgetDecision};
+use crate::config::{AdversarialReviewConfig, Cost, Efficiency, RosterEntry, Tier};
 
 const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 const MAX_REVIEW_ID_BYTES: usize = 128;
@@ -46,6 +50,483 @@ pub(crate) struct ArtifactSnapshot {
     pub(crate) review_dir: PathBuf,
     pub(crate) sha256: String,
     pub(crate) size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReviewerSlot {
+    pub(crate) slot: usize,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) alternatives: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct JudgeSlot {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) fallbacks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PanelCandidateAudit {
+    pub(crate) role: String,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) availability: String,
+    pub(crate) outcome: String,
+    pub(crate) reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PanelPlan {
+    pub(crate) reviewers: Vec<ReviewerSlot>,
+    pub(crate) judge: JudgeSlot,
+    pub(crate) audit: Vec<PanelCandidateAudit>,
+}
+
+#[derive(Clone, Copy)]
+struct EligibleCandidate<'a> {
+    entry: &'a RosterEntry,
+    roster_index: usize,
+    action: BudgetAction,
+}
+
+pub(crate) fn plan_panel(
+    roster: &[RosterEntry],
+    config: &AdversarialReviewConfig,
+    provider_snapshot: &BTreeMap<String, BudgetDecision>,
+    reviewer_count: usize,
+    explicit_models: Option<&[String]>,
+) -> Result<PanelPlan> {
+    if reviewer_count == 0 || reviewer_count > config.max_reviewers as usize {
+        return Err(AdversarialError::new(format!(
+            "reviewer count must be between 1 and {}",
+            config.max_reviewers
+        )));
+    }
+    if let Some(models) = explicit_models
+        && models.len() != reviewer_count
+    {
+        return Err(AdversarialError::new(format!(
+            "explicit model list contains {} entries; expected {reviewer_count}",
+            models.len()
+        )));
+    }
+
+    let mut audit = Vec::with_capacity(roster.len() + config.judge_fallbacks.len() + 1);
+    let mut eligible = Vec::new();
+    for (roster_index, entry) in roster.iter().enumerate() {
+        let provider = bursar::normalize_provider_key(&entry.provider);
+        let (decision, reasons) = reviewer_eligibility(entry, &provider, provider_snapshot);
+        let availability = decision.map_or_else(|| "unknown".to_string(), decision_availability);
+        if reasons.is_empty() {
+            eligible.push(EligibleCandidate {
+                entry,
+                roster_index,
+                action: decision
+                    .expect("eligible reviewer has provider decision")
+                    .action,
+            });
+        }
+        audit.push(PanelCandidateAudit {
+            role: "reviewer".to_string(),
+            model: entry.name.clone(),
+            provider,
+            availability,
+            outcome: if reasons.is_empty() {
+                "eligible".to_string()
+            } else {
+                "excluded".to_string()
+            },
+            reasons,
+        });
+    }
+
+    let selected = if let Some(models) = explicit_models {
+        select_explicit_reviewers(roster, &eligible, models, reviewer_count)?
+    } else {
+        select_automatic_reviewers(&eligible, reviewer_count)?
+    };
+    let reviewers = build_reviewer_slots(&eligible, &selected);
+    let selection_reason = if explicit_models.is_some() {
+        "explicit model passed closed-roster, tier, data, health, and provider-distinctness gates"
+    } else {
+        "selected by provider health, then cost, tier, efficiency, and roster order"
+    };
+    for slot in &reviewers {
+        mark_audit_outcome(&mut audit, "reviewer", &slot.model, "selected-reviewer");
+        add_audit_reason(&mut audit, "reviewer", &slot.model, selection_reason);
+        for alternative in &slot.alternatives {
+            mark_audit_outcome(
+                &mut audit,
+                "reviewer",
+                alternative,
+                "approved-same-provider-alternative",
+            );
+            add_audit_reason(
+                &mut audit,
+                "reviewer",
+                alternative,
+                "same-provider alternative ordered by cost, tier, efficiency, and roster order",
+            );
+        }
+    }
+    for row in &mut audit {
+        if row.role == "reviewer" && row.outcome == "eligible" {
+            row.outcome = "eligible-not-selected".to_string();
+        }
+    }
+
+    let (judge, mut judge_audit) = select_judge(roster, config, provider_snapshot, &reviewers)?;
+    audit.append(&mut judge_audit);
+    Ok(PanelPlan {
+        reviewers,
+        judge,
+        audit,
+    })
+}
+
+fn reviewer_eligibility<'a>(
+    entry: &RosterEntry,
+    provider: &str,
+    provider_snapshot: &'a BTreeMap<String, BudgetDecision>,
+) -> (Option<&'a BudgetDecision>, Vec<String>) {
+    let mut reasons = Vec::new();
+    if !matches!(entry.tier, Tier::Senior | Tier::Lead) {
+        reasons.push("reviewers must be Senior or Lead".to_string());
+    }
+    if provider.is_empty() {
+        reasons.push("provider key is empty".to_string());
+    }
+    if entry.cost == Cost::FreeTrainsInput {
+        reasons.push(
+            "free-trains-input is not allowed for proprietary adversarial artifacts".to_string(),
+        );
+    }
+    let decision = provider_snapshot.get(provider);
+    match decision {
+        None => reasons.push("provider is absent from the trusted snapshot".to_string()),
+        Some(decision) if !decision_is_eligible(decision) => reasons.push(format!(
+            "provider is not eligible: {}",
+            decision.availability.map_or_else(
+                || decision.action.label().to_string(),
+                |value| value.to_string()
+            )
+        )),
+        Some(_) => {}
+    }
+    (decision, reasons)
+}
+
+fn select_explicit_reviewers<'a>(
+    roster: &'a [RosterEntry],
+    eligible: &[EligibleCandidate<'a>],
+    models: &[String],
+    reviewer_count: usize,
+) -> Result<Vec<EligibleCandidate<'a>>> {
+    if models.len() != reviewer_count {
+        return Err(AdversarialError::new("explicit reviewer count mismatch"));
+    }
+    let mut names = HashSet::new();
+    let mut providers = HashSet::new();
+    let mut selected: Vec<EligibleCandidate<'a>> = Vec::with_capacity(models.len());
+    for model in models {
+        if !names.insert(model.as_str()) {
+            return Err(AdversarialError::new(format!(
+                "explicit reviewer model is duplicated: {model}"
+            )));
+        }
+        let entry = roster
+            .iter()
+            .find(|entry| entry.name == *model)
+            .ok_or_else(|| {
+                AdversarialError::new(format!(
+                    "explicit reviewer is not in the closed roster: {model}"
+                ))
+            })?;
+        let candidate = eligible
+            .iter()
+            .find(|candidate| candidate.entry.name == entry.name)
+            .copied()
+            .ok_or_else(|| {
+                AdversarialError::new(format!(
+                    "explicit reviewer does not satisfy tier, data, or provider gates: {model}"
+                ))
+            })?;
+        let provider = bursar::normalize_provider_key(&candidate.entry.provider);
+        if !providers.insert(provider.clone()) {
+            return Err(AdversarialError::new(format!(
+                "explicit reviewers do not use distinct providers: {provider}"
+            )));
+        }
+        if selected
+            .iter()
+            .any(|other| same_dispatch_identity(other.entry, candidate.entry))
+        {
+            return Err(AdversarialError::new(format!(
+                "explicit reviewer aliases an already selected dispatch identity: {model}"
+            )));
+        }
+        selected.push(candidate);
+    }
+    Ok(selected)
+}
+
+fn select_automatic_reviewers<'a>(
+    eligible: &[EligibleCandidate<'a>],
+    reviewer_count: usize,
+) -> Result<Vec<EligibleCandidate<'a>>> {
+    let mut groups: BTreeMap<String, Vec<EligibleCandidate<'a>>> = BTreeMap::new();
+    for candidate in eligible {
+        groups
+            .entry(bursar::normalize_provider_key(&candidate.entry.provider))
+            .or_default()
+            .push(*candidate);
+    }
+    for candidates in groups.values_mut() {
+        candidates.sort_by_key(candidate_key);
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(provider, candidates)| {
+        (
+            health_rank(candidates[0].action),
+            candidate_key(&candidates[0]),
+            provider.clone(),
+        )
+    });
+    if groups.len() < reviewer_count {
+        return Err(AdversarialError::new(format!(
+            "provider shortfall: requested {reviewer_count} distinct reviewers but only {} eligible provider groups remain ({})",
+            groups.len(),
+            groups
+                .iter()
+                .map(|(provider, _)| provider.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(groups
+        .into_iter()
+        .take(reviewer_count)
+        .map(|(_, candidates)| candidates[0])
+        .collect())
+}
+
+fn build_reviewer_slots<'a>(
+    eligible: &[EligibleCandidate<'a>],
+    selected: &[EligibleCandidate<'a>],
+) -> Vec<ReviewerSlot> {
+    selected
+        .iter()
+        .enumerate()
+        .map(|(index, primary)| {
+            let provider = bursar::normalize_provider_key(&primary.entry.provider);
+            let mut alternatives = eligible
+                .iter()
+                .filter(|candidate| {
+                    bursar::normalize_provider_key(&candidate.entry.provider) == provider
+                        && candidate.entry.name != primary.entry.name
+                        && !same_dispatch_identity(candidate.entry, primary.entry)
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            alternatives.sort_by_key(candidate_key);
+            ReviewerSlot {
+                slot: index + 1,
+                model: primary.entry.name.clone(),
+                provider,
+                alternatives: alternatives
+                    .into_iter()
+                    .take(2)
+                    .map(|candidate| candidate.entry.name.clone())
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn select_judge(
+    roster: &[RosterEntry],
+    config: &AdversarialReviewConfig,
+    provider_snapshot: &BTreeMap<String, BudgetDecision>,
+    reviewers: &[ReviewerSlot],
+) -> Result<(JudgeSlot, Vec<PanelCandidateAudit>)> {
+    let reviewer_chain = reviewers
+        .iter()
+        .flat_map(|slot| std::iter::once(&slot.model).chain(slot.alternatives.iter()))
+        .filter_map(|name| roster.iter().find(|entry| entry.name == *name))
+        .collect::<Vec<_>>();
+    let chain = std::iter::once(&config.judge)
+        .chain(config.judge_fallbacks.iter())
+        .collect::<Vec<_>>();
+    let mut eligible = Vec::new();
+    let mut audit = Vec::with_capacity(chain.len());
+    for name in chain {
+        let mut reasons = Vec::new();
+        let entry = roster.iter().find(|entry| entry.name == *name);
+        let provider = entry.map_or_else(String::new, |entry| {
+            bursar::normalize_provider_key(&entry.provider)
+        });
+        let decision = provider_snapshot.get(&provider);
+        match entry {
+            None => reasons.push("judge is not in the closed roster".to_string()),
+            Some(entry) => {
+                if entry.tier != Tier::Lead {
+                    reasons.push("judge must be Lead".to_string());
+                }
+                if entry.cost == Cost::FreeTrainsInput {
+                    reasons.push(
+                        "free-trains-input is not allowed for proprietary adversarial artifacts"
+                            .to_string(),
+                    );
+                }
+                if reviewer_chain
+                    .iter()
+                    .any(|reviewer| same_dispatch_identity(reviewer, entry))
+                {
+                    reasons.push("judge duplicates an approved reviewer identity".to_string());
+                }
+            }
+        }
+        match decision {
+            None => reasons.push("judge provider is absent from the trusted snapshot".to_string()),
+            Some(decision) if !decision_is_eligible(decision) => {
+                reasons.push("judge provider is exhausted or unknown".to_string());
+            }
+            Some(_) => {}
+        }
+        if reasons.is_empty() {
+            eligible.push(entry.expect("eligible judge has roster entry"));
+        }
+        audit.push(PanelCandidateAudit {
+            role: "judge".to_string(),
+            model: name.clone(),
+            provider,
+            availability: decision.map_or_else(|| "unknown".to_string(), decision_availability),
+            outcome: if reasons.is_empty() {
+                "eligible".to_string()
+            } else {
+                "excluded".to_string()
+            },
+            reasons,
+        });
+    }
+    let Some(selected) = eligible.first() else {
+        return Err(AdversarialError::new(
+            "judge shortfall: no approved Lead judge remains eligible",
+        ));
+    };
+    let fallbacks = eligible
+        .iter()
+        .skip(1)
+        .filter(|entry| !same_dispatch_identity(selected, entry))
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>();
+    mark_audit_outcome(&mut audit, "judge", &selected.name, "selected-judge");
+    add_audit_reason(
+        &mut audit,
+        "judge",
+        &selected.name,
+        "first eligible non-reviewer Lead in the configured judge chain",
+    );
+    for fallback in &fallbacks {
+        mark_audit_outcome(&mut audit, "judge", fallback, "approved-judge-fallback");
+        add_audit_reason(
+            &mut audit,
+            "judge",
+            fallback,
+            "later eligible Lead in the configured judge chain",
+        );
+    }
+    Ok((
+        JudgeSlot {
+            model: selected.name.clone(),
+            provider: bursar::normalize_provider_key(&selected.provider),
+            fallbacks,
+        },
+        audit,
+    ))
+}
+
+fn candidate_key(candidate: &EligibleCandidate<'_>) -> (u8, u8, u8, usize) {
+    (
+        cost_rank(candidate.entry.cost),
+        reviewer_tier_rank(candidate.entry.tier),
+        efficiency_rank(candidate.entry.efficiency),
+        candidate.roster_index,
+    )
+}
+
+fn cost_rank(cost: Cost) -> u8 {
+    match cost {
+        Cost::Free => 0,
+        Cost::Paid => 1,
+        Cost::FreeTrainsInput => 2,
+    }
+}
+
+fn reviewer_tier_rank(tier: Tier) -> u8 {
+    match tier {
+        Tier::Lead => 0,
+        Tier::Senior => 1,
+        Tier::Junior => 2,
+    }
+}
+
+fn efficiency_rank(efficiency: Efficiency) -> u8 {
+    match efficiency {
+        Efficiency::Lean => 0,
+        Efficiency::Std => 1,
+        Efficiency::Heavy => 2,
+    }
+}
+
+fn health_rank(action: BudgetAction) -> u8 {
+    match action {
+        BudgetAction::Proceed | BudgetAction::StaticCaps => 0,
+        BudgetAction::SpendCautiously => 1,
+        BudgetAction::Defer => 2,
+    }
+}
+
+fn same_dispatch_identity(left: &RosterEntry, right: &RosterEntry) -> bool {
+    left.backend == right.backend
+        && left.dispatch_id == right.dispatch_id
+        && left.reasoning_effort == right.reasoning_effort
+}
+
+fn decision_availability(decision: &BudgetDecision) -> String {
+    decision.availability.map_or_else(
+        || decision.action.label().to_string(),
+        |availability| availability.to_string(),
+    )
+}
+
+fn decision_is_eligible(decision: &BudgetDecision) -> bool {
+    matches!(
+        (decision.action, decision.availability),
+        (BudgetAction::Proceed, Some(Availability::Healthy))
+            | (BudgetAction::SpendCautiously, Some(Availability::Caution))
+            | (BudgetAction::StaticCaps, None)
+    )
+}
+
+fn mark_audit_outcome(audit: &mut [PanelCandidateAudit], role: &str, model: &str, outcome: &str) {
+    if let Some(row) = audit
+        .iter_mut()
+        .find(|row| row.role == role && row.model == model)
+    {
+        row.outcome = outcome.to_string();
+    }
+}
+
+fn add_audit_reason(audit: &mut [PanelCandidateAudit], role: &str, model: &str, reason: &str) {
+    if let Some(row) = audit
+        .iter_mut()
+        .find(|row| row.role == role && row.model == model)
+    {
+        row.reasons.push(reason.to_string());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,9 +841,322 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bursar::Availability;
+    use crate::config::{Backend, Ceiling};
     use sha2::{Digest, Sha256};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn panel_distinct_providers_health_and_deterministic_ordering() {
+        let roster = vec![
+            panel_roster_entry(
+                "p1-paid-lead",
+                Tier::Lead,
+                "provider-one",
+                Cost::Paid,
+                Efficiency::Lean,
+                "p1-paid-lead",
+            ),
+            panel_roster_entry(
+                "p1-free-senior",
+                Tier::Senior,
+                "provider-one",
+                Cost::Free,
+                Efficiency::Lean,
+                "p1-free-senior",
+            ),
+            panel_roster_entry(
+                "p1-free-lead",
+                Tier::Lead,
+                "provider-one",
+                Cost::Free,
+                Efficiency::Heavy,
+                "p1-free-lead",
+            ),
+            panel_roster_entry(
+                "caution-free-lead",
+                Tier::Lead,
+                "provider-two",
+                Cost::Free,
+                Efficiency::Lean,
+                "caution-free-lead",
+            ),
+            panel_roster_entry(
+                "healthy-paid-senior",
+                Tier::Senior,
+                "provider-three",
+                Cost::Paid,
+                Efficiency::Std,
+                "healthy-paid-senior",
+            ),
+            panel_roster_entry(
+                "judge",
+                Tier::Lead,
+                "provider-two",
+                Cost::Paid,
+                Efficiency::Heavy,
+                "judge",
+            ),
+        ];
+        let config = panel_config("judge", &[]);
+        let providers = panel_provider_snapshot(&[
+            ("provider-one", Availability::Healthy),
+            ("provider-two", Availability::Caution),
+            ("provider-three", Availability::Healthy),
+        ]);
+
+        let panel = plan_panel(&roster, &config, &providers, 2, None).expect("panel plans");
+
+        assert_eq!(
+            panel
+                .reviewers
+                .iter()
+                .map(|slot| slot.provider.as_str())
+                .collect::<Vec<_>>(),
+            ["provider-one", "provider-three"]
+        );
+        assert_eq!(panel.reviewers[0].model, "p1-free-lead");
+        assert_eq!(
+            panel.reviewers[0].alternatives,
+            ["p1-free-senior", "p1-paid-lead"]
+        );
+        let selected_audit = panel
+            .audit
+            .iter()
+            .find(|row| row.role == "reviewer" && row.model == "p1-free-lead")
+            .expect("selected reviewer audited");
+        assert!(!selected_audit.reasons.is_empty());
+        assert_eq!(panel.judge.model, "judge");
+    }
+
+    #[test]
+    fn panel_shortfall_never_duplicates_a_provider() {
+        let roster = vec![
+            panel_roster_entry(
+                "one-a",
+                Tier::Senior,
+                "provider-one",
+                Cost::Paid,
+                Efficiency::Lean,
+                "one-a",
+            ),
+            panel_roster_entry(
+                "one-b",
+                Tier::Lead,
+                "provider-one",
+                Cost::Paid,
+                Efficiency::Std,
+                "one-b",
+            ),
+            panel_roster_entry(
+                "judge",
+                Tier::Lead,
+                "provider-two",
+                Cost::Paid,
+                Efficiency::Heavy,
+                "judge",
+            ),
+        ];
+        let providers = panel_provider_snapshot(&[
+            ("provider-one", Availability::Healthy),
+            ("provider-two", Availability::Healthy),
+        ]);
+
+        let error = plan_panel(&roster, &panel_config("judge", &[]), &providers, 3, None)
+            .expect_err("two providers cannot fill three reviewer slots");
+        assert!(error.to_string().contains("provider shortfall"));
+        assert!(error.to_string().contains("only 2"));
+    }
+
+    #[test]
+    fn panel_explicit_models_cannot_bypass_closed_roster_health_tier_or_distinctness() {
+        let roster = vec![
+            panel_roster_entry(
+                "one-a",
+                Tier::Senior,
+                "provider-one",
+                Cost::Paid,
+                Efficiency::Lean,
+                "one-a",
+            ),
+            panel_roster_entry(
+                "one-b",
+                Tier::Lead,
+                "provider-one",
+                Cost::Paid,
+                Efficiency::Std,
+                "one-b",
+            ),
+            panel_roster_entry(
+                "junior",
+                Tier::Junior,
+                "provider-two",
+                Cost::Free,
+                Efficiency::Lean,
+                "junior",
+            ),
+            panel_roster_entry(
+                "exhausted",
+                Tier::Senior,
+                "provider-three",
+                Cost::Paid,
+                Efficiency::Lean,
+                "exhausted",
+            ),
+            panel_roster_entry(
+                "judge",
+                Tier::Lead,
+                "provider-four",
+                Cost::Paid,
+                Efficiency::Heavy,
+                "judge",
+            ),
+        ];
+        let providers = panel_provider_snapshot(&[
+            ("provider-one", Availability::Healthy),
+            ("provider-two", Availability::Healthy),
+            ("provider-three", Availability::Exhausted),
+            ("provider-four", Availability::Healthy),
+        ]);
+        let config = panel_config("judge", &[]);
+        for models in [
+            vec!["one-a".to_string()],
+            vec!["one-a".to_string(), "missing".to_string()],
+            vec!["one-a".to_string(), "one-b".to_string()],
+            vec!["one-a".to_string(), "junior".to_string()],
+            vec!["one-a".to_string(), "exhausted".to_string()],
+        ] {
+            assert!(
+                plan_panel(&roster, &config, &providers, 2, Some(&models)).is_err(),
+                "explicit gate bypassed for {models:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_judge_excludes_reviewer_identity_and_uses_configured_lead_chain() {
+        let roster = vec![
+            panel_roster_entry(
+                "reviewer",
+                Tier::Senior,
+                "provider-one",
+                Cost::Paid,
+                Efficiency::Lean,
+                "shared-dispatch",
+            ),
+            panel_roster_entry(
+                "judge-alias",
+                Tier::Lead,
+                "provider-two",
+                Cost::Paid,
+                Efficiency::Heavy,
+                "shared-dispatch",
+            ),
+            panel_roster_entry(
+                "judge-fallback",
+                Tier::Lead,
+                "provider-three",
+                Cost::Paid,
+                Efficiency::Std,
+                "judge-fallback",
+            ),
+        ];
+        let providers = panel_provider_snapshot(&[
+            ("provider-one", Availability::Healthy),
+            ("provider-two", Availability::Healthy),
+            ("provider-three", Availability::Caution),
+        ]);
+        let explicit = vec!["reviewer".to_string()];
+
+        let panel = plan_panel(
+            &roster,
+            &panel_config("judge-alias", &["judge-fallback"]),
+            &providers,
+            1,
+            Some(&explicit),
+        )
+        .expect("fallback judge remains eligible");
+
+        assert_eq!(panel.judge.model, "judge-fallback");
+        assert!(panel.judge.fallbacks.is_empty());
+        let alias = panel
+            .audit
+            .iter()
+            .find(|row| row.role == "judge" && row.model == "judge-alias")
+            .expect("judge alias audited");
+        assert_eq!(alias.outcome, "excluded");
+        assert!(
+            alias
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("duplicates"))
+        );
+    }
+
+    #[test]
+    fn panel_audit_retains_provider_and_data_policy_exclusions() {
+        let roster = vec![
+            panel_roster_entry(
+                "selected",
+                Tier::Senior,
+                "provider-one",
+                Cost::Paid,
+                Efficiency::Lean,
+                "selected",
+            ),
+            panel_roster_entry(
+                "training",
+                Tier::Lead,
+                "provider-two",
+                Cost::FreeTrainsInput,
+                Efficiency::Lean,
+                "training",
+            ),
+            panel_roster_entry(
+                "unknown",
+                Tier::Senior,
+                "provider-three",
+                Cost::Paid,
+                Efficiency::Lean,
+                "unknown",
+            ),
+            panel_roster_entry(
+                "judge",
+                Tier::Lead,
+                "provider-four",
+                Cost::Paid,
+                Efficiency::Heavy,
+                "judge",
+            ),
+        ];
+        let providers = panel_provider_snapshot(&[
+            ("provider-one", Availability::Healthy),
+            ("provider-two", Availability::Healthy),
+            ("provider-three", Availability::Unknown),
+            ("provider-four", Availability::Healthy),
+        ]);
+        let explicit = vec!["selected".to_string()];
+
+        let panel = plan_panel(
+            &roster,
+            &panel_config("judge", &[]),
+            &providers,
+            1,
+            Some(&explicit),
+        )
+        .expect("one valid reviewer and judge");
+
+        for model in ["training", "unknown"] {
+            let row = panel
+                .audit
+                .iter()
+                .find(|row| row.role == "reviewer" && row.model == model)
+                .expect("candidate audited");
+            assert_eq!(row.outcome, "excluded");
+            assert!(!row.reasons.is_empty());
+        }
+    }
 
     #[test]
     fn artifact_snapshot_preserves_exact_bytes_hash_and_atomic_state() {
@@ -481,6 +1275,70 @@ mod tests {
         assert!(snapshot_artifact(&artifact, &state, "../escape").is_err());
         snapshot_artifact(&artifact, &state, "review-once").expect("first snapshot");
         assert!(snapshot_artifact(&artifact, &state, "review-once").is_err());
+    }
+
+    fn panel_roster_entry(
+        name: &str,
+        tier: Tier,
+        provider: &str,
+        cost: Cost,
+        efficiency: Efficiency,
+        dispatch_id: &str,
+    ) -> RosterEntry {
+        RosterEntry {
+            name: name.to_string(),
+            tier,
+            ceiling: Ceiling::Xl,
+            efficiency,
+            backend: Backend::Pi,
+            dispatch_id: dispatch_id.to_string(),
+            reasoning_effort: None,
+            provider: provider.to_string(),
+            cost,
+            fallback: Vec::new(),
+        }
+    }
+
+    fn panel_config(judge: &str, fallbacks: &[&str]) -> AdversarialReviewConfig {
+        AdversarialReviewConfig {
+            max_reviewers: 7,
+            parallel: 3,
+            judge: judge.to_string(),
+            judge_fallbacks: fallbacks
+                .iter()
+                .map(|fallback| (*fallback).to_string())
+                .collect(),
+        }
+    }
+
+    fn panel_provider_snapshot(
+        providers: &[(&str, Availability)],
+    ) -> BTreeMap<String, BudgetDecision> {
+        providers
+            .iter()
+            .map(|(provider, availability)| {
+                let action = match availability {
+                    Availability::Healthy => BudgetAction::Proceed,
+                    Availability::Caution => BudgetAction::SpendCautiously,
+                    Availability::Exhausted | Availability::Unknown => BudgetAction::Defer,
+                };
+                (
+                    bursar::normalize_provider_key(provider),
+                    BudgetDecision {
+                        provider: bursar::normalize_provider_key(provider),
+                        model: None,
+                        availability: Some(*availability),
+                        source: Some("test".to_string()),
+                        checked_at: None,
+                        data_as_of: None,
+                        expires_at: None,
+                        expiry_basis: None,
+                        action,
+                        summary: "test provider state".to_string(),
+                    },
+                )
+            })
+            .collect()
     }
 
     struct TempDir(PathBuf);

@@ -327,6 +327,54 @@ pub(crate) fn canonical_provider_key(provider: &str) -> &str {
     }
 }
 
+pub(crate) fn normalize_provider_key(provider: &str) -> String {
+    canonical_provider_key(provider.trim()).to_ascii_lowercase()
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct SnapshotBursarClient {
+    result: Result<StatusReport>,
+}
+
+impl BursarClient for SnapshotBursarClient {
+    fn status(&self) -> Result<StatusReport> {
+        self.result.clone()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn evaluate_provider_snapshot<C, I, S>(
+    client: &C,
+    providers: I,
+    use_bursar: bool,
+) -> BTreeMap<String, BudgetDecision>
+where
+    C: BursarClient + ?Sized,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let result = if use_bursar {
+        client.status()
+    } else {
+        Err(BursarError::unavailable(
+            "bursar intentionally bypassed by static caps",
+        ))
+    };
+    let snapshot = SnapshotBursarClient { result };
+    providers
+        .into_iter()
+        .map(|provider| normalize_provider_key(provider.as_ref()))
+        .filter(|provider| !provider.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|provider| {
+            let decision = evaluate_budget(&snapshot, &provider, use_bursar);
+            (provider, decision)
+        })
+        .collect()
+}
+
 pub(crate) fn evaluate_budget<C: BursarClient + ?Sized>(
     client: &C,
     provider: &str,
@@ -703,6 +751,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use test_support::FakeBursarClient;
 
     #[derive(Clone)]
@@ -727,6 +776,40 @@ mod tests {
             result: serde_json::from_str(json)
                 .map_err(|error| BursarError::json(error.to_string())),
         }
+    }
+
+    #[test]
+    fn provider_snapshot_normalizes_deduplicates_and_reads_bursar_once() {
+        struct CountingClient {
+            report: StatusReport,
+            calls: Cell<usize>,
+        }
+
+        impl BursarClient for CountingClient {
+            fn status(&self) -> Result<StatusReport> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(self.report.clone())
+            }
+        }
+
+        let report = FakeBursarClient::with_provider_availabilities(&[
+            ("codex", Availability::Healthy),
+            ("anthropic", Availability::Caution),
+        ])
+        .status()
+        .unwrap();
+        let client = CountingClient {
+            report,
+            calls: Cell::new(0),
+        };
+
+        let snapshot =
+            evaluate_provider_snapshot(&client, ["openai-codex", "codex", " Anthropic "], true);
+
+        assert_eq!(client.calls.get(), 1);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot["codex"].action, BudgetAction::Proceed);
+        assert_eq!(snapshot["anthropic"].action, BudgetAction::SpendCautiously);
     }
 
     #[test]
