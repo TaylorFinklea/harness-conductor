@@ -1,7 +1,7 @@
 # current-state.md — conductor
 
 Branch: codex/provider-trust-p1
-`cargo test` green (275 unit + 1 integration); strict Clippy clean.
+`cargo test` green (282 unit + 1 integration); strict Clippy clean.
 Rebrand `harness-conductor` → `conductor` COMPLETE (2026-07-12): source refs, GitHub repos (incl. `backlog-conductor`), dir move, `chezmoi apply`, live HOME verified clean; `conductor config check` passes.
 
 ## Plan
@@ -14,7 +14,7 @@ Rebrand `harness-conductor` → `conductor` COMPLETE (2026-07-12): source refs, 
 - [x] conductor-5ij: cycle selector parsing and enforcement. Verify: `cargo test cycle::tests deck::tests cli::tests`
 - [x] conductor-xa5: bind dispatch to persisted scope; proposals inert when unscoped. Verify: `cargo test`
 - [x] conductor-8z8: bounded-approval final gates and report. Verify: `cargo test`
-- [ ] conductor-i8r: adversarial config and artifact snapshot. Verify: `cargo test config::tests adversarial::tests::artifact_`
+- [x] conductor-i8r: adversarial config and artifact snapshot. Verify: `cargo test config::tests adversarial::tests::artifact_`
 - [ ] conductor-0zv: distinct-provider reviewer panel plus Lead judge. Verify: `cargo test adversarial::tests::panel_ bursar::tests`
 - [ ] conductor-b35: immutable review approval envelope. Verify: `cargo test adversarial::tests::approval_ deck::tests`
 - [ ] conductor-2cr: bounded read-only reviewers and schema repair. Verify: `cargo test adversarial::tests::reviewer_ adversarial::tests::parallel_ dispatch::tests`

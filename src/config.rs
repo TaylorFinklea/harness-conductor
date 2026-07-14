@@ -437,6 +437,25 @@ impl Default for ArenaConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdversarialReviewConfig {
+    pub(crate) max_reviewers: u32,
+    pub(crate) parallel: u32,
+    pub(crate) judge: String,
+    pub(crate) judge_fallbacks: Vec<String>,
+}
+
+impl Default for AdversarialReviewConfig {
+    fn default() -> Self {
+        Self {
+            max_reviewers: 7,
+            parallel: 3,
+            judge: String::new(),
+            judge_fallbacks: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) autonomy: Autonomy,
@@ -448,6 +467,7 @@ pub(crate) struct Config {
     /// the month-1 narrow posture (junior / S) — see `RatchetCeiling`.
     pub(crate) ratchet: RatchetCeiling,
     pub(crate) arena: ArenaConfig,
+    pub(crate) adversarial_review: AdversarialReviewConfig,
     pub(crate) roster: Vec<RosterEntry>,
     /// Per-repo `[[repo_policy]]` entries; absent repos default to
     /// `CostPolicy::Proprietary` (fail closed for `FreeTrainsInput`).
@@ -885,6 +905,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "review"
                 | "ratchet"
                 | "arena"
+                | "adversarial_review"
                 | "arena_profile"
                 | "arena_judge"
                 | "roster"
@@ -909,6 +930,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         doc.get("arena_judge"),
     )?;
     let roster = parse_roster(doc.get("roster"))?;
+    let adversarial_review = parse_adversarial_review(doc.get("adversarial_review"), &roster)?;
     let repo_policies = parse_repo_policies(doc.get("repo_policy"), &roster)?;
     Ok(Config {
         autonomy,
@@ -918,9 +940,97 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         review,
         ratchet,
         arena,
+        adversarial_review,
         roster,
         repo_policies,
     })
+}
+
+fn parse_adversarial_review(
+    node: Option<&Node>,
+    roster: &[RosterEntry],
+) -> Result<AdversarialReviewConfig> {
+    let mut config = AdversarialReviewConfig::default();
+    if let Some(node) = node {
+        let Node::Table(table) = node else {
+            return Err(ConfigError::new("adversarial_review must be a table"));
+        };
+        for (key, value) in table {
+            match key.as_str() {
+                "max_reviewers" => {
+                    config.max_reviewers = expect_u32("adversarial_review.max_reviewers", value)?;
+                }
+                "parallel" => {
+                    config.parallel = expect_u32("adversarial_review.parallel", value)?;
+                }
+                "judge" => config.judge = expect_str("adversarial_review.judge", value)?,
+                "judge_fallbacks" => {
+                    config.judge_fallbacks =
+                        expect_str_arr("adversarial_review.judge_fallbacks", value)?;
+                }
+                other => {
+                    return Err(ConfigError::new(format!(
+                        "unknown adversarial_review key: {other}"
+                    )));
+                }
+            }
+        }
+        if config.judge.is_empty() {
+            return Err(ConfigError::new(
+                "adversarial_review.judge must name a Lead roster entry",
+            ));
+        }
+    }
+    if !(1..=7).contains(&config.max_reviewers) {
+        return Err(ConfigError::new(
+            "adversarial_review.max_reviewers must be between 1 and 7",
+        ));
+    }
+    if config.parallel == 0 || config.parallel > config.max_reviewers {
+        return Err(ConfigError::new(
+            "adversarial_review.parallel must be between 1 and max_reviewers",
+        ));
+    }
+    if config.judge.is_empty() {
+        if config.judge_fallbacks.is_empty() {
+            return Ok(config);
+        }
+        return Err(ConfigError::new(
+            "adversarial_review.judge_fallbacks require a configured judge",
+        ));
+    }
+
+    require_lead_roster_entry(roster, "adversarial_review.judge", &config.judge)?;
+    let mut seen = HashSet::new();
+    for fallback in &config.judge_fallbacks {
+        if fallback == &config.judge {
+            return Err(ConfigError::new(
+                "adversarial_review.judge cannot also be a judge fallback",
+            ));
+        }
+        if !seen.insert(fallback.as_str()) {
+            return Err(ConfigError::new(format!(
+                "duplicate adversarial_review judge fallback: {fallback}"
+            )));
+        }
+        require_lead_roster_entry(roster, "adversarial_review.judge_fallbacks", fallback)?;
+    }
+    Ok(config)
+}
+
+fn require_lead_roster_entry(roster: &[RosterEntry], field: &str, name: &str) -> Result<()> {
+    let entry = roster
+        .iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| {
+            ConfigError::new(format!("{field} references unknown roster entry {name}"))
+        })?;
+    if entry.tier != Tier::Lead {
+        return Err(ConfigError::new(format!(
+            "{field} roster entry {name} must have tier lead"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_scan(node: Option<&Node>) -> Result<ScanConfig> {
@@ -1801,6 +1911,13 @@ mod tests {
         assert!(!cfg.verify.always_orchestra);
         assert!(cfg.review.enabled);
         assert_eq!(cfg.review.min_tier_gap, 1);
+        assert_eq!(cfg.adversarial_review.max_reviewers, 7);
+        assert_eq!(cfg.adversarial_review.parallel, 3);
+        assert_eq!(cfg.adversarial_review.judge, "gpt-5.6-sol");
+        assert_eq!(
+            cfg.adversarial_review.judge_fallbacks,
+            ["gpt-5.6-terra", "opus-4.8"]
+        );
         // ratchet: month-1 default-narrow posture (ADR 2026-07-03) since
         // the checked-in conductor.toml does not set [ratchet].
         assert_eq!(cfg.ratchet.max_tier_floor, Tier::Junior);
@@ -1952,6 +2069,97 @@ dispatch_id = \"claude-sonnet-5\"
         let cfg = parse_str("").expect("empty input");
         assert!(cfg.roster.is_empty());
         assert_eq!(cfg.scan.root, "~/git");
+    }
+
+    #[test]
+    fn adversarial_defaults_and_valid_closed_roster_judge() {
+        let defaults = parse_str("").expect("defaults parse");
+        assert_eq!(defaults.adversarial_review.max_reviewers, 7);
+        assert_eq!(defaults.adversarial_review.parallel, 3);
+        assert!(defaults.adversarial_review.judge.is_empty());
+        assert!(defaults.adversarial_review.judge_fallbacks.is_empty());
+
+        let source = r#"
+[adversarial_review]
+max_reviewers = 5
+parallel = 2
+judge = "lead-a"
+judge_fallbacks = ["lead-b"]
+
+[[roster]]
+name = "lead-a"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "claude"
+dispatch_id = "lead-a"
+
+[[roster]]
+name = "lead-b"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "claude"
+dispatch_id = "lead-b"
+"#;
+        let cfg = parse_str(source).expect("valid adversarial config");
+        assert_eq!(cfg.adversarial_review.max_reviewers, 5);
+        assert_eq!(cfg.adversarial_review.parallel, 2);
+        assert_eq!(cfg.adversarial_review.judge, "lead-a");
+        assert_eq!(cfg.adversarial_review.judge_fallbacks, ["lead-b"]);
+    }
+
+    #[test]
+    fn adversarial_reviewer_bounds_and_unknown_keys_fail_closed() {
+        for source in [
+            "[adversarial_review]\nmax_reviewers = 0\n",
+            "[adversarial_review]\nmax_reviewers = 8\n",
+            "[adversarial_review]\nparallel = 0\n",
+            "[adversarial_review]\nmax_reviewers = 2\nparallel = 3\n",
+            "[adversarial_review]\nextra = 1\n",
+        ] {
+            assert!(parse_str(source).is_err(), "unexpected success: {source}");
+        }
+        for max_reviewers in [1, 7] {
+            let source = format!(
+                "[adversarial_review]\nmax_reviewers = {max_reviewers}\nparallel = 1\njudge = \"lead\"\n\
+                 [[roster]]\nname = \"lead\"\ntier = \"lead\"\nceiling = \"XL\"\n\
+                 efficiency = \"heavy\"\nbackend = \"claude\"\ndispatch_id = \"lead\"\n"
+            );
+            assert!(parse_str(&source).is_ok(), "unexpected failure: {source}");
+        }
+    }
+
+    #[test]
+    fn adversarial_judge_and_fallbacks_must_be_distinct_closed_roster_leads() {
+        let roster = r#"
+[[roster]]
+name = "lead"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "claude"
+dispatch_id = "lead"
+
+[[roster]]
+name = "senior"
+tier = "senior"
+ceiling = "L"
+efficiency = "std"
+backend = "pi"
+dispatch_id = "provider/senior"
+"#;
+        for table in [
+            "[adversarial_review]\njudge = \"missing\"\n",
+            "[adversarial_review]\njudge = \"senior\"\n",
+            "[adversarial_review]\njudge = \"lead\"\njudge_fallbacks = [\"missing\"]\n",
+            "[adversarial_review]\njudge = \"lead\"\njudge_fallbacks = [\"senior\"]\n",
+            "[adversarial_review]\njudge = \"lead\"\njudge_fallbacks = [\"lead\"]\n",
+            "[adversarial_review]\njudge = \"lead\"\njudge_fallbacks = [\"senior\", \"senior\"]\n",
+        ] {
+            let source = format!("{table}{roster}");
+            assert!(parse_str(&source).is_err(), "unexpected success: {table}");
+        }
     }
 
     #[test]

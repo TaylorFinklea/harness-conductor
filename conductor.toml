@@ -94,6 +94,13 @@ always_orchestra = false
 enabled = true
 min_tier_gap = 1
 
+[adversarial_review]
+# N provider-distinct reviewers plus one additional Lead synthesis call.
+max_reviewers = 7
+parallel = 3
+judge = "gpt-5.6-sol"
+judge_fallbacks = ["gpt-5.6-terra", "opus-4.8"]
+
 [arena]
 # Head-to-head Ralph arena defaults. Candidate runs are capped low and the
 # scheduler will not run two profiles with the same provider_group together.
