@@ -318,7 +318,7 @@ fn read_freshness(repo: &Path) -> Freshness {
     }
 }
 
-fn expand_tilde(path: &str) -> Result<PathBuf, ScanError> {
+pub(crate) fn expand_tilde(path: &str) -> Result<PathBuf, ScanError> {
     if !path.starts_with('~') {
         return Ok(PathBuf::from(path));
     }

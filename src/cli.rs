@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -711,32 +711,64 @@ fn run_status(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CycleOptions {
+    dry_run: bool,
+    config: PathBuf,
+    scope: crate::cycle::CycleScopeRequest,
+}
+
+fn parse_cycle_options(args: &[String]) -> Result<CycleOptions, String> {
     let mut dry_run = false;
     let mut config_path = PathBuf::from("conductor.toml");
+    let mut repos = Vec::new();
+    let mut only = Vec::new();
+    let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--repo" => repos.push(
+                it.next()
+                    .ok_or_else(|| "--repo requires a name or path".to_string())?
+                    .clone(),
+            ),
+            "--only" => only.push(
+                it.next()
+                    .ok_or_else(|| "--only requires <repo>:<issue-id>".to_string())?
+                    .clone(),
+            ),
             "--config" => {
-                let Some(p) = it.next() else {
-                    eprintln!("--config requires a path argument");
-                    return ExitCode::from(2);
-                };
-                config_path = PathBuf::from(p);
+                config_path = PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| "--config requires a path argument".to_string())?,
+                );
             }
-            other => {
-                eprintln!("unknown argument: {other}");
-                return ExitCode::from(2);
-            }
+            other => return Err(format!("unknown argument: {other}")),
         }
     }
 
     if !dry_run {
-        eprintln!("cycle: only --dry-run is supported in this version");
-        return ExitCode::from(2);
+        return Err("only --dry-run is supported in this version".to_string());
     }
+    Ok(CycleOptions {
+        dry_run,
+        config: config_path,
+        scope: crate::cycle::CycleScopeRequest { repos, only },
+    })
+}
 
-    let cfg = match config::load(&config_path) {
+fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let args: Vec<String> = it.collect();
+    let options = match parse_cycle_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("cycle: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    debug_assert!(options.dry_run);
+
+    let cfg = match config::load(&options.config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config: invalid — {e}");
@@ -749,7 +781,14 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 
     let client = crate::bd::CommandBdClient::new();
     let bursar = crate::bursar::CommandBursarClient::new();
-    match crate::cycle::run_dry_run(&cfg, &client, &bursar, &reports_home, &state_dir) {
+    match crate::cycle::run_dry_run_scoped(
+        &cfg,
+        &client,
+        &bursar,
+        &reports_home,
+        &state_dir,
+        &options.scope,
+    ) {
         Ok(result) => {
             println!("cycle {}: dry-run complete", result.cycle_id);
             println!("report: {}", result.report_path.display());
@@ -757,7 +796,11 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         }
         Err(e) => {
             eprintln!("cycle: {e}");
-            ExitCode::from(1)
+            if e.is_scope_error() {
+                ExitCode::from(2)
+            } else {
+                ExitCode::from(1)
+            }
         }
     }
 }
@@ -1028,6 +1071,37 @@ provider = "fixture-provider"
         ];
 
         assert_eq!(scan_exit_code(&snapshots), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn cycle_scope_parser_collects_repeatable_repo_and_only_selectors() {
+        let args = [
+            "--dry-run",
+            "--repo",
+            "alpha",
+            "--repo",
+            "/repos/bravo",
+            "--only",
+            "alpha:a-1",
+            "--only",
+            "/repos/bravo:b-2",
+            "--config",
+            "/tmp/conductor.toml",
+        ]
+        .map(str::to_string);
+        let options = parse_cycle_options(&args).expect("cycle options");
+        assert!(options.dry_run);
+        assert_eq!(options.scope.repos, ["alpha", "/repos/bravo"]);
+        assert_eq!(options.scope.only, ["alpha:a-1", "/repos/bravo:b-2"]);
+        assert_eq!(options.config, PathBuf::from("/tmp/conductor.toml"));
+    }
+
+    #[test]
+    fn cycle_scope_parser_rejects_missing_values_and_unknown_arguments() {
+        assert!(parse_cycle_options(&["--repo".to_string()]).is_err());
+        assert!(parse_cycle_options(&["--only".to_string()]).is_err());
+        assert!(parse_cycle_options(&["--dry-run".to_string(), "--wide".to_string()]).is_err());
+        assert!(parse_cycle_options(&[]).is_err());
     }
 
     #[test]

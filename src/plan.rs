@@ -46,6 +46,16 @@ pub(crate) enum ApprovalScopeKind {
     ExactItemScope,
 }
 
+impl ApprovalScopeKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FleetAudit => "fleet-audit",
+            Self::RepositoryScope => "repository-scope",
+            Self::ExactItemScope => "exact-item-scope",
+        }
+    }
+}
+
 /// Canonical user selector retained in the immutable cycle plan.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]

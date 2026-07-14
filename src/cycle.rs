@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,10 @@ use crate::bursar::BursarClient;
 use crate::config::{Config, CostPolicy};
 use crate::deck::{self, Bar, Block, CalloutLevel, Metric, Report, ReportStatus};
 use crate::fields::{Triage, extract};
-use crate::plan::{CyclePlan, ProviderRouteRecord};
+use crate::plan::{
+    ApprovalScope, ApprovalScopeKind, CyclePlan, ItemAuthorizationRecord, ProviderRouteRecord,
+    ScopeSelector, item_authorization_hash,
+};
 use crate::scan::{self, RepoSnapshot, SkipReason, ZeroState};
 use crate::state::{self, JournalEntry, JournalSummary};
 use crate::triage::{self, Flag, Plan, RatchetState, SkipCode};
@@ -26,13 +29,26 @@ use crate::triage::{self, Flag, Plan, RatchetState, SkipCode};
 #[derive(Debug)]
 pub(crate) struct CycleError {
     message: String,
+    scope: bool,
 }
 
 impl CycleError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            scope: false,
         }
+    }
+
+    fn scope(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            scope: true,
+        }
+    }
+
+    pub(crate) const fn is_scope_error(&self) -> bool {
+        self.scope
     }
 }
 
@@ -50,6 +66,12 @@ pub(crate) struct CycleResult {
     pub(crate) report_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CycleScopeRequest {
+    pub(crate) repos: Vec<String>,
+    pub(crate) only: Vec<String>,
+}
+
 /// Runs a dry-run cycle: scan → triage → plan → publish.
 ///
 /// No bd mutations: no claims, no dispatches, no metadata writes.
@@ -61,11 +83,29 @@ pub(crate) fn run_dry_run(
     reports_home: &Path,
     state_dir: &Path,
 ) -> Result<CycleResult, CycleError> {
+    run_dry_run_scoped(
+        cfg,
+        client,
+        bursar,
+        reports_home,
+        state_dir,
+        &CycleScopeRequest::default(),
+    )
+}
+
+pub(crate) fn run_dry_run_scoped(
+    cfg: &Config,
+    client: &dyn BdClient,
+    bursar: &dyn BursarClient,
+    reports_home: &Path,
+    state_dir: &Path,
+    scope: &CycleScopeRequest,
+) -> Result<CycleResult, CycleError> {
     let now = Utc::now();
     let cycle_id = now.format("cycle-%Y%m%d-%H%M%S").to_string();
     let created_at = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    run_dry_run_with_timestamps(
+    run_dry_run_with_timestamps_scoped(
         cfg,
         client,
         bursar,
@@ -73,6 +113,7 @@ pub(crate) fn run_dry_run(
         state_dir,
         &cycle_id,
         &created_at,
+        scope,
     )
 }
 
@@ -86,9 +127,37 @@ pub(crate) fn run_dry_run_with_timestamps(
     cycle_id: &str,
     created_at: &str,
 ) -> Result<CycleResult, CycleError> {
+    run_dry_run_with_timestamps_scoped(
+        cfg,
+        client,
+        bursar,
+        reports_home,
+        state_dir,
+        cycle_id,
+        created_at,
+        &CycleScopeRequest::default(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "deterministic test seam keeps timestamp and approval scope explicit"
+)]
+pub(crate) fn run_dry_run_with_timestamps_scoped(
+    cfg: &Config,
+    client: &dyn BdClient,
+    bursar: &dyn BursarClient,
+    reports_home: &Path,
+    state_dir: &Path,
+    cycle_id: &str,
+    created_at: &str,
+    scope_request: &CycleScopeRequest,
+) -> Result<CycleResult, CycleError> {
     // 1. Scan
     let snapshots =
         scan::scan(&cfg.scan, client).map_err(|e| CycleError::new(format!("scan: {e}")))?;
+    let resolved_scope = apply_scope(snapshots, scope_request)?;
+    let snapshots = resolved_scope.snapshots;
 
     // 2. Triage (dry-run: all ratchets locked → propose-only)
     let ratchet: HashMap<String, RatchetState> = HashMap::new();
@@ -109,6 +178,20 @@ pub(crate) fn run_dry_run_with_timestamps(
     let provider_advice = provider_route_advice(cfg, &snapshots, &plan, bursar)?;
     let mut cycle_plan = CyclePlan::from_triage(cycle_id, created_at, &plan);
     cycle_plan.apply_provider_routes(provider_advice);
+    let max_dispatch_count = match resolved_scope.kind {
+        ApprovalScopeKind::FleetAudit => cycle_plan.dispatches.len(),
+        ApprovalScopeKind::RepositoryScope | ApprovalScopeKind::ExactItemScope => {
+            cycle_plan.dispatches.len() + cycle_plan.proposals.len()
+        }
+    };
+    cycle_plan.approval_scope = ApprovalScope::new(
+        resolved_scope.kind,
+        resolved_scope.selectors,
+        resolved_scope.repo_paths,
+        max_dispatch_count,
+    )
+    .map_err(|error| CycleError::scope(format!("scope: {error}")))?;
+    cycle_plan.item_authorizations = build_item_authorizations(&snapshots, &cycle_plan)?;
     cycle_plan
         .save(state_dir)
         .map_err(|e| CycleError::new(format!("plan save: {e}")))?;
@@ -133,6 +216,253 @@ pub(crate) fn run_dry_run_with_timestamps(
         cycle_id: cycle_id.to_string(),
         report_path,
     })
+}
+
+#[derive(Debug)]
+struct ResolvedScope {
+    snapshots: Vec<RepoSnapshot>,
+    kind: ApprovalScopeKind,
+    selectors: Vec<ScopeSelector>,
+    repo_paths: Vec<String>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "scope resolution keeps cross-selector validation in one fail-closed boundary"
+)]
+fn apply_scope(
+    snapshots: Vec<RepoSnapshot>,
+    request: &CycleScopeRequest,
+) -> Result<ResolvedScope, CycleError> {
+    if request.repos.is_empty() && request.only.is_empty() {
+        let repo_paths = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.is_beads_repo && snapshot.skip_reason.is_none())
+            .map(canonical_snapshot_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(ResolvedScope {
+            snapshots,
+            kind: ApprovalScopeKind::FleetAudit,
+            selectors: Vec::new(),
+            repo_paths,
+        });
+    }
+
+    let mut selected_repo_paths = Vec::new();
+    let mut selected_repo_set = HashSet::new();
+    for raw in &request.repos {
+        let snapshot = resolve_repo(&snapshots, raw)?;
+        reject_scoped_skip(snapshot)?;
+        let canonical = canonical_snapshot_path(snapshot)?;
+        if !selected_repo_set.insert(canonical.clone()) {
+            return Err(CycleError::scope(format!(
+                "scope: duplicate repository selector {raw}"
+            )));
+        }
+        selected_repo_paths.push(canonical);
+    }
+
+    if request.only.is_empty() {
+        let selected: Vec<RepoSnapshot> = snapshots
+            .into_iter()
+            .filter(|snapshot| {
+                canonical_snapshot_path(snapshot)
+                    .is_ok_and(|path| selected_repo_set.contains(&path))
+            })
+            .collect();
+        if selected.iter().all(|snapshot| snapshot.ready.is_empty()) {
+            return Err(CycleError::scope(
+                "scope: repository selectors produced no ready items",
+            ));
+        }
+        let selectors = selected_repo_paths
+            .iter()
+            .map(|repo| ScopeSelector::Repository { repo: repo.clone() })
+            .collect();
+        return Ok(ResolvedScope {
+            snapshots: selected,
+            kind: ApprovalScopeKind::RepositoryScope,
+            selectors,
+            repo_paths: selected_repo_paths,
+        });
+    }
+
+    let mut exact = Vec::new();
+    let mut exact_set = HashSet::new();
+    let mut exact_repo_paths = HashSet::new();
+    for raw in &request.only {
+        let (repo_raw, issue_id) = raw
+            .rsplit_once(':')
+            .ok_or_else(|| CycleError::scope(format!("scope: invalid --only selector {raw:?}")))?;
+        if repo_raw.is_empty() || issue_id.is_empty() {
+            return Err(CycleError::scope(format!(
+                "scope: invalid --only selector {raw:?}"
+            )));
+        }
+        let snapshot = resolve_repo(&snapshots, repo_raw)?;
+        reject_scoped_skip(snapshot)?;
+        let canonical = canonical_snapshot_path(snapshot)?;
+        if !selected_repo_set.is_empty() && !selected_repo_set.contains(&canonical) {
+            return Err(CycleError::scope(format!(
+                "scope: --only selector {raw:?} is outside the --repo filter"
+            )));
+        }
+        if !snapshot.ready.iter().any(|issue| issue.id == issue_id) {
+            return Err(CycleError::scope(format!(
+                "scope: unknown ready issue {repo_raw}:{issue_id}"
+            )));
+        }
+        if !exact_set.insert((canonical.clone(), issue_id.to_string())) {
+            return Err(CycleError::scope(format!(
+                "scope: duplicate exact-item selector {raw}"
+            )));
+        }
+        exact_repo_paths.insert(canonical.clone());
+        exact.push(ScopeSelector::ExactItem {
+            repo: canonical,
+            issue_id: issue_id.to_string(),
+        });
+    }
+
+    let mut selected = Vec::new();
+    for mut snapshot in snapshots {
+        let canonical = canonical_snapshot_path(&snapshot)?;
+        snapshot
+            .ready
+            .retain(|issue| exact_set.contains(&(canonical.clone(), issue.id.clone())));
+        if !snapshot.ready.is_empty() {
+            selected.push(snapshot);
+        }
+    }
+    if selected.is_empty() {
+        return Err(CycleError::scope(
+            "scope: exact-item selectors produced no ready items",
+        ));
+    }
+    Ok(ResolvedScope {
+        snapshots: selected,
+        kind: ApprovalScopeKind::ExactItemScope,
+        selectors: exact,
+        repo_paths: exact_repo_paths.into_iter().collect(),
+    })
+}
+
+fn resolve_repo<'a>(
+    snapshots: &'a [RepoSnapshot],
+    selector: &str,
+) -> Result<&'a RepoSnapshot, CycleError> {
+    if let Some(snapshot) = snapshots.iter().find(|snapshot| snapshot.name == selector) {
+        return Ok(snapshot);
+    }
+    let expanded = scan::expand_tilde(selector)
+        .map_err(|error| CycleError::scope(format!("scope: {error}")))?;
+    let selector_path = std::fs::canonicalize(&expanded).ok();
+    snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot.path == expanded
+                || selector_path.as_ref().is_some_and(|path| {
+                    std::fs::canonicalize(&snapshot.path).ok().as_ref() == Some(path)
+                })
+        })
+        .ok_or_else(|| CycleError::scope(format!("scope: unknown repository {selector}")))
+}
+
+fn reject_scoped_skip(snapshot: &RepoSnapshot) -> Result<(), CycleError> {
+    if !snapshot.is_beads_repo {
+        return Err(CycleError::scope(format!(
+            "scope: repository {} is not a beads repository",
+            snapshot.name
+        )));
+    }
+    if let Some(reason) = snapshot.skip_reason.as_ref() {
+        return Err(CycleError::scope(format!(
+            "scope: repository {} is excluded or unavailable: {reason:?}",
+            snapshot.name
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_snapshot_path(snapshot: &RepoSnapshot) -> Result<String, CycleError> {
+    let path = std::fs::canonicalize(&snapshot.path).map_err(|error| {
+        CycleError::scope(format!(
+            "scope: cannot canonicalize {}: {error}",
+            snapshot.path.display()
+        ))
+    })?;
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| CycleError::scope("scope: canonical repository path is not UTF-8"))
+}
+
+fn build_item_authorizations(
+    snapshots: &[RepoSnapshot],
+    plan: &CyclePlan,
+) -> Result<Vec<ItemAuthorizationRecord>, CycleError> {
+    let mut items = plan
+        .dispatches
+        .iter()
+        .map(|entry| {
+            (
+                entry.repo.as_str(),
+                entry.issue_id.as_str(),
+                entry.model.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !matches!(plan.approval_scope.kind, ApprovalScopeKind::FleetAudit) {
+        items.extend(plan.proposals.iter().map(|entry| {
+            (
+                entry.repo.as_str(),
+                entry.issue_id.as_str(),
+                entry.model.as_str(),
+            )
+        }));
+    }
+    let mut records = Vec::with_capacity(items.len());
+    for (repo, issue_id, selected_model) in items {
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.name == repo)
+            .ok_or_else(|| CycleError::new(format!("authorization: missing repo {repo}")))?;
+        let issue = snapshot
+            .ready
+            .iter()
+            .find(|issue| issue.id == issue_id)
+            .ok_or_else(|| {
+                CycleError::new(format!("authorization: missing issue {repo}/{issue_id}"))
+            })?;
+        let Triage::Triaged(routing) = extract(issue) else {
+            return Err(CycleError::new(format!(
+                "authorization: routing fields disappeared for {repo}/{issue_id}"
+            )));
+        };
+        let route = plan
+            .provider_routes
+            .iter()
+            .find(|route| route.repo == repo && route.issue_id == issue_id)
+            .ok_or_else(|| {
+                CycleError::new(format!("authorization: missing route {repo}/{issue_id}"))
+            })?;
+        let canonical = canonical_snapshot_path(snapshot)?;
+        let sha256 = item_authorization_hash(
+            &canonical,
+            issue,
+            &routing,
+            selected_model,
+            &route.approved_models,
+        )
+        .map_err(|error| CycleError::new(format!("authorization: {error}")))?;
+        records.push(ItemAuthorizationRecord {
+            repo: repo.to_string(),
+            issue_id: issue_id.to_string(),
+            sha256,
+        });
+    }
+    records
+        .sort_by(|left, right| (&left.repo, &left.issue_id).cmp(&(&right.repo, &right.issue_id)));
+    Ok(records)
 }
 
 fn provider_route_advice(
@@ -433,10 +763,30 @@ fn repo_state_str(s: &RepoSnapshot) -> String {
 }
 
 fn format_dispatch_plan(plan: &CyclePlan) -> String {
-    if plan.dispatches.is_empty() && plan.proposals.is_empty() && plan.provider_routes.is_empty() {
-        return "No dispatchable items.".to_string();
+    let selectors = if plan.approval_scope.selectors.is_empty() {
+        "none".to_string()
+    } else {
+        plan.approval_scope
+            .selectors
+            .iter()
+            .map(|selector| match selector {
+                ScopeSelector::Repository { repo } => repo.clone(),
+                ScopeSelector::ExactItem { repo, issue_id } => format!("{repo}:{issue_id}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = vec![
+        format!("**Approval scope:** {}", plan.approval_scope.kind.label()),
+        format!("**Selectors:** {selectors}"),
+        format!(
+            "**Maximum dispatch count:** {}",
+            plan.approval_scope.max_dispatch_count
+        ),
+    ];
+    if plan.dispatches.is_empty() && plan.proposals.is_empty() {
+        lines.push("No dispatchable items.".to_string());
     }
-    let mut lines = Vec::new();
     if !plan.proposals.is_empty() {
         lines.push(format!("**Proposed ({}):**", plan.proposals.len()));
         for p in &plan.proposals {
@@ -765,6 +1115,272 @@ mod tests {
     }
 
     // --- The test ---
+
+    fn scope_snapshot(
+        path: PathBuf,
+        name: &str,
+        ready: Vec<Issue>,
+        skip_reason: Option<SkipReason>,
+    ) -> RepoSnapshot {
+        RepoSnapshot {
+            path,
+            name: name.to_string(),
+            is_beads_repo: true,
+            skip_reason,
+            count: ready.len() as u64,
+            ready,
+            blocked: Vec::new(),
+            zero_state: ZeroState::NotApplicable,
+            freshness: crate::scan::Freshness::Fresh,
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one selector matrix keeps canonical aliases and all fail-closed cases together"
+    )]
+    fn scope_resolution_is_canonical_and_rejects_invalid_selectors() {
+        let fleet = TempDir::new("scope-resolution");
+        let alpha = fleet.path().join("alpha");
+        let beta = fleet.path().join("beta");
+        let empty = fleet.path().join("empty");
+        let excluded = fleet.path().join("chezmoi-personal");
+        for path in [&alpha, &beta, &empty, &excluded] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let snapshots = vec![
+            scope_snapshot(
+                alpha.clone(),
+                "alpha",
+                vec![
+                    make_issue_with_metadata("a-1", 1, "senior", "M"),
+                    make_issue_with_metadata("a-2", 2, "senior", "M"),
+                ],
+                None,
+            ),
+            scope_snapshot(
+                beta.clone(),
+                "beta",
+                vec![make_issue_with_metadata("b-1", 1, "senior", "M")],
+                None,
+            ),
+            scope_snapshot(empty, "empty", Vec::new(), None),
+            scope_snapshot(
+                excluded,
+                "chezmoi-personal",
+                Vec::new(),
+                Some(SkipReason::Excluded),
+            ),
+        ];
+
+        let resolved = apply_scope(
+            snapshots.clone(),
+            &CycleScopeRequest {
+                repos: vec!["alpha".to_string()],
+                only: vec!["alpha:a-2".to_string()],
+            },
+        )
+        .expect("exact scope");
+        assert_eq!(resolved.kind, ApprovalScopeKind::ExactItemScope);
+        assert_eq!(resolved.snapshots.len(), 1);
+        assert_eq!(resolved.snapshots[0].ready[0].id, "a-2");
+        assert_eq!(resolved.selectors.len(), 1);
+        assert_eq!(
+            resolved.repo_paths,
+            vec![std::fs::canonicalize(&alpha).unwrap().to_str().unwrap()]
+        );
+
+        let repo_scope = apply_scope(
+            snapshots.clone(),
+            &CycleScopeRequest {
+                repos: vec!["beta".to_string(), "alpha".to_string()],
+                only: Vec::new(),
+            },
+        )
+        .expect("repo scope");
+        assert_eq!(repo_scope.kind, ApprovalScopeKind::RepositoryScope);
+        assert_eq!(repo_scope.selectors.len(), 2);
+
+        let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+        let home_aliases = apply_scope(
+            vec![scope_snapshot(
+                home.clone(),
+                "home-repo",
+                vec![make_issue_with_metadata("home-1", 1, "senior", "M")],
+                None,
+            )],
+            &CycleScopeRequest {
+                repos: vec![
+                    "home-repo".to_string(),
+                    home.display().to_string(),
+                    "~".to_string(),
+                ],
+                only: Vec::new(),
+            },
+        )
+        .expect_err("name, absolute, and tilde aliases are duplicates");
+        assert!(home_aliases.is_scope_error());
+
+        let invalid = [
+            CycleScopeRequest {
+                repos: vec!["alpha".to_string(), alpha.display().to_string()],
+                only: Vec::new(),
+            },
+            CycleScopeRequest {
+                repos: vec!["alpha".to_string()],
+                only: vec!["beta:b-1".to_string()],
+            },
+            CycleScopeRequest {
+                repos: Vec::new(),
+                only: vec!["alpha:missing".to_string()],
+            },
+            CycleScopeRequest {
+                repos: Vec::new(),
+                only: vec!["alpha:a-1".to_string(), "alpha:a-1".to_string()],
+            },
+            CycleScopeRequest {
+                repos: vec!["chezmoi-personal".to_string()],
+                only: Vec::new(),
+            },
+            CycleScopeRequest {
+                repos: vec!["empty".to_string()],
+                only: Vec::new(),
+            },
+            CycleScopeRequest {
+                repos: vec!["unknown".to_string()],
+                only: Vec::new(),
+            },
+        ];
+        for request in invalid {
+            let error = apply_scope(snapshots.clone(), &request).expect_err("scope rejected");
+            assert!(error.is_scope_error());
+        }
+    }
+
+    fn scoped_config(root: &Path) -> Config {
+        config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+use_bursar = false
+
+[[roster]]
+name = "scope-worker"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/scope-worker"
+provider = "opencode-go"
+fallback = []
+"#,
+            root.display()
+        ))
+        .expect("scope config")
+    }
+
+    #[test]
+    fn scoped_cycle_persists_exact_items_hashes_and_report_boundary() {
+        let fleet = TempDir::new("scoped-cycle-fleet");
+        let reports = TempDir::new("scoped-cycle-reports");
+        let state = TempDir::new("scoped-cycle-state");
+        let alpha = fleet.path().join("alpha");
+        let beta = fleet.path().join("beta");
+        for repo in [&alpha, &beta] {
+            std::fs::create_dir_all(repo).unwrap();
+            init_beads_repo(repo);
+        }
+        let bd = FakeBdClient::new();
+        bd.set_ready(
+            &alpha,
+            vec![
+                make_issue_with_metadata("a-1", 1, "senior", "M"),
+                make_issue_with_metadata("a-2", 2, "senior", "M"),
+            ],
+        );
+        bd.set_count(&alpha, 2);
+        bd.set_blocked(&alpha, Vec::new());
+        bd.set_ready(
+            &beta,
+            vec![make_issue_with_metadata("b-1", 1, "senior", "M")],
+        );
+        bd.set_count(&beta, 1);
+        bd.set_blocked(&beta, Vec::new());
+
+        let result = run_dry_run_with_timestamps_scoped(
+            &scoped_config(fleet.path()),
+            &bd,
+            &FakeBursarClient::unavailable(),
+            reports.path(),
+            state.path(),
+            "cycle-20260713-scoped",
+            "2026-07-13T12:00:00Z",
+            &CycleScopeRequest {
+                repos: vec!["alpha".to_string()],
+                only: vec!["alpha:a-2".to_string()],
+            },
+        )
+        .expect("scoped cycle");
+
+        let plan = CyclePlan::load(state.path(), "cycle-20260713-scoped").unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(plan.proposals[0].issue_id, "a-2");
+        assert_eq!(plan.approval_scope.kind, ApprovalScopeKind::ExactItemScope);
+        assert_eq!(plan.approval_scope.max_dispatch_count, 1);
+        assert_eq!(plan.item_authorizations.len(), 1);
+        assert_eq!(plan.item_authorizations[0].issue_id, "a-2");
+        assert_eq!(plan.item_authorizations[0].sha256.len(), 64);
+        let report: Value =
+            serde_json::from_slice(&std::fs::read(result.report_path).unwrap()).unwrap();
+        let approval = report["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "approval")
+            .unwrap();
+        let prompt = approval["prompt"].as_str().unwrap();
+        assert!(prompt.contains("exact-item-scope"));
+        assert!(prompt.contains("Maximum dispatch count:** 1"));
+        assert!(prompt.contains("a-2"));
+        assert!(!prompt.contains("a-1"));
+        assert!(!prompt.contains("b-1"));
+    }
+
+    #[test]
+    fn scope_fleet_audit_with_103_proposals_authorizes_zero_proposals() {
+        let fleet = TempDir::new("scope-103-fleet");
+        let reports = TempDir::new("scope-103-reports");
+        let state = TempDir::new("scope-103-state");
+        let repo = fleet.path().join("alpha");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_beads_repo(&repo);
+        let issues = (0..103)
+            .map(|index| make_issue_with_metadata(&format!("a-{index:03}"), index, "senior", "M"))
+            .collect::<Vec<_>>();
+        let bd = FakeBdClient::new();
+        bd.set_ready(&repo, issues);
+        bd.set_count(&repo, 103);
+        bd.set_blocked(&repo, Vec::new());
+
+        run_dry_run_with_timestamps(
+            &scoped_config(fleet.path()),
+            &bd,
+            &FakeBursarClient::unavailable(),
+            reports.path(),
+            state.path(),
+            "cycle-20260713-fleet-103",
+            "2026-07-13T12:00:00Z",
+        )
+        .expect("fleet audit");
+        let plan = CyclePlan::load(state.path(), "cycle-20260713-fleet-103").unwrap();
+        assert_eq!(plan.proposals.len(), 103);
+        assert!(plan.dispatches.is_empty());
+        assert_eq!(plan.approval_scope.kind, ApprovalScopeKind::FleetAudit);
+        assert_eq!(plan.approval_scope.max_dispatch_count, 0);
+        assert!(plan.item_authorizations.is_empty());
+    }
 
     #[test]
     #[expect(
