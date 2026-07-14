@@ -1310,7 +1310,9 @@ mod tests {
     use crate::dispatch::{
         ChildProcess, CommitProbe, Exec, GitCommitProbe, ProcessStatus, SpawnRequest,
     };
-    use crate::plan::{CyclePlan, ProposalEntry, ProviderCandidateRecord, ProviderRouteRecord};
+    use crate::plan::{
+        ApprovalScope, CyclePlan, ProposalEntry, ProviderCandidateRecord, ProviderRouteRecord,
+    };
 
     #[test]
     fn approval_gate_matrix_refuses_absent_closes_changes_requested_and_runs_approved() {
@@ -2217,6 +2219,8 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: Vec::new(),
+            approval_scope: ApprovalScope::default(),
+            item_authorizations: Vec::new(),
         };
         plan.save(state).expect("save plan");
     }
@@ -2243,6 +2247,8 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: vec![provider_route],
+            approval_scope: ApprovalScope::default(),
+            item_authorizations: Vec::new(),
         };
         plan.save(state).expect("save plan");
     }

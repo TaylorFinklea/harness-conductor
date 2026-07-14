@@ -103,8 +103,13 @@ every proposal observed under `~/git`.
 **Decision**: Unscoped approval may launch only the existing dispatch bucket.
 Explicit repo/item selectors are persisted in the plan and approval may cover
 proposals only inside that immutable scope. Dispatch cannot add selectors or
-substitute items. Details: `phases/bounded-dispatch-approval-spec.md`.
+substitute items. Each authorized item carries a SHA-256 digest over a
+deterministically serialized, ordered input record. Use the in-process
+`sha2 = "0.10"` crate. Details: `phases/bounded-dispatch-approval-spec.md`.
 **Alternatives considered**: Keep blanket approval; parse free-form approval
-notes; add dispatch-time selectors that were not part of the plan.
+notes; add dispatch-time selectors that were not part of the plan; use
+process-dependent standard hashing; shell out to `shasum`.
 **Rationale**: An approval is meaningful only when its maximum blast radius is
-visible and immutable before the user grants it.
+visible and immutable before the user grants it. Standard hashing is not a
+stable cross-process contract, and a subprocess would add platform and PATH
+failure modes to a correctness boundary.
