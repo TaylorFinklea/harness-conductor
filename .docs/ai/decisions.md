@@ -108,3 +108,63 @@ substitute items. Details: `phases/bounded-dispatch-approval-spec.md`.
 notes; add dispatch-time selectors that were not part of the plan.
 **Rationale**: An approval is meaningful only when its maximum blast radius is
 visible and immutable before the user grants it.
+
+## [2026-07-13] Roster enablement is config-level, with a provider gate
+
+**Context**: Taking a model or a whole provider lane out of rotation meant
+deleting `[[roster]]` rows and losing their config — and `fallback` chains name
+roster entries, so a deletion silently orphans other models' chains.
+**Decision**: `[[roster]]` rows gain an optional `enabled` (default `true`); a
+new first-class `[[provider]]` table gains the same. `effective_enabled =
+roster.enabled && provider.enabled` is resolved at parse time. A non-empty
+`provider` MUST resolve to a declared `[[provider]]` block (fail closed on
+typos); an empty `provider` bypasses the gate (legacy/test shape). A disabled
+model is **never selected** and is **skipped** in the fallback walk — the same
+rule, so there is no special case for `chain[0]`. Manual `enabled` is the hard
+off knob; Bursar's per-cycle `Defer` remains the soft one. Details:
+`phases/roster-tui-spec.md`.
+**Alternatives considered**: Delete-only (loses config); a runtime overlay file
+(leaves `conductor.toml` non-authoritative); "disabled primary is still
+selectable, dispatch walks to its first enabled fallback" (routing-alias
+framing).
+**Rationale**: Rejected the routing-alias framing because `select_candidate`
+must return a model that will actually run — otherwise the ledger names a model
+that never executed. Provider is the natural toggle unit because it is the unit
+that actually goes down (quota, rate limit), and it is where `provider_policy`
+(conductor-d5j) will land.
+
+## [2026-07-13] `enabled` must NOT enter `candidate_rejection`
+
+**Context**: `candidate_rejection` (`triage.rs:183`) is shared by
+`select_candidate`, the fallback walk, and `next_eligible_roster` — so folding
+the enabled check into it is the obvious implementation.
+**Decision**: Do not. Keep a separate effective-enabled predicate applied
+*after* `candidate_rejection`, and add `Flag::AllDisabled` for "candidates
+qualify but all are dark". A disabled link in the walk is a hard skip
+(`record_fallback_skip`), never the Bursar `Deferred` path.
+**Alternatives considered**: Fold it in (one predicate, less code).
+**Rationale**: Folding it in makes `select_candidate` return `None` for a fully
+darkened tier, and `route` flags that as `Flag::OverCeiling` (`triage.rs:351`) —
+reporting "the operator turned these off" as "this item is too hard." Silent
+misattribution, and worse for a ratchet-unlocked auto-dispatch item.
+
+## [2026-07-13] TOML write-back is a line-span editor gated by structural equivalence
+
+**Context**: A roster TUI must write `conductor.toml` — 535 lines carrying
+load-bearing comments. `config.rs` hand-rolls a read-only TOML parser and the
+crate holds only three dependencies.
+**Decision**: Hand-roll a line-span editor (`src/config_edit.rs`) that splices
+only the lines it touches, so comments survive by construction. Take ratatui +
+crossterm for the UI (feature-gated). Do **not** add `toml_edit`. Every write is
+gated by a **structural-equivalence check**: re-parse and assert the resulting
+`Config` differs from the pre-edit `Config` only in the intended field.
+**Alternatives considered**: `toml_edit` (battle-tested round-tripping);
+hand-roll the terminal layer too; gate writes on `parse_str` alone.
+**Rationale**: `toml_edit` would put two TOML semantics in one tree that can
+disagree — the TUI could write what `config.rs` rejects. Rendering, by contrast,
+is toil with no domain value, so ratatui is worth the dep. Critically, gating on
+`parse_str` alone is **insufficient**: the parser accepts `[[roster]] # comment`
+(`config.rs:1944`), so an indexer whose header match is stricter than the
+parser's mis-attributes keys to the previous block and silently edits the WRONG
+model while still emitting valid TOML. Parseability is not correctness — hence
+structural equivalence. (Found by adversarial review, opencode-go/glm-5.2.)
