@@ -13,7 +13,7 @@ Rebrand `harness-conductor` → `conductor` COMPLETE (2026-07-12): source refs, 
 - [x] conductor-6dv: immutable approval scope and item hashes. Verify: `cargo test plan::tests`
 - [x] conductor-5ij: cycle selector parsing and enforcement. Verify: `cargo test cycle::tests deck::tests cli::tests`
 - [x] conductor-xa5: bind dispatch to persisted scope; proposals inert when unscoped. Verify: `cargo test`
-- [ ] conductor-8z8: bounded-approval final gates and report. Verify: `cargo test`
+- [x] conductor-8z8: bounded-approval final gates and report. Verify: `cargo test`
 - [ ] conductor-i8r: adversarial config and artifact snapshot. Verify: `cargo test config::tests adversarial::tests::artifact_`
 - [ ] conductor-0zv: distinct-provider reviewer panel plus Lead judge. Verify: `cargo test adversarial::tests::panel_ bursar::tests`
 - [ ] conductor-b35: immutable review approval envelope. Verify: `cargo test adversarial::tests::approval_ deck::tests`
