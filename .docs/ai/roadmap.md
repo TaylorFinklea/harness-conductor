@@ -10,9 +10,10 @@ Conductor: a single Rust binary that runs autonomous work-routing cycles over th
 
 ### Now
 - [ ] Provider-trust integration + bounded approvals + adversarial design
-  review. Consume `bursar/status@2` fail-closed during plan and dispatch,
-  write runtime 429 observations before fallback, resolve `conductor-xa5`, and
-  add isolated `N` provider reviewers + one Lead synthesis call. Specs:
+  review. Provider-trust slice complete: consume `bursar/status@2` fail-closed
+  during plan and dispatch and write runtime 429 observations before approved
+  fallback. Remaining: resolve `conductor-xa5` and add isolated `N` provider
+  reviewers + one Lead synthesis call. Specs:
   `phases/provider-trust-integration-spec.md`,
   `phases/bounded-dispatch-approval-spec.md`, and
   `phases/adversarial-design-review-spec.md`. **Landmine:** adversarial review

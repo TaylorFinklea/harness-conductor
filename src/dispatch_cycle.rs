@@ -1304,7 +1304,7 @@ mod tests {
     use serde_json::json;
 
     use crate::bd::{BdClient, BdError, CommandBdClient, Comment, Issue};
-    use crate::bursar::{test_support::FakeBursarClient, Availability};
+    use crate::bursar::{Availability, test_support::FakeBursarClient};
     use crate::config;
     use crate::deck::{Block, Report, ReportStatus};
     use crate::dispatch::{
@@ -1388,9 +1388,11 @@ mod tests {
         )
         .expect_err("missing approval refuses");
         assert!(absent.is_not_answered());
-        assert!(absent
-            .to_string()
-            .contains("dispatch-plan not yet answered"));
+        assert!(
+            absent
+                .to_string()
+                .contains("dispatch-plan not yet answered")
+        );
     }
 
     #[test]
@@ -1509,17 +1511,21 @@ dispatch_id = "fake-worker"
             heartbeats.len() >= 2,
             "expected multiple live patches, got {heartbeats:?}"
         );
-        assert!(heartbeats
-            .iter()
-            .any(|step| step.contains("worker sandbox-repo/sandbox-1")));
+        assert!(
+            heartbeats
+                .iter()
+                .any(|step| step.contains("worker sandbox-repo/sandbox-1"))
+        );
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(report_path(&reports, cycle_id)).unwrap())
                 .unwrap();
         assert_eq!(report["status"], "done");
-        assert!(report["live"]["step"]
-            .as_str()
-            .unwrap()
-            .contains("complete"));
+        assert!(
+            report["live"]["step"]
+                .as_str()
+                .unwrap()
+                .contains("complete")
+        );
     }
 
     #[test]
@@ -1746,18 +1752,24 @@ provider = "codex"
         );
         assert_eq!(rows[0]["model"], "primary-worker");
         assert_eq!(rows[0]["verify_passed"], false);
-        assert!(rows[0]["notes"]
-            .as_str()
-            .expect("notes")
-            .contains("classified as runtime HTTP 429"));
-        assert!(rows[1]["notes"]
-            .as_str()
-            .expect("notes")
-            .contains("bursar observation failed"));
-        assert!(rows[2]["notes"]
-            .as_str()
-            .expect("notes")
-            .contains("failover to fallback-worker"));
+        assert!(
+            rows[0]["notes"]
+                .as_str()
+                .expect("notes")
+                .contains("classified as runtime HTTP 429")
+        );
+        assert!(
+            rows[1]["notes"]
+                .as_str()
+                .expect("notes")
+                .contains("bursar observation failed")
+        );
+        assert!(
+            rows[2]["notes"]
+                .as_str()
+                .expect("notes")
+                .contains("failover to fallback-worker")
+        );
         assert_eq!(rows[3]["model"], "fallback-worker");
         assert_eq!(rows[3]["verify_passed"], true);
     }
@@ -1890,15 +1902,21 @@ dispatch_id = "fallback-worker"
         );
         assert!(spawns[0].argv.contains(&"primary-worker".to_string()));
         assert!(spawns[1].argv.contains(&"fallback-worker".to_string()));
-        assert!(!spawns
-            .iter()
-            .any(|spawn| spawn.argv.contains(&"below-floor-worker".to_string())));
-        assert!(!spawns
-            .iter()
-            .any(|spawn| spawn.argv.contains(&"below-ceiling-worker".to_string())));
-        assert!(!spawns
-            .iter()
-            .any(|spawn| spawn.argv.contains(&"free-train-worker".to_string())));
+        assert!(
+            !spawns
+                .iter()
+                .any(|spawn| spawn.argv.contains(&"below-floor-worker".to_string()))
+        );
+        assert!(
+            !spawns
+                .iter()
+                .any(|spawn| spawn.argv.contains(&"below-ceiling-worker".to_string()))
+        );
+        assert!(
+            !spawns
+                .iter()
+                .any(|spawn| spawn.argv.contains(&"free-train-worker".to_string()))
+        );
 
         let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
         assert!(ledger_line.contains("failover to fallback-worker"));

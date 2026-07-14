@@ -38,7 +38,9 @@ fn run_route(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
         Some("explain") => run_route_explain(it),
         None => {
-            eprintln!("usage: conductor route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]");
+            eprintln!(
+                "usage: conductor route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]"
+            );
             ExitCode::from(2)
         }
         Some(sub) => {

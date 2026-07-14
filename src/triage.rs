@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use crate::bd::Issue;
 #[allow(unused_imports)]
 use crate::config::{Backend, Budgets, Ceiling, Cost, CostPolicy, Efficiency, RosterEntry, Tier};
-use crate::fields::{extract, MissingField, RoutingFields, Triage};
+use crate::fields::{MissingField, RoutingFields, Triage, extract};
 use crate::scan::{RepoSnapshot, SkipReason};
 
 // ---------------------------------------------------------------------------

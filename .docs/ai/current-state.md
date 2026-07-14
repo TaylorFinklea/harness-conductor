@@ -9,7 +9,7 @@ Rebrand `harness-conductor` → `conductor` COMPLETE (2026-07-12): source refs, 
 - [x] conductor-61f: consume Bursar status@2. Verify: `cargo test`
 - [x] conductor-sb6: provider-aware route explain. Verify: `cargo test triage::tests route::tests cli::tests::route_`
 - [x] conductor-oxm: persist evidence, dispatch recheck, 429 writeback. Verify: `cargo test cycle::tests dispatch_cycle::tests bursar::tests`
-- [ ] conductor-mus: provider-trust final gates and handoff. Verify: `cargo test`
+- [x] conductor-mus: provider-trust final gates and handoff. Verify: `cargo test`
 - [ ] conductor-6dv: immutable approval scope and item hashes. Verify: `cargo test plan::tests`
 - [ ] conductor-5ij: cycle selector parsing and enforcement. Verify: `cargo test cycle::tests deck::tests cli::tests`
 - [ ] conductor-xa5: bind dispatch to persisted scope; proposals inert when unscoped. Verify: `cargo test`

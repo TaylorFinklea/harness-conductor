@@ -16,7 +16,7 @@ use crate::bd::BdClient;
 use crate::bursar::BursarClient;
 use crate::config::{Config, CostPolicy};
 use crate::deck::{self, Bar, Block, CalloutLevel, Metric, Report, ReportStatus};
-use crate::fields::{extract, Triage};
+use crate::fields::{Triage, extract};
 use crate::plan::{CyclePlan, ProviderRouteRecord};
 use crate::scan::{self, RepoSnapshot, SkipReason, ZeroState};
 use crate::state::{self, JournalEntry, JournalSummary};
@@ -494,7 +494,7 @@ mod tests {
     use crate::bursar::test_support::FakeBursarClient;
     use crate::bursar::{Availability, BursarClient, ProviderStatus, StatusReport};
     use crate::config;
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
@@ -859,10 +859,12 @@ fallback = []
         assert!(healthy_candidate["expires_at"].is_string());
         assert_eq!(healthy_candidate["expiry_basis"], "human-override");
         assert_eq!(healthy_candidate["action"], "proceed");
-        assert!(healthy_candidate["reason"]
-            .as_str()
-            .unwrap()
-            .contains("bursar availability healthy"));
+        assert!(
+            healthy_candidate["reason"]
+                .as_str()
+                .unwrap()
+                .contains("bursar availability healthy")
+        );
         assert_eq!(healthy_candidate["outcome"], "selected");
 
         let deferred = &saved["provider_routes"][1];
@@ -870,16 +872,18 @@ fallback = []
         assert_eq!(deferred["selected_model"], Value::Null);
         assert_eq!(deferred["approved_models"].as_array().unwrap().len(), 0);
         assert_eq!(deferred["terminal_defer"], true);
-        assert!(deferred["candidates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|candidate| {
-                candidate["provider"] == "opencode-go"
-                    && candidate["availability"] == "exhausted"
-                    && candidate["outcome"] == "excluded"
-                    && candidate["exclusion_reasons"][0]["code"] == "provider-exhausted"
-            }));
+        assert!(
+            deferred["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| {
+                    candidate["provider"] == "opencode-go"
+                        && candidate["availability"] == "exhausted"
+                        && candidate["outcome"] == "excluded"
+                        && candidate["exclusion_reasons"][0]["code"] == "provider-exhausted"
+                })
+        );
 
         let report: Value =
             serde_json::from_slice(&std::fs::read(result.report_path).unwrap()).unwrap();
@@ -903,10 +907,12 @@ fallback = []
             .iter()
             .find(|block| block["type"] == "approval")
             .unwrap();
-        assert!(approval["prompt"]
-            .as_str()
-            .unwrap()
-            .contains("alpha/deferred → terminal defer"));
+        assert!(
+            approval["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("alpha/deferred → terminal defer")
+        );
     }
 
     fn assert_dry_run_report(result: &CycleResult, cycle_id: &str) {
@@ -1038,10 +1044,12 @@ dispatch_id = "test/senior"
             .iter()
             .find(|b| b["type"] == "callout" && b["tag"] == "SCAN-GAP")
             .expect("scan gap callout");
-        assert!(scan_gap_callout["markdown"]
-            .as_str()
-            .unwrap()
-            .contains("bad"));
+        assert!(
+            scan_gap_callout["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("bad")
+        );
 
         let plan_path = state.path().join("plans").join(format!("{cycle_id}.json"));
         let plan: serde_json::Value =

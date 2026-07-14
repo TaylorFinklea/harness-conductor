@@ -962,8 +962,7 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
                 b.use_bursar = expect_bool("budgets.use_bursar", val)?;
             }
             "unknown_429_cooldown" => {
-                b.unknown_429_cooldown_mins =
-                    expect_u32("budgets.unknown_429_cooldown", val)?;
+                b.unknown_429_cooldown_mins = expect_u32("budgets.unknown_429_cooldown", val)?;
                 if b.unknown_429_cooldown_mins == 0 {
                     return Err(ConfigError::new(
                         "budgets.unknown_429_cooldown must be greater than zero minutes",
@@ -1236,7 +1235,7 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
             Some(_) => {
                 return Err(ConfigError::new(format!(
                     "roster entry {i} field provider must be a string"
-                )))
+                )));
             }
             None => String::new(),
         };
@@ -1245,7 +1244,7 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
             Some(_) => {
                 return Err(ConfigError::new(format!(
                     "roster entry {i} field cost must be a string"
-                )))
+                )));
             }
             None => Cost::Paid,
         };

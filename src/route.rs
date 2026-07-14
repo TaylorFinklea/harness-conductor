@@ -147,10 +147,12 @@ mod tests {
                     )
                 })
         }));
-        assert!(advice
-            .audit
-            .iter()
-            .all(|entry| entry.reasons.iter().all(|reason| !reason.text.is_empty())));
+        assert!(
+            advice
+                .audit
+                .iter()
+                .all(|entry| entry.reasons.iter().all(|reason| !reason.text.is_empty()))
+        );
     }
 
     #[test]
@@ -198,14 +200,18 @@ mod tests {
                 .map(|candidate| candidate.model.as_str()),
             Some("fallback")
         );
-        assert!(advice
-            .selected
-            .as_ref()
-            .is_some_and(|candidate| { candidate.fallback.is_empty() }));
-        assert!(advice
-            .audit
-            .iter()
-            .any(|entry| { entry.model == "too-expensive" && !entry.eligible }));
+        assert!(
+            advice
+                .selected
+                .as_ref()
+                .is_some_and(|candidate| { candidate.fallback.is_empty() })
+        );
+        assert!(
+            advice
+                .audit
+                .iter()
+                .any(|entry| { entry.model == "too-expensive" && !entry.eligible })
+        );
         assert!(advice.audit.iter().any(|entry| {
             entry.model == "unconfigured"
                 && !entry.eligible
@@ -348,14 +354,14 @@ use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::str::FromStr;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::bursar::{
-    evaluate_budget, Availability, BudgetAction, BudgetDecision, BursarClient, StatusReport,
+    Availability, BudgetAction, BudgetDecision, BursarClient, StatusReport, evaluate_budget,
 };
 use crate::config::{Backend, Config, Cost, CostPolicy, Efficiency, RosterEntry, Tier};
 use crate::fields::RoutingFields;
-use crate::triage::{candidate_rejection, CandidateRejection};
+use crate::triage::{CandidateRejection, candidate_rejection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteIntent {
