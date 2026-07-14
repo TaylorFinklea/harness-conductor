@@ -168,3 +168,50 @@ is toil with no domain value, so ratatui is worth the dep. Critically, gating on
 parser's mis-attributes keys to the previous block and silently edits the WRONG
 model while still emitting valid TOML. Parseability is not correctness — hence
 structural equivalence. (Found by adversarial review, opencode-go/glm-5.2.)
+
+## [2026-07-14] backnotprop/orchestrator is mined for design, never adopted as a dependency
+
+**Context**: `backnotprop/orchestrator` (BUSL-1.1, ~31k LoC TS) is a kubectl-style
+process-supervision layer for agent workers across Claude Code, Codex, Copilot,
+Grok, and Pi. It explicitly disclaims Conductor's layer — ADR 0008 "do not require
+structured worker output in v1", ADR 0011 "parent-directed, no prebaked recipes" —
+so it competes with `dispatch.rs` alone, not with scan/triage/verify/ledger. Its
+README and ADR titles advertise worktree isolation, session resume, and provider-limit
+intelligence: three things we want. A title-deep comparison recommended adopting it
+behind the `Exec` trait (`dispatch.rs:129`).
+
+**Decision**: **Mine the design; take no dependency.** Reading the source
+(`conductor-iz7`, pinned `583acf4`, memo `docs/notes/orchestrator-recon.md`) refuted
+the premise. Concretely: (a) take their provider-limit detectors into Bursar —
+endpoints, the two-tier CLI fallback, the window+reset shape, the typed auth-failure
+taxonomy (`bursar-ejf`); (b) build a **native Rust client** over Codex's *own*
+app-server protocol (`conductor-2d4`); (c) borrow the tri-state degrade-honestly
+catalog shape for `roster_drift`; (d) build worktree isolation clean (`conductor-fia`).
+Close `conductor-kfq` (wrap-orchestrator spike) as wont-fix. Do not vendor or copy
+their code — BUSL-1.1 would carry into our tree.
+
+**Alternatives considered**: Adopt as one `Exec` impl behind the existing trait
+(the original recommendation); reject wholesale and revisit later.
+
+**Rationale**: Adoption's two justifying capabilities did not survive verification.
+**Worktree isolation does not exist** — `supportsWorktree`/`CwdPolicy` are unconsumed
+type surface (`runtime/types.ts:30-31,40`) and orchestrator never invokes git at all;
+our Arena worktrees already exceed it. **Session resume is codex-app-server-only** —
+Claude Code, Pi, Copilot and Grok all use the process executor, whose handle is
+`{completed, interrupt}` (`process.ts:399-401`), one-shot and identical to
+`dispatch.rs`; `sendMessage?`/`startGoal?` are optional members precisely because
+most executors lack them (`executors/types.ts:44-48`). Wrapping would therefore buy
+nothing for three of our four backends. And the resume protocol we *do* want —
+`thread/start`, `thread/resume`, `turn/start`, `account/rateLimits/read` — is
+**Codex's API, not orchestrator's**; we already depend on the `codex` binary, so we
+can speak it from Rust with no BUSL exposure and no Node toolchain.
+
+The disqualifier is verification. Their success oracle is `code === 0`
+(`process.ts:257-264`), cross-checked only against the worker's own output stream —
+so an **agy quota-exhausted no-op reports `succeeded`**. That is the exact failure the
+charter names ("exit codes are testimony; artifacts are evidence"), and it is why
+`dispatch.rs`'s `CommitProbe` classify (`dispatch.rs:140,483`, and the
+`exit_zero_with_no_new_commit_*` tests) is **strictly better** than what we would be
+adopting. We would have had to override their status model on day one. A supervisor
+whose notion of success we must overrule is not a supervisor we should depend on —
+it is a design to read and a protocol to reimplement.
