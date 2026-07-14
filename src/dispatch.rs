@@ -152,6 +152,29 @@ pub(crate) fn run<E: Exec, C: CommitProbe>(
     })
 }
 
+pub(crate) fn run_readonly<E: Exec + ?Sized>(
+    exec: &E,
+    request: &SpawnRequest,
+    timeout: Duration,
+) -> Result<()> {
+    let mut child = exec.spawn(request)?;
+    let process = wait_with_timeout_and_heartbeat(child.as_mut(), timeout, timeout, |_| Ok(()))?;
+    if process.timed_out {
+        return Err(DispatchError::new("read-only process timed out"));
+    }
+    if process.status.success {
+        Ok(())
+    } else {
+        Err(DispatchError::new(format!(
+            "read-only process exited with status {}",
+            process
+                .status
+                .code
+                .map_or_else(|| "signal".to_string(), |code| code.to_string())
+        )))
+    }
+}
+
 pub(crate) fn run_with_heartbeat<E, C, H>(
     exec: &E,
     commits: &C,
@@ -271,6 +294,66 @@ pub(crate) fn argv_for_backend(
             "--dangerously-skip-permissions".to_string(),
         ],
         Backend::Claude => strings(["claude", "-p", prompt, "--model", dispatch_id]),
+    })
+}
+
+pub(crate) fn readonly_argv_for_backend(
+    backend: Backend,
+    dispatch_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    prompt: &str,
+    state_dir: &Path,
+) -> Result<Vec<String>> {
+    Ok(match backend {
+        Backend::Pi => strings([
+            "pi",
+            "--model",
+            dispatch_id,
+            "--thinking",
+            PI_THINKING,
+            "--no-tools",
+            "-p",
+            prompt,
+        ]),
+        Backend::Codex => {
+            let effort = reasoning_effort.ok_or_else(|| {
+                DispatchError::new("Codex dispatch requires an explicit reasoning_effort")
+            })?;
+            vec![
+                "codex".to_string(),
+                "exec".to_string(),
+                "--model".to_string(),
+                dispatch_id.to_string(),
+                "--config".to_string(),
+                format!("model_reasoning_effort=\"{}\"", effort.as_str()),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                prompt.to_string(),
+            ]
+        }
+        Backend::Agy => vec![
+            "agy".to_string(),
+            "-p".to_string(),
+            prompt.to_string(),
+            "--add-dir".to_string(),
+            state_dir.display().to_string(),
+            "--model".to_string(),
+            dispatch_id.to_string(),
+            "--mode".to_string(),
+            "plan".to_string(),
+            "--sandbox".to_string(),
+        ],
+        Backend::Claude => strings([
+            "claude",
+            "-p",
+            prompt,
+            "--model",
+            dispatch_id,
+            "--permission-mode",
+            "plan",
+            "--tools",
+            "",
+        ]),
     })
 }
 
@@ -648,6 +731,78 @@ mod tests {
         assert_eq!(
             exec.spawned().argv,
             vec!["claude", "-p", PROMPT, "--model", "claude-sonnet-5"]
+        );
+    }
+
+    #[test]
+    fn adversarial_readonly_argv_disables_tools_for_every_backend() {
+        let repo = Path::new("/tmp/review-state");
+
+        assert_eq!(
+            readonly_argv_for_backend(Backend::Pi, "opencode-go/glm-5.2", None, PROMPT, repo,)
+                .expect("pi readonly argv"),
+            vec![
+                "pi",
+                "--model",
+                "opencode-go/glm-5.2",
+                "--thinking",
+                "xhigh",
+                "--no-tools",
+                "-p",
+                PROMPT,
+            ]
+        );
+        assert_eq!(
+            readonly_argv_for_backend(
+                Backend::Codex,
+                "gpt-5.6-terra",
+                Some(ReasoningEffort::Xhigh),
+                PROMPT,
+                repo,
+            )
+            .expect("codex readonly argv"),
+            vec![
+                "codex",
+                "exec",
+                "--model",
+                "gpt-5.6-terra",
+                "--config",
+                "model_reasoning_effort=\"xhigh\"",
+                "--sandbox",
+                "read-only",
+                PROMPT,
+            ]
+        );
+        assert_eq!(
+            readonly_argv_for_backend(Backend::Agy, "Gemini 3.5 Flash (High)", None, PROMPT, repo,)
+                .expect("agy readonly argv"),
+            vec![
+                "agy",
+                "-p",
+                PROMPT,
+                "--add-dir",
+                "/tmp/review-state",
+                "--model",
+                "Gemini 3.5 Flash (High)",
+                "--mode",
+                "plan",
+                "--sandbox",
+            ]
+        );
+        assert_eq!(
+            readonly_argv_for_backend(Backend::Claude, "claude-sonnet-5", None, PROMPT, repo,)
+                .expect("claude readonly argv"),
+            vec![
+                "claude",
+                "-p",
+                PROMPT,
+                "--model",
+                "claude-sonnet-5",
+                "--permission-mode",
+                "plan",
+                "--tools",
+                "",
+            ]
         );
     }
 
