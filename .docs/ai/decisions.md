@@ -209,9 +209,20 @@ can speak it from Rust with no BUSL exposure and no Node toolchain.
 The disqualifier is verification. Their success oracle is `code === 0`
 (`process.ts:257-264`), cross-checked only against the worker's own output stream —
 so an **agy quota-exhausted no-op reports `succeeded`**. That is the exact failure the
-charter names ("exit codes are testimony; artifacts are evidence"), and it is why
-`dispatch.rs`'s `CommitProbe` classify (`dispatch.rs:140,483`, and the
-`exit_zero_with_no_new_commit_*` tests) is **strictly better** than what we would be
-adopting. We would have had to override their status model on day one. A supervisor
-whose notion of success we must overrule is not a supervisor we should depend on —
-it is a design to read and a protocol to reimplement.
+charter names ("exit codes are testimony; artifacts are evidence"), and `dispatch.rs`'s
+`CommitProbe` classify (`dispatch.rs:140,483`, and the `exit_zero_with_no_new_commit_*`
+tests) is materially better: it at least demands an artifact. We would have had to
+override their status model on day one. A supervisor whose notion of success we must
+overrule is not a supervisor we should depend on — it is a design to read and a
+protocol to reimplement.
+
+**Correction (same day, on discovering `conductor-1i9`)**: an earlier draft of this ADR
+called our classify "strictly better." That overclaims. `conductor-1i9` establishes that
+`CommitProbe` is **itself forgeable** — it declares success on *any* HEAD change
+(`dispatch.rs:350-352`, `verify.rs:161-162,223`), not on the worker's *own* commit, so a
+concurrent commit satisfies it. Ours demands an artifact but does not check who produced
+it; theirs demands nothing but an exit code. The decision above is unchanged — we would
+still be importing the weaker of two flawed oracles, and would still have to override it
+— but the honest statement is that **both success models are broken, ours less badly**,
+and `conductor-1i9` is the P0 that fixes ours. This ADR is not a claim that our
+verification is sound; it is a claim that theirs is not worth adopting.
