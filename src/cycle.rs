@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::bd::BdClient;
+use crate::bursar::BursarClient;
 use crate::config::{Config, CostPolicy};
 use crate::deck::{self, Bar, Block, CalloutLevel, Metric, Report, ReportStatus};
-use crate::plan::CyclePlan;
+use crate::fields::{extract, Triage};
+use crate::plan::{CyclePlan, ProviderRouteRecord};
 use crate::scan::{self, RepoSnapshot, SkipReason, ZeroState};
 use crate::state::{self, JournalEntry, JournalSummary};
 use crate::triage::{self, Flag, Plan, RatchetState, SkipCode};
@@ -55,6 +57,7 @@ pub(crate) struct CycleResult {
 pub(crate) fn run_dry_run(
     cfg: &Config,
     client: &dyn BdClient,
+    bursar: &dyn BursarClient,
     reports_home: &Path,
     state_dir: &Path,
 ) -> Result<CycleResult, CycleError> {
@@ -62,13 +65,22 @@ pub(crate) fn run_dry_run(
     let cycle_id = now.format("cycle-%Y%m%d-%H%M%S").to_string();
     let created_at = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    run_dry_run_with_timestamps(cfg, client, reports_home, state_dir, &cycle_id, &created_at)
+    run_dry_run_with_timestamps(
+        cfg,
+        client,
+        bursar,
+        reports_home,
+        state_dir,
+        &cycle_id,
+        &created_at,
+    )
 }
 
 /// Runs a dry-run cycle with explicit timestamps (for deterministic tests).
 pub(crate) fn run_dry_run_with_timestamps(
     cfg: &Config,
     client: &dyn BdClient,
+    bursar: &dyn BursarClient,
     reports_home: &Path,
     state_dir: &Path,
     cycle_id: &str,
@@ -94,18 +106,20 @@ pub(crate) fn run_dry_run_with_timestamps(
     );
 
     // 3. Build and save cycle plan
-    let cycle_plan = CyclePlan::from_triage(cycle_id, created_at, &plan);
+    let provider_advice = provider_route_advice(cfg, &snapshots, &plan, bursar)?;
+    let mut cycle_plan = CyclePlan::from_triage(cycle_id, created_at, &plan);
+    cycle_plan.apply_provider_routes(provider_advice);
     cycle_plan
         .save(state_dir)
         .map_err(|e| CycleError::new(format!("plan save: {e}")))?;
 
     // 4. Build and write harness-deck report
-    let report = build_report(cycle_id, created_at, &snapshots, &plan)?;
+    let report = build_report(cycle_id, created_at, &snapshots, &plan, &cycle_plan)?;
     let report_path = deck::write_report(reports_home, &report)
         .map_err(|e| CycleError::new(format!("report: {e}")))?;
 
     // 5. Write journal entry
-    let summary = compute_summary(&snapshots, &plan);
+    let summary = compute_summary(&snapshots, &cycle_plan);
     let entry = JournalEntry {
         id: cycle_id.to_string(),
         completed_at: created_at.to_string(),
@@ -121,18 +135,75 @@ pub(crate) fn run_dry_run_with_timestamps(
     })
 }
 
+fn provider_route_advice(
+    cfg: &Config,
+    snapshots: &[RepoSnapshot],
+    plan: &Plan,
+    bursar: &dyn BursarClient,
+) -> Result<Vec<(String, crate::route::RouteAdvice)>, CycleError> {
+    let decisions =
+        crate::route::snapshot_provider_decisions(bursar, &cfg.roster, cfg.budgets.use_bursar);
+    let mut dispatch_count_by_model = HashMap::new();
+    let mut advice = Vec::with_capacity(plan.dispatches.len() + plan.proposals.len());
+
+    for (repo, issue_id, dispatched) in plan
+        .dispatches
+        .iter()
+        .map(|entry| (entry.repo.as_str(), entry.issue_id.as_str(), true))
+        .chain(
+            plan.proposals
+                .iter()
+                .map(|entry| (entry.repo.as_str(), entry.issue_id.as_str(), false)),
+        )
+    {
+        let issue = snapshots
+            .iter()
+            .find(|snapshot| snapshot.name == repo)
+            .and_then(|snapshot| snapshot.ready.iter().find(|issue| issue.id == issue_id))
+            .ok_or_else(|| {
+                CycleError::new(format!(
+                    "provider route: missing scan item {repo}/{issue_id}"
+                ))
+            })?;
+        let Triage::Triaged(routing) = extract(issue) else {
+            return Err(CycleError::new(format!(
+                "provider route: routing fields disappeared for {repo}/{issue_id}"
+            )));
+        };
+        let route = crate::route::select(
+            repo,
+            &routing,
+            cfg.cost_policy_for(repo),
+            &cfg.roster,
+            &decisions,
+            &dispatch_count_by_model,
+            None,
+        );
+        if dispatched {
+            if let Some(selected) = route.selected.as_ref() {
+                *dispatch_count_by_model
+                    .entry(selected.model.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+        advice.push((issue_id.to_string(), route));
+    }
+    Ok(advice)
+}
+
 fn build_report(
     cycle_id: &str,
     created_at: &str,
     snapshots: &[RepoSnapshot],
     plan: &Plan,
+    cycle_plan: &CyclePlan,
 ) -> Result<Report, CycleError> {
     let mut blocks = Vec::new();
 
     // --- Metrics block ---
     let repos_scanned = snapshots.len();
     let ready_items: usize = snapshots.iter().map(|s| s.ready.len()).sum();
-    let triaged_count = plan.proposals.len() + plan.dispatches.len();
+    let triaged_count = cycle_plan.proposals.len() + cycle_plan.dispatches.len();
     let flagged_count = plan.flags.len();
     let triaged_pct = (triaged_count * 100).checked_div(ready_items).unwrap_or(0);
 
@@ -142,8 +213,8 @@ fn build_report(
             Metric::new("Repos scanned", repos_scanned.to_string()),
             Metric::new("Ready items", ready_items.to_string()),
             Metric::new("Triaged", triaged_pct.to_string()).with_unit("%"),
-            Metric::new("Proposed", plan.proposals.len().to_string()),
-            Metric::new("Dispatched", plan.dispatches.len().to_string()),
+            Metric::new("Proposed", cycle_plan.proposals.len().to_string()),
+            Metric::new("Dispatched", cycle_plan.dispatches.len().to_string()),
             Metric::new("Flagged", flagged_count.to_string()),
         ],
         vec![Bar::new(
@@ -169,8 +240,12 @@ fn build_report(
         .collect();
     blocks.push(Block::table("Fleet Queue", columns, rows));
 
+    if !cycle_plan.provider_routes.is_empty() {
+        blocks.push(provider_route_audit_table(&cycle_plan.provider_routes));
+    }
+
     // --- Approval block (informational in dry-run) ---
-    let dispatch_summary = format_dispatch_plan(plan);
+    let dispatch_summary = format_dispatch_plan(cycle_plan);
     blocks.push(Block::approval("dispatch-plan", dispatch_summary));
 
     blocks.extend(build_callouts(plan));
@@ -183,6 +258,55 @@ fn build_report(
         blocks,
     )
     .map_err(|e| CycleError::new(format!("report: {e}")))
+}
+
+fn provider_route_audit_table(routes: &[ProviderRouteRecord]) -> Block {
+    let columns = vec![
+        "Item",
+        "Outcome",
+        "Model",
+        "Provider",
+        "Backend",
+        "Dispatch ID",
+        "Reasoning",
+        "Availability",
+        "Source",
+        "Checked",
+        "Data as of",
+        "Expires",
+        "Expiry basis",
+        "Action",
+        "Reason",
+        "Exclusions",
+    ];
+    let rows = routes.iter().flat_map(|route| {
+        route.candidates.iter().map(|candidate| {
+            vec![
+                format!("{}/{}", route.repo, route.issue_id),
+                candidate.outcome.clone(),
+                candidate.model.clone(),
+                candidate.provider.clone(),
+                candidate.backend.clone(),
+                candidate.dispatch_id.clone(),
+                candidate.reasoning_effort.clone().unwrap_or_default(),
+                candidate.availability.clone().unwrap_or_default(),
+                candidate.source.clone().unwrap_or_default(),
+                candidate.checked_at.clone().unwrap_or_default(),
+                candidate.data_as_of.clone().unwrap_or_default(),
+                candidate.expires_at.clone().unwrap_or_default(),
+                candidate.expiry_basis.clone().unwrap_or_default(),
+                candidate.action.clone().unwrap_or_default(),
+                candidate.reason.clone().unwrap_or_default(),
+                candidate
+                    .exclusion_reasons
+                    .iter()
+                    .map(|reason| format!("{}: {}", reason.code, reason.reason))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ]
+        })
+    });
+    Block::table("Provider Candidate Audit", columns, rows)
 }
 
 fn build_callouts(plan: &Plan) -> Vec<Block> {
@@ -308,8 +432,8 @@ fn repo_state_str(s: &RepoSnapshot) -> String {
     }
 }
 
-fn format_dispatch_plan(plan: &Plan) -> String {
-    if plan.dispatches.is_empty() && plan.proposals.is_empty() {
+fn format_dispatch_plan(plan: &CyclePlan) -> String {
+    if plan.dispatches.is_empty() && plan.proposals.is_empty() && plan.provider_routes.is_empty() {
         return "No dispatchable items.".to_string();
     }
     let mut lines = Vec::new();
@@ -328,10 +452,29 @@ fn format_dispatch_plan(plan: &Plan) -> String {
             ));
         }
     }
+    if !plan.provider_routes.is_empty() {
+        lines.push("**Approved provider envelopes:**".to_string());
+        for route in &plan.provider_routes {
+            if route.terminal_defer {
+                lines.push(format!(
+                    "- {}/{} → terminal defer (no approved model)",
+                    route.repo, route.issue_id
+                ));
+            } else {
+                lines.push(format!(
+                    "- {}/{} → selected {}; approved [{}]",
+                    route.repo,
+                    route.issue_id,
+                    route.selected_model.as_deref().unwrap_or("none"),
+                    route.approved_models.join(", ")
+                ));
+            }
+        }
+    }
     lines.join("\n")
 }
 
-fn compute_summary(snapshots: &[RepoSnapshot], plan: &Plan) -> JournalSummary {
+fn compute_summary(snapshots: &[RepoSnapshot], plan: &CyclePlan) -> JournalSummary {
     let ready: u64 = snapshots.iter().map(|s| s.ready.len() as u64).sum();
     JournalSummary {
         scanned: snapshots.len() as u64,
@@ -348,9 +491,11 @@ fn compute_summary(snapshots: &[RepoSnapshot], plan: &Plan) -> JournalSummary {
 mod tests {
     use super::*;
     use crate::bd::{BdError, Comment, Issue};
+    use crate::bursar::test_support::FakeBursarClient;
+    use crate::bursar::{Availability, BursarClient, ProviderStatus, StatusReport};
     use crate::config;
-    use serde_json::json;
-    use std::cell::RefCell;
+    use serde_json::{json, Map, Value};
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -562,7 +707,207 @@ mod tests {
         BdError::json("bd ready", &err)
     }
 
+    struct CountingBursar {
+        report: StatusReport,
+        calls: Cell<usize>,
+    }
+
+    impl BursarClient for CountingBursar {
+        fn status(&self) -> crate::bursar::Result<StatusReport> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.report.clone())
+        }
+    }
+
+    fn provider_status_report() -> StatusReport {
+        let checked = Utc::now();
+        let checked_at = checked.to_rfc3339();
+        let data_as_of = (checked - chrono::Duration::seconds(1)).to_rfc3339();
+        let expires_at = (checked + chrono::Duration::minutes(15)).to_rfc3339();
+        let providers = [
+            ("anthropic", Availability::Unknown),
+            ("codex", Availability::Healthy),
+            ("opencode-go", Availability::Exhausted),
+            ("agy", Availability::Unknown),
+        ]
+        .into_iter()
+        .map(|(provider, availability)| {
+            let mut extra = Map::new();
+            extra.insert(
+                "observation_model".to_string(),
+                Value::String(format!("{provider}-observed-model")),
+            );
+            extra.insert(
+                "observation_expiry_basis".to_string(),
+                Value::String("human-override".to_string()),
+            );
+            (
+                provider.to_string(),
+                ProviderStatus {
+                    availability,
+                    source: "cycle-test".to_string(),
+                    checked_at: checked_at.clone(),
+                    data_as_of: Some(data_as_of.clone()),
+                    expires_at: Some(expires_at.clone()),
+                    windows: Vec::new(),
+                    reason: (availability != Availability::Healthy)
+                        .then(|| "fixture limit".to_string()),
+                    extra,
+                },
+            )
+        })
+        .collect();
+        StatusReport {
+            schema: "bursar/status@2".to_string(),
+            checked_at,
+            providers,
+        }
+    }
+
     // --- The test ---
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single end-to-end assertion keeps saved-plan and report evidence aligned"
+    )]
+    fn cycle_persists_one_provider_snapshot_and_terminal_defers() {
+        let fleet = TempDir::new("provider-fleet");
+        let reports = TempDir::new("provider-reports");
+        let state = TempDir::new("provider-state");
+        let repo = fleet.path().join("alpha");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_beads_repo(&repo);
+
+        let config_src = format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+use_bursar = true
+
+[[roster]]
+name = "healthy-junior"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "codex"
+dispatch_id = "gpt-healthy"
+reasoning_effort = "medium"
+provider = "codex"
+fallback = []
+
+[[roster]]
+name = "exhausted-senior"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "opencode-go/exhausted"
+provider = "opencode-go"
+fallback = []
+"#,
+            fleet.path().display()
+        );
+        let cfg = config::parse_str(&config_src).unwrap();
+        let bd = FakeBdClient::new();
+        bd.set_ready(
+            &repo,
+            vec![
+                make_issue_with_metadata("healthy", 1, "junior", "S"),
+                make_issue_with_metadata("deferred", 2, "senior", "M"),
+            ],
+        );
+        bd.set_count(&repo, 2);
+        bd.set_blocked(&repo, vec![]);
+        let bursar = CountingBursar {
+            report: provider_status_report(),
+            calls: Cell::new(0),
+        };
+
+        let result = run_dry_run_with_timestamps(
+            &cfg,
+            &bd,
+            &bursar,
+            reports.path(),
+            state.path(),
+            "cycle-20260713-120000",
+            "2026-07-13T12:00:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(bursar.calls.get(), 1, "one Bursar status call per cycle");
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("plans/cycle-20260713-120000.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["proposals"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["proposals"][0]["model"], "healthy-junior");
+        assert_eq!(saved["provider_routes"].as_array().unwrap().len(), 2);
+        let healthy = &saved["provider_routes"][0];
+        assert_eq!(healthy["selected_model"], "healthy-junior");
+        assert_eq!(healthy["approved_models"][0], "healthy-junior");
+        let healthy_candidate = &healthy["candidates"][0];
+        assert_eq!(healthy_candidate["provider"], "codex");
+        assert_eq!(healthy_candidate["backend"], "codex");
+        assert_eq!(healthy_candidate["dispatch_id"], "gpt-healthy");
+        assert_eq!(healthy_candidate["reasoning_effort"], "medium");
+        assert_eq!(healthy_candidate["availability"], "healthy");
+        assert_eq!(healthy_candidate["source"], "cycle-test");
+        assert!(healthy_candidate["checked_at"].is_string());
+        assert!(healthy_candidate["data_as_of"].is_string());
+        assert!(healthy_candidate["expires_at"].is_string());
+        assert_eq!(healthy_candidate["expiry_basis"], "human-override");
+        assert_eq!(healthy_candidate["action"], "proceed");
+        assert!(healthy_candidate["reason"]
+            .as_str()
+            .unwrap()
+            .contains("bursar availability healthy"));
+        assert_eq!(healthy_candidate["outcome"], "selected");
+
+        let deferred = &saved["provider_routes"][1];
+        assert_eq!(deferred["issue_id"], "deferred");
+        assert_eq!(deferred["selected_model"], Value::Null);
+        assert_eq!(deferred["approved_models"].as_array().unwrap().len(), 0);
+        assert_eq!(deferred["terminal_defer"], true);
+        assert!(deferred["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| {
+                candidate["provider"] == "opencode-go"
+                    && candidate["availability"] == "exhausted"
+                    && candidate["outcome"] == "excluded"
+                    && candidate["exclusion_reasons"][0]["code"] == "provider-exhausted"
+            }));
+
+        let report: Value =
+            serde_json::from_slice(&std::fs::read(result.report_path).unwrap()).unwrap();
+        let audit = report["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "table" && block["title"] == "Provider Candidate Audit")
+            .expect("provider candidate audit table");
+        assert_eq!(audit["columns"].as_array().unwrap().len(), 16);
+        assert!(audit["rows"].as_array().unwrap().iter().any(|row| {
+            row[0] == "alpha/deferred"
+                && row[2] == "exhausted-senior"
+                && row[3] == "opencode-go"
+                && row[7] == "exhausted"
+                && row[15].as_str().unwrap().contains("provider-exhausted")
+        }));
+        let approval = report["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "approval")
+            .unwrap();
+        assert!(approval["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("alpha/deferred → terminal defer"));
+    }
 
     fn assert_dry_run_report(result: &CycleResult, cycle_id: &str) {
         // --- Verify cycle-id ---
@@ -633,6 +978,9 @@ mod tests {
             r#"[scan]
 root = "{}"
 
+[budgets]
+use_bursar = false
+
 [[roster]]
 name = "test-senior"
 tier = "senior"
@@ -656,6 +1004,7 @@ dispatch_id = "test/senior"
         let result = run_dry_run_with_timestamps(
             &cfg,
             &client,
+            &FakeBursarClient::unavailable(),
             reports.path(),
             state.path(),
             cycle_id,
@@ -729,6 +1078,7 @@ root = "{}"
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 max_external_dispatches = 4
+use_bursar = false
 
 [[roster]]
 name = "test-senior"
@@ -785,6 +1135,7 @@ dispatch_id = "test/junior"
         let result = run_dry_run_with_timestamps(
             &cfg,
             &client,
+            &FakeBursarClient::unavailable(),
             reports.path(),
             state.path(),
             cycle_id,

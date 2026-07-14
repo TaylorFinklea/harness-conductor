@@ -296,6 +296,52 @@ mod tests {
             Some("senior-caution")
         );
     }
+
+    #[test]
+    fn approved_fallbacks_exclude_unconfigured_advisory_alternatives() {
+        let mut primary = paid_entry("primary", Tier::Senior, Efficiency::Lean, "opencode-go");
+        primary.fallback = vec!["configured".to_string()];
+        let roster = vec![
+            primary,
+            paid_entry("configured", Tier::Senior, Efficiency::Std, "codex"),
+            paid_entry("advisory", Tier::Senior, Efficiency::Heavy, "anthropic"),
+        ];
+        let advice = select(
+            "repo",
+            &RoutingFields {
+                tier_floor: Tier::Senior,
+                complexity: Ceiling::M,
+                verify_cmd: None,
+                trains_ok: false,
+            },
+            CostPolicy::Proprietary,
+            &roster,
+            &decisions(&[
+                ("opencode-go", BudgetAction::Proceed, Availability::Healthy),
+                ("codex", BudgetAction::Proceed, Availability::Healthy),
+                ("anthropic", BudgetAction::Proceed, Availability::Healthy),
+            ]),
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(
+            advice
+                .alternatives
+                .iter()
+                .map(|candidate| candidate.model.as_str())
+                .collect::<Vec<_>>(),
+            ["configured", "advisory"]
+        );
+        assert_eq!(
+            advice
+                .approved_fallbacks
+                .iter()
+                .map(|candidate| candidate.model.as_str())
+                .collect::<Vec<_>>(),
+            ["configured"]
+        );
+    }
 }
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Write as _};
@@ -409,6 +455,7 @@ pub(crate) struct RouteAdvice {
     pub(crate) intent: Option<RouteIntent>,
     pub(crate) selected: Option<RouteCandidate>,
     pub(crate) alternatives: Vec<RouteCandidate>,
+    pub(crate) approved_fallbacks: Vec<RouteCandidate>,
     pub(crate) audit: Vec<CandidateAudit>,
 }
 
@@ -555,6 +602,23 @@ fn select_impl(
         .take(2)
         .map(|(_, entry, decision)| candidate(entry, *decision))
         .collect::<Vec<_>>();
+    let approved_fallbacks = if fallback_names.is_some() {
+        alternatives.clone()
+    } else {
+        selected.as_ref().map_or_else(Vec::new, |selected| {
+            selected
+                .fallback
+                .iter()
+                .filter_map(|name| {
+                    ranked
+                        .iter()
+                        .find(|(_, entry, _)| entry.name == *name)
+                        .map(|(_, entry, decision)| candidate(entry, *decision))
+                })
+                .take(2)
+                .collect()
+        })
+    };
     if let Some(selected) = selected.as_ref() {
         if let Some(entry) = audit.iter_mut().find(|item| item.model == selected.model) {
             entry.reasons.push(RouteReason {
@@ -580,6 +644,7 @@ fn select_impl(
         intent,
         selected,
         alternatives,
+        approved_fallbacks,
         audit,
     }
 }
@@ -784,6 +849,7 @@ impl RouteAdvice {
             "intent": self.intent.map(RouteIntent::label),
             "selected": self.selected.as_ref().map(candidate_json),
             "alternatives": self.alternatives.iter().map(candidate_json).collect::<Vec<_>>(),
+            "approved_fallbacks": self.approved_fallbacks.iter().map(candidate_json).collect::<Vec<_>>(),
             "audit": self.audit.iter().map(audit_json).collect::<Vec<_>>(),
         })
     }
@@ -802,6 +868,14 @@ impl RouteAdvice {
         } else {
             output.push_str("alternatives:\n");
             for candidate in &self.alternatives {
+                write_candidate_human(&mut output, "-", candidate);
+            }
+        }
+        if self.approved_fallbacks.is_empty() {
+            output.push_str("approved fallbacks: none\n");
+        } else {
+            output.push_str("approved fallbacks:\n");
+            for candidate in &self.approved_fallbacks {
                 write_candidate_human(&mut output, "-", candidate);
             }
         }

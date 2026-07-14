@@ -746,7 +746,8 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     let state_dir = state_dir();
 
     let client = crate::bd::CommandBdClient::new();
-    match crate::cycle::run_dry_run(&cfg, &client, &reports_home, &state_dir) {
+    let bursar = crate::bursar::CommandBursarClient::new();
+    match crate::cycle::run_dry_run(&cfg, &client, &bursar, &reports_home, &state_dir) {
         Ok(result) => {
             println!("cycle {}: dry-run complete", result.cycle_id);
             println!("report: {}", result.report_path.display());

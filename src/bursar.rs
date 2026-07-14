@@ -175,9 +175,8 @@ pub(crate) enum ObservationExpiryBasis {
     LocalCooldown,
 }
 
-#[allow(dead_code)]
 impl ObservationExpiryBasis {
-    const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::ProviderReset => "provider-reset",
             Self::LocalCooldown => "local-cooldown",
@@ -193,9 +192,8 @@ pub(crate) enum RuntimeLimitReason {
     RateLimit,
 }
 
-#[allow(dead_code)]
 impl RuntimeLimitReason {
-    const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Http429 => "runtime HTTP 429",
             Self::QuotaExceeded => "runtime quota exceeded",
@@ -205,7 +203,6 @@ impl RuntimeLimitReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct ObservationRequest {
     pub(crate) provider: String,
     pub(crate) model: Option<String>,
@@ -214,7 +211,6 @@ pub(crate) struct ObservationRequest {
     pub(crate) reason: RuntimeLimitReason,
 }
 
-#[allow(dead_code)]
 impl ObservationRequest {
     pub(crate) fn runtime_limit(
         provider: impl Into<String>,
@@ -591,22 +587,38 @@ fn reason_suffix(reason: Option<&str>) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[derive(Debug, Clone)]
     pub(crate) struct FakeBursarClient {
         result: Result<StatusReport>,
+        observe_result: Result<()>,
+        observations: Rc<RefCell<Vec<ObservationRequest>>>,
     }
 
     impl FakeBursarClient {
-        pub(crate) fn unavailable() -> Self {
+        fn from_result(result: Result<StatusReport>) -> Self {
             Self {
-                result: Err(BursarError::unavailable("bursar unavailable on PATH")),
+                result,
+                observe_result: Ok(()),
+                observations: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+
+        pub(crate) fn unavailable() -> Self {
+            Self::from_result(Err(BursarError::unavailable("bursar unavailable on PATH")))
         }
 
         pub(crate) fn with_provider_availability(
             provider: &str,
             availability: Availability,
+        ) -> Self {
+            Self::with_provider_availabilities(&[(provider, availability)])
+        }
+
+        pub(crate) fn with_provider_availabilities(
+            availability_by_provider: &[(&str, Availability)],
         ) -> Self {
             let checked_at = Utc::now().to_rfc3339();
             let mut providers: BTreeMap<String, ProviderStatus> = PROVIDERS
@@ -627,52 +639,63 @@ pub(crate) mod test_support {
                     )
                 })
                 .collect();
-            let provider = canonical_provider_key(provider);
-            if let Some(status) = providers.get_mut(provider) {
-                status.availability = availability;
-                status.reason =
-                    (availability != Availability::Healthy).then(|| "test status".to_string());
+            for (provider, availability) in availability_by_provider {
+                if let Some(status) = providers.get_mut(canonical_provider_key(provider)) {
+                    status.availability = *availability;
+                    status.reason =
+                        (*availability != Availability::Healthy).then(|| "test status".to_string());
+                }
             }
-            Self {
-                result: Ok(StatusReport {
-                    schema: SCHEMA.to_string(),
-                    checked_at,
-                    providers,
-                }),
-            }
+            Self::from_result(Ok(StatusReport {
+                schema: SCHEMA.to_string(),
+                checked_at,
+                providers,
+            }))
         }
 
         pub(crate) fn without_provider() -> Self {
-            Self {
-                result: Ok(StatusReport {
-                    schema: SCHEMA.to_string(),
-                    checked_at: Utc::now().to_rfc3339(),
-                    providers: PROVIDERS
-                        .into_iter()
-                        .map(|provider| {
-                            (
-                                provider.to_string(),
-                                ProviderStatus {
-                                    availability: Availability::Unknown,
-                                    source: "test".to_string(),
-                                    checked_at: Utc::now().to_rfc3339(),
-                                    data_as_of: None,
-                                    expires_at: None,
-                                    windows: Vec::new(),
-                                    reason: Some("test status".to_string()),
-                                    extra: Map::new(),
-                                },
-                            )
-                        })
-                        .collect(),
-                }),
-            }
+            Self::from_result(Ok(StatusReport {
+                schema: SCHEMA.to_string(),
+                checked_at: Utc::now().to_rfc3339(),
+                providers: PROVIDERS
+                    .into_iter()
+                    .map(|provider| {
+                        (
+                            provider.to_string(),
+                            ProviderStatus {
+                                availability: Availability::Unknown,
+                                source: "test".to_string(),
+                                checked_at: Utc::now().to_rfc3339(),
+                                data_as_of: None,
+                                expires_at: None,
+                                windows: Vec::new(),
+                                reason: Some("test status".to_string()),
+                                extra: Map::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+            }))
+        }
+
+        pub(crate) fn with_observe_failure(mut self) -> Self {
+            self.observe_result = Err(BursarError::command("fixture observe failure"));
+            self
+        }
+
+        pub(crate) fn observations(&self) -> Vec<ObservationRequest> {
+            self.observations.borrow().clone()
         }
     }
 
     impl BursarClient for FakeBursarClient {
         fn status(&self) -> Result<StatusReport> {
             self.result.clone()
+        }
+
+        fn observe(&self, request: &ObservationRequest) -> Result<()> {
+            self.observations.borrow_mut().push(request.clone());
+            self.observe_result.clone()
         }
     }
 }

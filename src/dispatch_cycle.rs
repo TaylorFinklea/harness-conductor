@@ -6,16 +6,19 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use crate::bd::{BdClient, Issue};
-use crate::bursar::{self, BudgetAction, BudgetDecision, BursarClient};
+use crate::bursar::{
+    self, BudgetAction, BudgetDecision, BursarClient, ObservationExpiryBasis, ObservationRequest,
+    RuntimeLimitReason,
+};
 use crate::config::{Backend, Ceiling, Config, Cost, CostPolicy, RosterEntry, Tier};
 use crate::deck::{self, CalloutLevel, LiveUpdate, ReportStatus};
 use crate::dispatch::{self, CommitProbe, DispatchRequest, Exec};
 use crate::fields::{self, RoutingFields, Triage};
 use crate::ledger::{self, LedgerRow};
-use crate::plan::CyclePlan;
+use crate::plan::{CyclePlan, ProviderRouteRecord};
 use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
 
@@ -105,6 +108,7 @@ struct PlannedItem {
     issue_id: String,
     model: String,
     verify_cmd: Option<String>,
+    approved_route: Option<ProviderRouteRecord>,
 }
 
 #[expect(
@@ -226,14 +230,23 @@ fn planned_items(plan: &CyclePlan) -> Vec<PlannedItem> {
         issue_id: entry.issue_id.clone(),
         model: entry.model.clone(),
         verify_cmd: Some(entry.verify_cmd.clone()),
+        approved_route: approved_route(plan, &entry.repo, &entry.issue_id),
     }));
     items.extend(plan.proposals.iter().map(|entry| PlannedItem {
         repo: entry.repo.clone(),
         issue_id: entry.issue_id.clone(),
         model: entry.model.clone(),
         verify_cmd: None,
+        approved_route: approved_route(plan, &entry.repo, &entry.issue_id),
     }));
     items
+}
+
+fn approved_route(plan: &CyclePlan, repo: &str, issue_id: &str) -> Option<ProviderRouteRecord> {
+    plan.provider_routes
+        .iter()
+        .find(|route| route.repo == repo && route.issue_id == issue_id)
+        .cloned()
 }
 
 struct DispatchOneResult {
@@ -249,7 +262,7 @@ struct WorkerAttempt {
 
 enum WorkerChainOutcome {
     Ran(WorkerAttempt),
-    Deferred(String),
+    Deferred { summary: String, attempts: u64 },
 }
 
 #[expect(
@@ -359,15 +372,17 @@ fn dispatch_one<
     })?;
     let worker_attempt = match worker_outcome {
         WorkerChainOutcome::Ran(worker_attempt) => worker_attempt,
-        WorkerChainOutcome::Deferred(summary) => {
+        WorkerChainOutcome::Deferred { summary, attempts } => {
             let _ = bd.release(&repo_path, &item.issue_id);
+            let disposition = if attempts == 0 {
+                format!("budget deferred: {summary}")
+            } else {
+                format!("provider chain deferred after {attempts} worker attempt(s): {summary}")
+            };
             let _ = bd.comment(
                 &repo_path,
                 &item.issue_id,
-                &format!(
-                    "conductor: {cycle_id} {} budget deferred: {summary}",
-                    item.issue_id
-                ),
+                &format!("conductor: {cycle_id} {} {disposition}", item.issue_id),
             );
             append_ledger(
                 ledger_path,
@@ -378,11 +393,11 @@ fn dispatch_one<
                 "implement",
                 false,
                 cycle_id,
-                &format!("budget deferred: {summary}"),
+                &disposition,
             )?;
             return Ok(DispatchOneResult {
                 decision: VerifyDecision::Failed,
-                dispatches: 0,
+                dispatches: attempts,
             });
         }
     };
@@ -485,7 +500,12 @@ where
     L: LiveSink + ?Sized,
     U: BursarClient + ?Sized,
 {
-    let chain = fallback_chain(&cfg.roster, initial_roster)?;
+    let chain = fallback_chain(
+        &cfg.roster,
+        initial_roster,
+        item.approved_route.as_ref(),
+        cfg.budgets.use_bursar,
+    )?;
     let repo_cost_policy = cfg.cost_policy_for(&item.repo);
     let mut attempts = 0_u64;
     let mut deferred = Vec::new();
@@ -516,7 +536,10 @@ where
                         repo_cost_policy,
                         fields,
                     )?;
-                    return Ok(WorkerChainOutcome::Deferred(deferred.join("; ")));
+                    return Ok(WorkerChainOutcome::Deferred {
+                        summary: deferred.join("; "),
+                        attempts,
+                    });
                 };
                 patch_live(
                     live,
@@ -561,13 +584,56 @@ where
         )
         .map_err(|e| DispatchCycleError::message(e.to_string()))?;
 
-        let Some(reason) = retryable_failure_reason(&result)? else {
+        let Some(failure) = retryable_failure_reason(&result)? else {
             return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
                 roster: roster.clone(),
                 result,
                 attempts,
             }));
         };
+        if cfg.budgets.use_bursar {
+            append_ledger(
+                ledger_path,
+                roster,
+                &item.repo,
+                issue,
+                fields,
+                "implement",
+                false,
+                cycle_id,
+                &format!(
+                    "retryable worker failure classified as {}",
+                    failure.reason.label()
+                ),
+            )?;
+            let observation = runtime_observation(
+                roster,
+                &failure,
+                cfg.budgets.unknown_429_cooldown_mins,
+                Utc::now(),
+            );
+            let observation_result = bursar_client.observe(&observation);
+            record_runtime_observation(
+                report_path,
+                item,
+                roster,
+                &observation,
+                observation_result.as_ref().err(),
+            )?;
+            if let Err(error) = observation_result {
+                append_ledger(
+                    ledger_path,
+                    roster,
+                    &item.repo,
+                    issue,
+                    fields,
+                    "implement",
+                    false,
+                    cycle_id,
+                    &format!("bursar observation failed: {error}"),
+                )?;
+            }
+        }
         let Some(next) = next_eligible_roster(&chain, idx + 1, &fields.routing, repo_cost_policy)
         else {
             record_remaining_ineligible(
@@ -588,7 +654,7 @@ where
                 "implement",
                 false,
                 cycle_id,
-                &format!("retryable worker failure ({reason}); no eligible fallback"),
+                &format!("{}; no eligible fallback", failure.reason.label()),
             )?;
             return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
                 roster: roster.clone(),
@@ -605,10 +671,7 @@ where
             "implement",
             false,
             cycle_id,
-            &format!(
-                "retryable worker failure ({reason}); failover to {}",
-                next.name
-            ),
+            &format!("{}; failover to {}", failure.reason.label(), next.name),
         )?;
         patch_live(
             live,
@@ -627,7 +690,10 @@ where
 }
 
 fn is_metered_worker_backend(backend: Backend) -> bool {
-    matches!(backend, Backend::Pi | Backend::Agy | Backend::Codex)
+    matches!(
+        backend,
+        Backend::Claude | Backend::Pi | Backend::Agy | Backend::Codex
+    )
 }
 
 fn bursar_provider_for(roster: &RosterEntry) -> String {
@@ -681,6 +747,42 @@ fn record_budget_decision(
         ),
     )
     .map_err(|e| DispatchCycleError::message(format!("report budget decision: {e}")))
+}
+
+fn record_runtime_observation(
+    report_path: &Path,
+    item: &PlannedItem,
+    roster: &RosterEntry,
+    observation: &ObservationRequest,
+    error: Option<&bursar::BursarError>,
+) -> std::result::Result<(), DispatchCycleError> {
+    if !report_path.exists() {
+        return Ok(());
+    }
+    let (level, status) = if error.is_some() {
+        (CalloutLevel::Warn, "writeback-failed")
+    } else {
+        (CalloutLevel::Info, "recorded")
+    };
+    deck::append_callout(
+        report_path,
+        level,
+        "BURSAR_OBSERVE",
+        &format!(
+            "runtime provider observation {status}: {}/{}\n- roster: {}\n- provider: {}\n- model: {}\n- expires_at: {}\n- expiry_basis: {}\n- reason: {}",
+            item.repo,
+            item.issue_id,
+            roster.name,
+            observation.provider,
+            observation.model.as_deref().unwrap_or("-"),
+            observation.expires_at,
+            observation.expiry_basis.label(),
+            observation.reason.label(),
+        ),
+    )
+    .map_err(|error| {
+        DispatchCycleError::message(format!("report runtime observation: {error}"))
+    })
 }
 
 fn next_eligible_roster<'a>(
@@ -780,7 +882,56 @@ fn record_fallback_skip(
 fn fallback_chain(
     roster: &[RosterEntry],
     initial: &RosterEntry,
+    approved_route: Option<&ProviderRouteRecord>,
+    require_approval: bool,
 ) -> std::result::Result<Vec<RosterEntry>, DispatchCycleError> {
+    if let Some(route) = approved_route {
+        let approved = &route.approved_models;
+        if approved.first().map(String::as_str) != Some(initial.name.as_str()) {
+            return Err(DispatchCycleError::message(format!(
+                "approved provider envelope does not start with selected model {}",
+                initial.name
+            )));
+        }
+        return approved
+            .iter()
+            .map(|name| {
+                let current = roster
+                    .iter()
+                    .find(|entry| entry.name == *name)
+                    .ok_or_else(|| {
+                        DispatchCycleError::message(format!(
+                            "approved provider envelope references unknown model {name}"
+                        ))
+                    })?;
+                let approved_candidate = route
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.model == *name)
+                    .ok_or_else(|| {
+                        DispatchCycleError::message(format!(
+                            "approved provider envelope lacks identity evidence for model {name}"
+                        ))
+                    })?;
+                let current_backend = format!("{:?}", current.backend).to_ascii_lowercase();
+                if approved_candidate.provider != current.provider
+                    || approved_candidate.backend != current_backend
+                    || approved_candidate.dispatch_id != current.dispatch_id
+                {
+                    return Err(DispatchCycleError::message(format!(
+                        "approved provider envelope identity changed for model {name}"
+                    )));
+                }
+                Ok(current.clone())
+            })
+            .collect();
+    }
+    if require_approval {
+        return Err(DispatchCycleError::message(format!(
+            "approved provider envelope missing for selected model {}",
+            initial.name
+        )));
+    }
     let mut chain = Vec::with_capacity(1 + initial.fallback.len());
     chain.push(initial.clone());
     for name in &initial.fallback {
@@ -798,9 +949,15 @@ fn fallback_chain(
     Ok(chain)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetryableFailure {
+    reason: RuntimeLimitReason,
+    provider_reset: Option<String>,
+}
+
 fn retryable_failure_reason(
     result: &dispatch::DispatchResult,
-) -> std::result::Result<Option<String>, DispatchCycleError> {
+) -> std::result::Result<Option<RetryableFailure>, DispatchCycleError> {
     if !matches!(result.status, dispatch::DispatchStatus::Failed(_)) {
         return Ok(None);
     }
@@ -810,28 +967,95 @@ fn retryable_failure_reason(
             result.stderr_path.display()
         ))
     })?;
-    if !is_retryable_worker_stderr(&stderr) {
-        return Ok(None);
-    }
-    let reason = stderr
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("retryable provider failure")
-        .trim()
-        .to_string();
-    Ok(Some(reason))
+    Ok(classify_retryable_failure(&stderr, Utc::now()))
 }
 
 fn is_retryable_worker_stderr(stderr: &str) -> bool {
+    classify_runtime_limit(stderr).is_some()
+}
+
+fn classify_retryable_failure(stderr: &str, now: DateTime<Utc>) -> Option<RetryableFailure> {
+    Some(RetryableFailure {
+        reason: classify_runtime_limit(stderr)?,
+        provider_reset: extract_provider_reset(stderr, now),
+    })
+}
+
+fn classify_runtime_limit(stderr: &str) -> Option<RuntimeLimitReason> {
     let stderr = stderr.to_ascii_lowercase();
-    contains_contextual_429(&stderr)
-        || stderr.contains("quota")
-        || stderr.contains("rate_limit")
-        || stderr.contains("rate limit")
-        || stderr.contains("too many requests")
+    if contains_contextual_429(&stderr) || stderr.contains("too many requests") {
+        Some(RuntimeLimitReason::Http429)
+    } else if stderr.contains("quota") {
+        Some(RuntimeLimitReason::QuotaExceeded)
+    } else if stderr.contains("rate_limit") || stderr.contains("rate limit") {
+        Some(RuntimeLimitReason::RateLimit)
+    } else {
+        None
+    }
+}
+
+fn extract_provider_reset(stderr: &str, now: DateTime<Utc>) -> Option<String> {
+    let lower = stderr.to_ascii_lowercase();
+    for marker in [
+        "\"reset_at\":\"",
+        "\"reset_at\": \"",
+        "reset_at=",
+        "reset_at: ",
+        "x-ratelimit-reset: ",
+    ] {
+        let Some(index) = lower.find(marker) else {
+            continue;
+        };
+        let value = stderr[index + marker.len()..]
+            .split(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '\"' | '\'' | ',' | '}' | ']' | ';')
+            })
+            .next()
+            .unwrap_or_default();
+        let Ok(reset) = DateTime::parse_from_rfc3339(value) else {
+            continue;
+        };
+        let reset = reset.with_timezone(&Utc);
+        if reset > now {
+            return Some(reset.to_rfc3339());
+        }
+    }
+    None
+}
+
+fn runtime_observation(
+    roster: &RosterEntry,
+    failure: &RetryableFailure,
+    cooldown_mins: u32,
+    now: DateTime<Utc>,
+) -> ObservationRequest {
+    let (expires_at, expiry_basis) = failure.provider_reset.as_ref().map_or_else(
+        || {
+            (
+                (now + ChronoDuration::minutes(i64::from(cooldown_mins))).to_rfc3339(),
+                ObservationExpiryBasis::LocalCooldown,
+            )
+        },
+        |reset| (reset.clone(), ObservationExpiryBasis::ProviderReset),
+    );
+    ObservationRequest::runtime_limit(
+        bursar_provider_for(roster),
+        Some(roster.dispatch_id.clone()),
+        expires_at,
+        expiry_basis,
+        failure.reason,
+    )
 }
 
 fn contains_contextual_429(stderr: &str) -> bool {
+    if stderr.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("429")
+            .is_some_and(|suffix| suffix.chars().next().is_none_or(|c| !c.is_ascii_digit()))
+    }) {
+        return true;
+    }
     let normalized: String = stderr
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
@@ -1086,7 +1310,7 @@ mod tests {
     use crate::dispatch::{
         ChildProcess, CommitProbe, Exec, GitCommitProbe, ProcessStatus, SpawnRequest,
     };
-    use crate::plan::{CyclePlan, ProposalEntry};
+    use crate::plan::{CyclePlan, ProposalEntry, ProviderCandidateRecord, ProviderRouteRecord};
 
     #[test]
     fn approval_gate_matrix_refuses_absent_closes_changes_requested_and_runs_approved() {
@@ -1170,6 +1394,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end dispatch fixture keeps approval, worker, verify, and ledger assertions together"
+    )]
     fn e2e_sandbox() {
         let temp = TempDir::new("e2e-sandbox");
         let fleet = temp.path().join("fleet");
@@ -1214,7 +1442,15 @@ dispatch_id = "fake-worker"
         let reports = temp.path().join("reports");
         let ledger = temp.path().join("ledger").join("model-bench.jsonl");
         let cycle_id = "cycle-20260702-010203";
-        write_plan_with_proposal(&state, cycle_id, "sandbox-repo", "sandbox-1", "fake-worker");
+        write_plan_with_proposal(
+            &state,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+        );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
 
@@ -1338,7 +1574,15 @@ dispatch_id = "senior-reviewer"
         let reports = temp.path().join("reports");
         let ledger = temp.path().join("ledger").join("model-bench.jsonl");
         let cycle_id = "cycle-20260702-review";
-        write_plan_with_proposal(&state, cycle_id, "sandbox-repo", "sandbox-1", "fake-worker");
+        write_plan_with_proposal(
+            &state,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+        );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
 
@@ -1381,6 +1625,10 @@ dispatch_id = "senior-reviewer"
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end provider fallback fixture verifies writeback ordering and final close together"
+    )]
     fn fallback_e2e_retries_retryable_worker_failure_and_verifies_fallback_commit() {
         let temp = TempDir::new("fallback-e2e-sandbox");
         let fleet = temp.path().join("fleet");
@@ -1396,7 +1644,7 @@ root = "{}"
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 max_external_dispatches = 8
-use_bursar = false
+use_bursar = true
 item_wall_clock_mins = 1
 cycle_wall_clock_mins = 1
 
@@ -1415,6 +1663,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "primary-worker"
+provider = "opencode-go"
 fallback = ["fallback-worker"]
 
 [[roster]]
@@ -1424,6 +1673,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "fallback-worker"
+provider = "codex"
 "#,
             fleet.display()
         ))
@@ -1439,17 +1689,22 @@ dispatch_id = "fallback-worker"
             "sandbox-repo",
             "sandbox-1",
             "primary-worker",
+            &["primary-worker", "fallback-worker"],
+            &cfg.roster,
         );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
 
+        let bursar = FakeBursarClient::with_provider_availabilities(&[
+            ("opencode-go", Availability::Healthy),
+            ("codex", Availability::Healthy),
+        ])
+        .with_observe_failure();
         let bd = RecordingBdClient::new(sandbox_issue());
-        let exec = FallbackExec::new();
+        let exec = FallbackExec::with_bursar(bursar.clone());
         let commits = GitCommitProbe;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
-        let bursar = FakeBursarClient::unavailable();
-
         let result = run_dispatch_cycle(
             &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
             &bursar,
@@ -1467,20 +1722,44 @@ dispatch_id = "fallback-worker"
         assert!(spawns[1].argv.contains(&"fallback-worker".to_string()));
         assert_eq!(spawns[1].cwd, repo);
 
+        let observations = bursar.observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].provider, "opencode-go");
+        assert_eq!(observations[0].reason, RuntimeLimitReason::Http429);
+        assert_eq!(
+            observations[0].expiry_basis,
+            ObservationExpiryBasis::LocalCooldown
+        );
+        assert!(!format!("{:?}", observations[0]).contains("quota exceeded"));
+        let report = std::fs::read_to_string(report_path(&reports, cycle_id)).expect("report");
+        assert!(report.contains("writeback-failed"));
+
         let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
         let rows: Vec<serde_json::Value> = ledger_line
             .lines()
             .map(|line| serde_json::from_str(line).expect("ledger line json"))
             .collect();
-        assert_eq!(rows.len(), 2, "failover row + final implement row");
+        assert_eq!(
+            rows.len(),
+            4,
+            "classification + writeback warning + failover + final implement rows"
+        );
         assert_eq!(rows[0]["model"], "primary-worker");
         assert_eq!(rows[0]["verify_passed"], false);
         assert!(rows[0]["notes"]
             .as_str()
             .expect("notes")
+            .contains("classified as runtime HTTP 429"));
+        assert!(rows[1]["notes"]
+            .as_str()
+            .expect("notes")
+            .contains("bursar observation failed"));
+        assert!(rows[2]["notes"]
+            .as_str()
+            .expect("notes")
             .contains("failover to fallback-worker"));
-        assert_eq!(rows[1]["model"], "fallback-worker");
-        assert_eq!(rows[1]["verify_passed"], true);
+        assert_eq!(rows[3]["model"], "fallback-worker");
+        assert_eq!(rows[3]["verify_passed"], true);
     }
 
     #[test]
@@ -1571,6 +1850,14 @@ dispatch_id = "fallback-worker"
             "sandbox-repo",
             "sandbox-1",
             "primary-worker",
+            &[
+                "primary-worker",
+                "below-floor-worker",
+                "below-ceiling-worker",
+                "free-train-worker",
+                "fallback-worker",
+            ],
+            &cfg.roster,
         );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
@@ -1628,6 +1915,9 @@ dispatch_id = "fallback-worker"
     fn retryable_worker_stderr_classifier_matches_provider_limit_signals() {
         assert!(is_retryable_worker_stderr("HTTP 429: too many requests"));
         assert!(is_retryable_worker_stderr("status code: 429"));
+        assert!(is_retryable_worker_stderr(
+            "429 {\"error\":\"Weekly usage limit reached\"}"
+        ));
         assert!(is_retryable_worker_stderr("quota exceeded"));
         assert!(is_retryable_worker_stderr("provider returned rate_limit"));
         assert!(is_retryable_worker_stderr("provider returned rate limit"));
@@ -1636,13 +1926,100 @@ dispatch_id = "fallback-worker"
     }
 
     #[test]
+    fn runtime_observation_uses_trusted_reset_or_local_cooldown_without_raw_stderr() {
+        let now = DateTime::parse_from_rfc3339("2026-07-13T10:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let roster = RosterEntry {
+            name: "worker".to_string(),
+            tier: Tier::Senior,
+            ceiling: Ceiling::M,
+            efficiency: crate::config::Efficiency::Lean,
+            backend: Backend::Pi,
+            dispatch_id: "opencode-go/worker".to_string(),
+            reasoning_effort: None,
+            provider: "opencode-go".to_string(),
+            cost: Cost::Paid,
+            fallback: Vec::new(),
+        };
+        let reset_failure = classify_retryable_failure(
+            "HTTP 429 secret-payload reset_at=2026-07-13T10:30:00Z",
+            now,
+        )
+        .expect("classified");
+        let reset_observation = runtime_observation(&roster, &reset_failure, 15, now);
+        assert_eq!(
+            reset_observation.expiry_basis,
+            ObservationExpiryBasis::ProviderReset
+        );
+        assert_eq!(reset_observation.expires_at, "2026-07-13T10:30:00+00:00");
+        assert_eq!(reset_observation.reason, RuntimeLimitReason::Http429);
+        assert!(!format!("{reset_observation:?}").contains("secret-payload"));
+
+        let cooldown_failure =
+            classify_retryable_failure("quota exceeded", now).expect("classified");
+        let cooldown_observation = runtime_observation(&roster, &cooldown_failure, 15, now);
+        assert_eq!(
+            cooldown_observation.expiry_basis,
+            ObservationExpiryBasis::LocalCooldown
+        );
+        assert_eq!(cooldown_observation.expires_at, "2026-07-13T10:15:00+00:00");
+        assert_eq!(
+            cooldown_observation.reason,
+            RuntimeLimitReason::QuotaExceeded
+        );
+    }
+
+    #[test]
+    fn approved_provider_envelope_forbids_newly_healthy_unapproved_fallbacks() {
+        let primary = RosterEntry {
+            name: "primary".to_string(),
+            tier: Tier::Senior,
+            ceiling: Ceiling::M,
+            efficiency: crate::config::Efficiency::Lean,
+            backend: Backend::Pi,
+            dispatch_id: "primary".to_string(),
+            reasoning_effort: None,
+            provider: "opencode-go".to_string(),
+            cost: Cost::Paid,
+            fallback: vec!["approved".to_string(), "unapproved".to_string()],
+        };
+        let mut approved = primary.clone();
+        approved.name = "approved".to_string();
+        approved.dispatch_id = "approved".to_string();
+        let mut unapproved = approved.clone();
+        unapproved.name = "unapproved".to_string();
+        unapproved.dispatch_id = "unapproved".to_string();
+        let roster = vec![primary.clone(), approved, unapproved];
+        let route = provider_route_fixture(
+            "repo",
+            "issue",
+            "primary",
+            &["primary", "approved"],
+            &roster,
+        );
+
+        let chain = fallback_chain(&roster, &primary, Some(&route), true)
+            .expect("approved envelope resolves");
+        assert_eq!(
+            chain
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["primary", "approved"]
+        );
+        assert!(fallback_chain(&roster, &primary, None, true).is_err());
+
+        let mut repointed = roster.clone();
+        repointed[1].provider = "codex".to_string();
+        assert!(fallback_chain(&repointed, &primary, Some(&route), true).is_err());
+    }
+
+    #[test]
     fn bursar_budget_healthy_provider_proceeds_and_reports_decision() {
         let run = run_bursar_budget_case(
             "healthy",
-            &FakeBursarClient::with_provider_availability(
-                "opencode-go",
-                Availability::Healthy,
-            ),
+            &FakeBursarClient::with_provider_availability("opencode-go", Availability::Healthy),
         );
 
         assert_eq!(run.result.dispatched, 1);
@@ -1658,10 +2035,7 @@ dispatch_id = "fallback-worker"
     fn bursar_budget_unknown_provider_defers_and_reports_decision() {
         let run = run_bursar_budget_case(
             "unknown",
-            &FakeBursarClient::with_provider_availability(
-                "opencode-go",
-                Availability::Unknown,
-            ),
+            &FakeBursarClient::with_provider_availability("opencode-go", Availability::Unknown),
         );
 
         assert_eq!(run.result.dispatched, 0);
@@ -1678,10 +2052,7 @@ dispatch_id = "fallback-worker"
     fn bursar_budget_exhausted_provider_defers_and_reports_decision() {
         let run = run_bursar_budget_case(
             "exhausted",
-            &FakeBursarClient::with_provider_availability(
-                "opencode-go",
-                Availability::Exhausted,
-            ),
+            &FakeBursarClient::with_provider_availability("opencode-go", Availability::Exhausted),
         );
 
         assert_eq!(run.result.dispatched, 0);
@@ -1767,6 +2138,8 @@ provider = "opencode-go"
             "sandbox-repo",
             "sandbox-1",
             "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
         );
         write_report(&reports, &cycle_id);
         write_response(&reports, &cycle_id, "approved");
@@ -1825,6 +2198,7 @@ dispatch_id = "fake-worker"
             proposals: Vec::new(),
             flags: Vec::new(),
             skips: Vec::new(),
+            provider_routes: Vec::new(),
         };
         plan.save(state).expect("save plan");
     }
@@ -1835,7 +2209,10 @@ dispatch_id = "fake-worker"
         repo: &str,
         issue_id: &str,
         model: &str,
+        approved_models: &[&str],
+        roster: &[RosterEntry],
     ) {
+        let provider_route = provider_route_fixture(repo, issue_id, model, approved_models, roster);
         let plan = CyclePlan {
             cycle_id: cycle_id.to_string(),
             created_at: "2026-07-02T01:02:03Z".to_string(),
@@ -1847,8 +2224,63 @@ dispatch_id = "fake-worker"
             }],
             flags: Vec::new(),
             skips: Vec::new(),
+            provider_routes: vec![provider_route],
         };
         plan.save(state).expect("save plan");
+    }
+
+    fn provider_route_fixture(
+        repo: &str,
+        issue_id: &str,
+        model: &str,
+        approved_models: &[&str],
+        roster: &[RosterEntry],
+    ) -> ProviderRouteRecord {
+        let candidates = approved_models
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let entry = roster
+                    .iter()
+                    .find(|entry| entry.name == *name)
+                    .expect("approved test roster entry");
+                ProviderCandidateRecord {
+                    model: entry.name.clone(),
+                    provider: entry.provider.clone(),
+                    backend: format!("{:?}", entry.backend).to_ascii_lowercase(),
+                    dispatch_id: entry.dispatch_id.clone(),
+                    reasoning_effort: entry
+                        .reasoning_effort
+                        .map(|effort| effort.as_str().to_string()),
+                    availability: None,
+                    source: None,
+                    checked_at: None,
+                    data_as_of: None,
+                    expires_at: None,
+                    expiry_basis: None,
+                    action: None,
+                    reason: None,
+                    outcome: if index == 0 {
+                        "selected".to_string()
+                    } else {
+                        "approved-fallback".to_string()
+                    },
+                    routing_reasons: Vec::new(),
+                    exclusion_reasons: Vec::new(),
+                }
+            })
+            .collect();
+        ProviderRouteRecord {
+            repo: repo.to_string(),
+            issue_id: issue_id.to_string(),
+            selected_model: Some(model.to_string()),
+            approved_models: approved_models
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            candidates,
+            terminal_defer: false,
+        }
     }
 
     fn write_report(reports: &Path, cycle_id: &str) {
@@ -2298,12 +2730,21 @@ dispatch_id = "fake-worker"
 
     struct FallbackExec {
         spawns: RefCell<Vec<SpawnRequest>>,
+        bursar: Option<FakeBursarClient>,
     }
 
     impl FallbackExec {
         fn new() -> Self {
             Self {
                 spawns: RefCell::new(Vec::new()),
+                bursar: None,
+            }
+        }
+
+        fn with_bursar(bursar: FakeBursarClient) -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+                bursar: Some(bursar),
             }
         }
 
@@ -2317,11 +2758,18 @@ dispatch_id = "fake-worker"
             self.spawns.borrow_mut().push(request.clone());
             if request.argv.iter().any(|arg| arg == "primary-worker") {
                 std::fs::write(&request.stdout_path, b"").expect("write primary stdout");
-                std::fs::write(&request.stderr_path, b"429 quota exceeded\n")
+                std::fs::write(&request.stderr_path, b"HTTP 429 quota exceeded\n")
                     .expect("write primary stderr");
                 return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
             }
             if request.argv.iter().any(|arg| arg == "fallback-worker") {
+                if let Some(bursar) = self.bursar.as_ref() {
+                    assert_eq!(
+                        bursar.observations().len(),
+                        1,
+                        "runtime observation must precede fallback spawn"
+                    );
+                }
                 std::fs::write(&request.stdout_path, b"fallback worker ran\n")
                     .expect("write fallback stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
@@ -2394,7 +2842,7 @@ dispatch_id = "fake-worker"
     }
 
     #[test]
-    fn codex_workers_are_metered_and_use_the_codex_bursar_provider() {
+    fn paid_harness_workers_are_metered_and_codex_uses_canonical_provider() {
         let cfg = config::parse_str(
             "\
 [[roster]]
@@ -2410,6 +2858,9 @@ provider = \"openai-codex\"
         )
         .expect("Codex roster parses");
 
+        assert!(is_metered_worker_backend(Backend::Claude));
+        assert!(is_metered_worker_backend(Backend::Pi));
+        assert!(is_metered_worker_backend(Backend::Agy));
         assert!(is_metered_worker_backend(Backend::Codex));
         assert_eq!(bursar_provider_for(&cfg.roster[0]), "codex");
     }
