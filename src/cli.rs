@@ -893,6 +893,28 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn dispatch_rejects_scope_selectors_that_could_widen_an_approved_plan() {
+        assert_eq!(
+            run(vec![
+                "dispatch".to_string(),
+                "cycle-1".to_string(),
+                "--repo".to_string(),
+                "alpha".to_string(),
+            ]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            run(vec![
+                "dispatch".to_string(),
+                "cycle-1".to_string(),
+                "--only".to_string(),
+                "alpha:a-1".to_string(),
+            ]),
+            ExitCode::from(2)
+        );
+    }
+
+    #[test]
     fn route_explain_accepts_read_only_provider_advice_arguments() {
         let options = parse_route_explain_options(&[
             "--repo".to_string(),

@@ -18,7 +18,10 @@ use crate::deck::{self, CalloutLevel, LiveUpdate, ReportStatus};
 use crate::dispatch::{self, CommitProbe, DispatchRequest, Exec};
 use crate::fields::{self, RoutingFields, Triage};
 use crate::ledger::{self, LedgerRow};
-use crate::plan::{CyclePlan, ProviderRouteRecord};
+use crate::plan::{
+    ApprovalScope, ApprovalScopeKind, CyclePlan, ProviderRouteRecord, ScopeSelector,
+    item_authorization_hash,
+};
 use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
 
@@ -109,6 +112,8 @@ struct PlannedItem {
     model: String,
     verify_cmd: Option<String>,
     approved_route: Option<ProviderRouteRecord>,
+    authorization_sha256: String,
+    approval_scope: ApprovalScope,
 }
 
 #[expect(
@@ -161,7 +166,7 @@ pub(crate) fn run_dispatch_cycle<
         )));
     }
 
-    let items = planned_items(&plan);
+    let items = planned_items(&plan)?;
     let cycle_start = Instant::now();
     let mut dispatched = 0_u64;
     let mut verified = 0_u64;
@@ -186,8 +191,9 @@ pub(crate) fn run_dispatch_cycle<
         )?;
         dispatched += attempt.dispatches;
         match attempt.decision {
-            VerifyDecision::Passed => verified += 1,
-            VerifyDecision::Failed | VerifyDecision::HardError => failed += 1,
+            Some(VerifyDecision::Passed) => verified += 1,
+            Some(VerifyDecision::Failed | VerifyDecision::HardError) => failed += 1,
+            None => {}
         }
     }
 
@@ -223,23 +229,69 @@ fn approval_gate(run_dir: &Path) -> std::result::Result<ApprovalGate, DispatchCy
     }
 }
 
-fn planned_items(plan: &CyclePlan) -> Vec<PlannedItem> {
-    let mut items = Vec::with_capacity(plan.dispatches.len() + plan.proposals.len());
-    items.extend(plan.dispatches.iter().map(|entry| PlannedItem {
-        repo: entry.repo.clone(),
-        issue_id: entry.issue_id.clone(),
-        model: entry.model.clone(),
-        verify_cmd: Some(entry.verify_cmd.clone()),
-        approved_route: approved_route(plan, &entry.repo, &entry.issue_id),
-    }));
-    items.extend(plan.proposals.iter().map(|entry| PlannedItem {
-        repo: entry.repo.clone(),
-        issue_id: entry.issue_id.clone(),
-        model: entry.model.clone(),
-        verify_cmd: None,
-        approved_route: approved_route(plan, &entry.repo, &entry.issue_id),
-    }));
-    items
+fn planned_items(plan: &CyclePlan) -> std::result::Result<Vec<PlannedItem>, DispatchCycleError> {
+    let mut identities = plan
+        .dispatches
+        .iter()
+        .map(|entry| {
+            (
+                entry.repo.as_str(),
+                entry.issue_id.as_str(),
+                entry.model.as_str(),
+                Some(entry.verify_cmd.as_str()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !matches!(plan.approval_scope.kind, ApprovalScopeKind::FleetAudit) {
+        identities.extend(plan.proposals.iter().map(|entry| {
+            (
+                entry.repo.as_str(),
+                entry.issue_id.as_str(),
+                entry.model.as_str(),
+                None,
+            )
+        }));
+    }
+    if identities.len() != plan.approval_scope.max_dispatch_count {
+        return Err(DispatchCycleError::message(format!(
+            "approval scope maximum {} does not match {} persisted launchable items",
+            plan.approval_scope.max_dispatch_count,
+            identities.len()
+        )));
+    }
+    if plan.item_authorizations.len() != identities.len() {
+        return Err(DispatchCycleError::message(format!(
+            "approval scope has {} item hashes for {} launchable items",
+            plan.item_authorizations.len(),
+            identities.len()
+        )));
+    }
+
+    let mut items = Vec::with_capacity(identities.len());
+    for (repo, issue_id, model, verify_cmd) in identities {
+        let matching = plan
+            .item_authorizations
+            .iter()
+            .filter(|authorization| {
+                authorization.repo == repo && authorization.issue_id == issue_id
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(DispatchCycleError::message(format!(
+                "approval scope requires exactly one item hash for {repo}/{issue_id}"
+            )));
+        }
+        items.push(PlannedItem {
+            repo: repo.to_string(),
+            issue_id: issue_id.to_string(),
+            model: model.to_string(),
+            verify_cmd: verify_cmd.map(str::to_string),
+            approved_route: approved_route(plan, repo, issue_id),
+            authorization_sha256: matching[0].sha256.clone(),
+            approval_scope: plan.approval_scope.clone(),
+        });
+    }
+    Ok(items)
 }
 
 fn approved_route(plan: &CyclePlan, repo: &str, issue_id: &str) -> Option<ProviderRouteRecord> {
@@ -249,8 +301,97 @@ fn approved_route(plan: &CyclePlan, repo: &str, issue_id: &str) -> Option<Provid
         .cloned()
 }
 
+fn approval_scope_authorizes(scope: &ApprovalScope, canonical_repo: &str, issue_id: &str) -> bool {
+    match scope.kind {
+        ApprovalScopeKind::FleetAudit => true,
+        ApprovalScopeKind::RepositoryScope => {
+            scope.repo_paths.iter().any(|repo| repo == canonical_repo)
+                && scope.selectors.iter().any(|selector| {
+                    matches!(selector, ScopeSelector::Repository { repo } if repo == canonical_repo)
+                })
+        }
+        ApprovalScopeKind::ExactItemScope => {
+            scope.repo_paths.iter().any(|repo| repo == canonical_repo)
+                && scope.selectors.iter().any(|selector| {
+                    matches!(
+                        selector,
+                        ScopeSelector::ExactItem { repo, issue_id: selected }
+                            if repo == canonical_repo && selected == issue_id
+                    )
+                })
+        }
+    }
+}
+
+fn validate_item_authorization(
+    cfg: &Config,
+    item: &PlannedItem,
+    roster: &RosterEntry,
+    canonical_repo: &str,
+    issue: &Issue,
+) -> std::result::Result<ExtractedFields, String> {
+    if issue.id != item.issue_id {
+        return Err("bd returned a different issue identity".to_string());
+    }
+    if !approval_scope_authorizes(&item.approval_scope, canonical_repo, &item.issue_id) {
+        return Err("item is outside the persisted approval scope".to_string());
+    }
+    let extracted = extract_dispatch_fields(issue, None).map_err(|error| error.to_string())?;
+    if let Some(planned_verify_cmd) = item.verify_cmd.as_deref()
+        && extracted.routing.verify_cmd.as_deref() != Some(planned_verify_cmd)
+    {
+        return Err("verify command changed after approval".to_string());
+    }
+    if let Some(rejection) =
+        triage::candidate_rejection(roster, &extracted.routing, cfg.cost_policy_for(&item.repo))
+    {
+        return Err(format!(
+            "selected model no longer satisfies routing: {rejection:?}"
+        ));
+    }
+    let route = item
+        .approved_route
+        .as_ref()
+        .ok_or_else(|| "approved provider envelope is missing".to_string())?;
+    if route.selected_model.as_deref() != Some(item.model.as_str()) {
+        return Err("approved provider envelope does not match selected model".to_string());
+    }
+    let current_hash = item_authorization_hash(
+        canonical_repo,
+        issue,
+        &extracted.routing,
+        &item.model,
+        &route.approved_models,
+    )
+    .map_err(|error| format!("cannot recompute item authorization: {error}"))?;
+    if current_hash != item.authorization_sha256 {
+        return Err("item authorization hash changed after approval".to_string());
+    }
+    Ok(extracted)
+}
+
+fn record_replan_required(
+    report_path: &Path,
+    item: &PlannedItem,
+    reason: &str,
+) -> std::result::Result<(), DispatchCycleError> {
+    if !report_path.exists() {
+        return Ok(());
+    }
+    deck::append_callout(
+        report_path,
+        CalloutLevel::Warn,
+        "REPLAN_REQUIRED",
+        &format!(
+            "approval scope skip: {}/{}\n- disposition: replan-required\n- reason: {reason}",
+            item.repo, item.issue_id
+        ),
+    )
+    .map_err(|error| DispatchCycleError::message(format!("report approval scope skip: {error}")))
+}
+
 struct DispatchOneResult {
-    decision: VerifyDecision,
+    decision: Option<VerifyDecision>,
     dispatches: u64,
 }
 
@@ -293,6 +434,16 @@ fn dispatch_one<
     bursar: &U,
 ) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
     let repo_path = repo_path(cfg, &item.repo)?;
+    let canonical_repo = std::fs::canonicalize(&repo_path)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "cannot canonicalize repository {}: {error}",
+                repo_path.display()
+            ))
+        })?
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| DispatchCycleError::message("canonical repository path is not UTF-8"))?;
     let roster = cfg
         .roster
         .iter()
@@ -300,6 +451,48 @@ fn dispatch_one<
         .ok_or_else(|| {
             DispatchCycleError::message(format!("plan references unknown model {}", item.model))
         })?;
+
+    let current = match bd.show(&repo_path, &item.issue_id) {
+        Ok(issue) => issue,
+        Err(error) => {
+            record_replan_required(report_path, item, &format!("bd show failed: {error}"))?;
+            return Ok(DispatchOneResult {
+                decision: None,
+                dispatches: 0,
+            });
+        }
+    };
+    if current.status != "open" {
+        record_replan_required(report_path, item, "issue is no longer open")?;
+        return Ok(DispatchOneResult {
+            decision: None,
+            dispatches: 0,
+        });
+    }
+    let ready = match bd.ready(&repo_path) {
+        Ok(issues) => issues,
+        Err(error) => {
+            record_replan_required(report_path, item, &format!("bd ready failed: {error}"))?;
+            return Ok(DispatchOneResult {
+                decision: None,
+                dispatches: 0,
+            });
+        }
+    };
+    if !ready.iter().any(|issue| issue.id == item.issue_id) {
+        record_replan_required(report_path, item, "issue is no longer ready")?;
+        return Ok(DispatchOneResult {
+            decision: None,
+            dispatches: 0,
+        });
+    }
+    if let Err(reason) = validate_item_authorization(cfg, item, roster, &canonical_repo, &current) {
+        record_replan_required(report_path, item, &reason)?;
+        return Ok(DispatchOneResult {
+            decision: None,
+            dispatches: 0,
+        });
+    }
 
     patch_live(
         live,
@@ -311,18 +504,22 @@ fn dispatch_one<
     let claimed = bd
         .claim(&repo_path, &item.issue_id, "conductor")
         .map_err(|e| DispatchCycleError::message(format!("bd claim: {e}")))?;
-    let extracted = extract_dispatch_fields(&claimed, item.verify_cmd.as_deref()).map_err(|e| {
-        let _ = bd.release(&repo_path, &item.issue_id);
-        let _ = bd.comment(
-            &repo_path,
-            &item.issue_id,
-            &format!(
-                "conductor: {cycle_id} {} dispatch refused: {e}",
-                item.issue_id
-            ),
-        );
-        e
-    })?;
+    let extracted = match validate_item_authorization(cfg, item, roster, &canonical_repo, &claimed)
+    {
+        Ok(extracted) => extracted,
+        Err(reason) => {
+            bd.release(&repo_path, &item.issue_id).map_err(|error| {
+                DispatchCycleError::message(format!(
+                    "authorization changed after claim and release failed: {error}"
+                ))
+            })?;
+            record_replan_required(report_path, item, &reason)?;
+            return Ok(DispatchOneResult {
+                decision: None,
+                dispatches: 0,
+            });
+        }
+    };
 
     let prompt = render_worker_prompt(&claimed, &repo_path, &extracted.verify_cmd);
     let before_head = commits
@@ -396,7 +593,7 @@ fn dispatch_one<
                 &disposition,
             )?;
             return Ok(DispatchOneResult {
-                decision: VerifyDecision::Failed,
+                decision: Some(VerifyDecision::Failed),
                 dispatches: attempts,
             });
         }
@@ -463,7 +660,7 @@ fn dispatch_one<
         &outcome.summary,
     )?;
     Ok(DispatchOneResult {
-        decision: outcome.decision,
+        decision: Some(outcome.decision),
         dispatches: worker_attempt.attempts + outcome.review_dispatches,
     })
 }
@@ -1311,7 +1508,8 @@ mod tests {
         ChildProcess, CommitProbe, Exec, GitCommitProbe, ProcessStatus, SpawnRequest,
     };
     use crate::plan::{
-        ApprovalScope, CyclePlan, ProposalEntry, ProviderCandidateRecord, ProviderRouteRecord,
+        ApprovalScope, ApprovalScopeKind, CyclePlan, ItemAuthorizationRecord, ProposalEntry,
+        ProviderCandidateRecord, ProviderRouteRecord, ScopeSelector, item_authorization_hash,
     };
 
     #[test]
@@ -1398,6 +1596,168 @@ mod tests {
     }
 
     #[test]
+    fn approval_unscoped_fleet_leaves_103_proposals_inert() {
+        let plan = CyclePlan {
+            cycle_id: "cycle-103-proposals".to_string(),
+            created_at: "2026-07-13T00:00:00Z".to_string(),
+            dispatches: Vec::new(),
+            proposals: (0..103)
+                .map(|index| ProposalEntry {
+                    repo: "sandbox-repo".to_string(),
+                    issue_id: format!("sandbox-{index}"),
+                    model: "fake-worker".to_string(),
+                })
+                .collect(),
+            flags: Vec::new(),
+            skips: Vec::new(),
+            provider_routes: Vec::new(),
+            approval_scope: ApprovalScope::default(),
+            item_authorizations: Vec::new(),
+        };
+
+        assert!(planned_items(&plan).expect("valid fleet audit").is_empty());
+    }
+
+    #[test]
+    fn approval_scope_authorizes_only_the_persisted_repository_or_exact_item() {
+        let repository = ApprovalScope::new(
+            ApprovalScopeKind::RepositoryScope,
+            vec![ScopeSelector::Repository {
+                repo: "/repos/alpha".to_string(),
+            }],
+            vec!["/repos/alpha".to_string()],
+            1,
+        )
+        .expect("repository scope");
+        assert!(approval_scope_authorizes(
+            &repository,
+            "/repos/alpha",
+            "alpha-1"
+        ));
+        assert!(!approval_scope_authorizes(
+            &repository,
+            "/repos/beta",
+            "beta-1"
+        ));
+
+        let exact = ApprovalScope::new(
+            ApprovalScopeKind::ExactItemScope,
+            vec![ScopeSelector::ExactItem {
+                repo: "/repos/alpha".to_string(),
+                issue_id: "alpha-1".to_string(),
+            }],
+            vec!["/repos/alpha".to_string()],
+            1,
+        )
+        .expect("exact scope");
+        assert!(approval_scope_authorizes(&exact, "/repos/alpha", "alpha-1"));
+        assert!(!approval_scope_authorizes(
+            &exact,
+            "/repos/alpha",
+            "alpha-2"
+        ));
+    }
+
+    #[test]
+    fn changed_authorization_hash_prevents_claim_and_spawn() {
+        let temp = TempDir::new("changed-authorization");
+        let repo = temp.path().join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-changed-authorization";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let mut changed = sandbox_issue();
+        changed.title = "changed after approval".to_string();
+        let bd = RecordingBdClient::new(changed);
+        let exec = SandboxExec::new();
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("changed authorization skips without dispatching");
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(bd.claim_count(), 0);
+        assert!(exec.spawns().is_empty());
+        assert!(report_json_string(&reports, cycle_id).contains("REPLAN_REQUIRED"));
+    }
+
+    #[test]
+    fn post_claim_authorization_change_releases_without_spawn() {
+        let temp = TempDir::new("post-claim-authorization");
+        let repo = temp.path().join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let cfg = config::parse_str(fixture_config(temp.path())).expect("config parses");
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-post-claim-authorization";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue()).with_claim_title("changed during claim");
+        let exec = SandboxExec::new();
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("post-claim authorization change releases safely");
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(bd.claim_count(), 1);
+        assert_eq!(bd.release_count(), 1);
+        assert!(exec.spawns().is_empty());
+        assert!(report_json_string(&reports, cycle_id).contains("REPLAN_REQUIRED"));
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "end-to-end dispatch fixture keeps approval, worker, verify, and ledger assertions together"
@@ -1448,12 +1808,14 @@ dispatch_id = "fake-worker"
         let cycle_id = "cycle-20260702-010203";
         write_plan_with_proposal(
             &state,
+            &repo,
             cycle_id,
             "sandbox-repo",
             "sandbox-1",
             "fake-worker",
             &["fake-worker"],
             &cfg.roster,
+            &sandbox_issue(),
         );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
@@ -1584,12 +1946,14 @@ dispatch_id = "senior-reviewer"
         let cycle_id = "cycle-20260702-review";
         write_plan_with_proposal(
             &state,
+            &repo,
             cycle_id,
             "sandbox-repo",
             "sandbox-1",
             "fake-worker",
             &["fake-worker"],
             &cfg.roster,
+            &sandbox_issue(),
         );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
@@ -1693,12 +2057,14 @@ provider = "codex"
         let cycle_id = "cycle-20260706-fallback";
         write_plan_with_proposal(
             &state,
+            &repo,
             cycle_id,
             "sandbox-repo",
             "sandbox-1",
             "primary-worker",
             &["primary-worker", "fallback-worker"],
             &cfg.roster,
+            &sandbox_issue(),
         );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
@@ -1858,8 +2224,13 @@ dispatch_id = "fallback-worker"
         let reports = temp.path().join("reports");
         let ledger = temp.path().join("ledger").join("model-bench.jsonl");
         let cycle_id = "cycle-20260707-fallback-eligibility";
+        let mut issue = sandbox_issue();
+        let metadata = issue.metadata.as_mut().expect("metadata");
+        metadata.insert("tier_floor".to_string(), json!("senior"));
+        metadata.insert("complexity".to_string(), json!("M"));
         write_plan_with_proposal(
             &state,
+            &repo,
             cycle_id,
             "sandbox-repo",
             "sandbox-1",
@@ -1872,14 +2243,11 @@ dispatch_id = "fallback-worker"
                 "fallback-worker",
             ],
             &cfg.roster,
+            &issue,
         );
         write_report(&reports, cycle_id);
         write_response(&reports, cycle_id, "approved");
 
-        let mut issue = sandbox_issue();
-        let metadata = issue.metadata.as_mut().expect("metadata");
-        metadata.insert("tier_floor".to_string(), json!("senior"));
-        metadata.insert("complexity".to_string(), json!("M"));
         let bd = RecordingBdClient::new(issue);
         let exec = FallbackExec::new();
         let commits = GitCommitProbe;
@@ -2154,12 +2522,14 @@ provider = "opencode-go"
         let cycle_id = format!("cycle-20260707-bursar-{label}");
         write_plan_with_proposal(
             &state,
+            &repo,
             &cycle_id,
             "sandbox-repo",
             "sandbox-1",
             "fake-worker",
             &["fake-worker"],
             &cfg.roster,
+            &sandbox_issue(),
         );
         write_report(&reports, &cycle_id);
         write_response(&reports, &cycle_id, "approved");
@@ -2225,16 +2595,37 @@ dispatch_id = "fake-worker"
         plan.save(state).expect("save plan");
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test plan fixture keeps persisted approval inputs explicit"
+    )]
     fn write_plan_with_proposal(
         state: &Path,
+        repo_path: &Path,
         cycle_id: &str,
         repo: &str,
         issue_id: &str,
         model: &str,
         approved_models: &[&str],
         roster: &[RosterEntry],
+        issue: &Issue,
     ) {
         let provider_route = provider_route_fixture(repo, issue_id, model, approved_models, roster);
+        let canonical_repo = std::fs::canonicalize(repo_path)
+            .expect("canonical test repository")
+            .to_str()
+            .expect("UTF-8 test repository")
+            .to_string();
+        let Triage::Triaged(routing) = fields::extract(issue) else {
+            panic!("sandbox issue is triaged");
+        };
+        let approved_models = approved_models
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>();
+        let authorization =
+            item_authorization_hash(&canonical_repo, issue, &routing, model, &approved_models)
+                .expect("test item authorization");
         let plan = CyclePlan {
             cycle_id: cycle_id.to_string(),
             created_at: "2026-07-02T01:02:03Z".to_string(),
@@ -2247,8 +2638,21 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: vec![provider_route],
-            approval_scope: ApprovalScope::default(),
-            item_authorizations: Vec::new(),
+            approval_scope: ApprovalScope::new(
+                ApprovalScopeKind::ExactItemScope,
+                vec![ScopeSelector::ExactItem {
+                    repo: canonical_repo.clone(),
+                    issue_id: issue_id.to_string(),
+                }],
+                vec![canonical_repo],
+                1,
+            )
+            .expect("explicit test approval scope"),
+            item_authorizations: vec![ItemAuthorizationRecord {
+                repo: repo.to_string(),
+                issue_id: issue_id.to_string(),
+                sha256: authorization,
+            }],
         };
         plan.save(state).expect("save plan");
     }
@@ -2596,6 +3000,7 @@ dispatch_id = "fake-worker"
     struct RecordingBdClient {
         issue: RefCell<Issue>,
         events: RefCell<Vec<BdEvent>>,
+        claim_title: RefCell<Option<String>>,
     }
 
     impl RecordingBdClient {
@@ -2603,7 +3008,13 @@ dispatch_id = "fake-worker"
             Self {
                 issue: RefCell::new(issue),
                 events: RefCell::new(Vec::new()),
+                claim_title: RefCell::new(None),
             }
+        }
+
+        fn with_claim_title(self, title: &str) -> Self {
+            *self.claim_title.borrow_mut() = Some(title.to_string());
+            self
         }
 
         fn close_count(&self) -> usize {
@@ -2621,11 +3032,24 @@ dispatch_id = "fake-worker"
                 .filter(|event| matches!(event, BdEvent::Release { .. }))
                 .count()
         }
+
+        fn claim_count(&self) -> usize {
+            self.events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, BdEvent::Claim { .. }))
+                .count()
+        }
     }
 
     impl BdClient for RecordingBdClient {
         fn ready(&self, _repo: &Path) -> crate::bd::Result<Vec<Issue>> {
-            Err(BdError::new("ready not implemented in fake"))
+            let issue = self.issue.borrow().clone();
+            if issue.status == "open" {
+                Ok(vec![issue])
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         fn show(&self, _repo: &Path, _id: &str) -> crate::bd::Result<Issue> {
@@ -2647,6 +3071,9 @@ dispatch_id = "fake-worker"
             let mut issue = self.issue.borrow_mut();
             issue.status = "in_progress".to_string();
             issue.assignee = Some(actor.to_string());
+            if let Some(title) = self.claim_title.borrow().as_ref() {
+                issue.title.clone_from(title);
+            }
             Ok(issue.clone())
         }
 
