@@ -78,6 +78,8 @@ max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 # Combined cap for metered external backends (pi + agy + codex).
 max_external_dispatches = 4
+# Minutes to defer a provider when a runtime HTTP 429 has no reset timestamp.
+unknown_429_cooldown = 15
 item_wall_clock_mins = 45
 cycle_wall_clock_mins = 90
 

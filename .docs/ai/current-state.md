@@ -1,12 +1,12 @@
 # current-state.md — conductor
 
-Branch: main
-`cargo test` 237/238 — 1 pre-existing env failure (`harness_deck_validate`; `harness-deck` not on PATH), unrelated to rebrand.
+Branch: codex/provider-trust-p1
+`cargo test` 250/250; strict Clippy clean.
 Rebrand `harness-conductor` → `conductor` COMPLETE (2026-07-12): source refs, GitHub repos (incl. `backlog-conductor`), dir move, `chezmoi apply`, live HOME verified clean; `conductor config check` passes.
 
 ## Plan
 
-- [ ] conductor-61f: consume Bursar status@2. Verify: `cargo test bursar::tests config::tests`
+- [x] conductor-61f: consume Bursar status@2. Verify: `cargo test`
 - [ ] conductor-sb6: provider-aware route explain. Verify: `cargo test triage::tests route::tests cli::tests::route_`
 - [ ] conductor-oxm: persist evidence, dispatch recheck, 429 writeback. Verify: `cargo test cycle::tests dispatch_cycle::tests bursar::tests`
 - [ ] conductor-mus: provider-trust final gates and handoff. Verify: `cargo test`

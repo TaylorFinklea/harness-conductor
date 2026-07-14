@@ -579,6 +579,7 @@ mod tests {
             max_active_per_repo: max_repo,
             max_external_dispatches: max_external,
             use_bursar: true,
+            unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
             cycle_wall_clock_mins: 90,
         }

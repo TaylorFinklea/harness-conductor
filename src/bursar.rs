@@ -5,16 +5,23 @@ use std::fmt;
 use std::io;
 use std::process::{Command, Stdio};
 
-use serde::Deserialize;
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
-const SCHEMA: &str = "bursar/status@1";
-const NEAR_EXHAUSTED_PERCENT: f64 = 90.0;
+const SCHEMA: &str = "bursar/status@2";
+const MAX_STATUS_AGE_MINS: i64 = 5;
+const PROVIDERS: [&str; 4] = ["anthropic", "codex", "opencode-go", "agy"];
 
 pub(crate) type Result<T> = std::result::Result<T, BursarError>;
 
 pub(crate) trait BursarClient {
     fn status(&self) -> Result<StatusReport>;
+
+    #[allow(dead_code)]
+    fn observe(&self, _request: &ObservationRequest) -> Result<()> {
+        Err(BursarError::unavailable("bursar observation unavailable"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,46 +73,66 @@ impl fmt::Display for BursarError {
 impl std::error::Error for BursarError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ProviderState {
-    Ok,
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Availability {
+    Healthy,
+    Caution,
+    Exhausted,
     Unknown,
-    Error,
 }
 
-impl fmt::Display for ProviderState {
+impl fmt::Display for Availability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ok => f.write_str("ok"),
+            Self::Healthy => f.write_str("healthy"),
+            Self::Caution => f.write_str("caution"),
+            Self::Exhausted => f.write_str("exhausted"),
             Self::Unknown => f.write_str("unknown"),
-            Self::Error => f.write_str("error"),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub(crate) struct Window {
     pub(crate) label: String,
+    #[serde(deserialize_with = "deserialize_nullable")]
     pub(crate) percent: Option<f64>,
+    #[serde(deserialize_with = "deserialize_nullable")]
     pub(crate) reset_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProviderStatus {
-    pub(crate) status: ProviderState,
+    pub(crate) availability: Availability,
     pub(crate) source: String,
     pub(crate) checked_at: String,
+    #[serde(deserialize_with = "deserialize_nullable")]
     pub(crate) data_as_of: Option<String>,
+    #[serde(deserialize_with = "deserialize_nullable")]
+    pub(crate) expires_at: Option<String>,
     pub(crate) windows: Vec<Window>,
+    #[serde(deserialize_with = "deserialize_nullable")]
     pub(crate) reason: Option<String>,
     pub(crate) extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StatusReport {
     pub(crate) schema: String,
     pub(crate) checked_at: String,
     pub(crate) providers: BTreeMap<String, ProviderStatus>,
+}
+
+fn deserialize_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +157,81 @@ impl BudgetAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BudgetDecision {
     pub(crate) provider: String,
+    pub(crate) model: Option<String>,
+    pub(crate) availability: Option<Availability>,
+    pub(crate) source: Option<String>,
+    pub(crate) checked_at: Option<String>,
+    pub(crate) data_as_of: Option<String>,
+    pub(crate) expires_at: Option<String>,
+    pub(crate) expiry_basis: Option<String>,
     pub(crate) action: BudgetAction,
     pub(crate) summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ObservationExpiryBasis {
+    ProviderReset,
+    LocalCooldown,
+}
+
+#[allow(dead_code)]
+impl ObservationExpiryBasis {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ProviderReset => "provider-reset",
+            Self::LocalCooldown => "local-cooldown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum RuntimeLimitReason {
+    Http429,
+    QuotaExceeded,
+    RateLimit,
+}
+
+#[allow(dead_code)]
+impl RuntimeLimitReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Http429 => "runtime HTTP 429",
+            Self::QuotaExceeded => "runtime quota exceeded",
+            Self::RateLimit => "runtime rate limit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ObservationRequest {
+    pub(crate) provider: String,
+    pub(crate) model: Option<String>,
+    pub(crate) expires_at: String,
+    pub(crate) expiry_basis: ObservationExpiryBasis,
+    pub(crate) reason: RuntimeLimitReason,
+}
+
+#[allow(dead_code)]
+impl ObservationRequest {
+    pub(crate) fn runtime_limit(
+        provider: impl Into<String>,
+        model: Option<String>,
+        expires_at: impl Into<String>,
+        expiry_basis: ObservationExpiryBasis,
+        reason: RuntimeLimitReason,
+    ) -> Self {
+        let provider = provider.into();
+        Self {
+            provider: canonical_provider_key(&provider).to_string(),
+            model,
+            expires_at: expires_at.into(),
+            expiry_basis,
+            reason,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -151,30 +251,83 @@ impl BursarClient for CommandBursarClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => BursarError::unavailable("bursar unavailable on PATH"),
-                _ => BursarError::command(format!("failed to spawn bursar status --json: {e}")),
-            })?;
+            .map_err(|error| spawn_error("bursar status --json", &error))?;
 
         if !output.status.success() {
-            let status = output
-                .status
-                .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string());
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let detail = if stderr.trim().is_empty() {
-                stdout.trim()
-            } else {
-                stderr.trim()
-            };
-            return Err(BursarError::command(format!(
-                "bursar status --json exited {status}: {detail}"
-            )));
+            return Err(command_failure("bursar status --json", &output));
         }
 
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| BursarError::json(format!("failed to parse bursar status --json: {e}")))
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            BursarError::json(format!("failed to parse bursar status --json: {error}"))
+        })
+    }
+
+    fn observe(&self, request: &ObservationRequest) -> Result<()> {
+        let args = observation_args(request);
+        let output = Command::new("bursar")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| spawn_error("bursar observe", &error))?;
+
+        if !output.status.success() {
+            return Err(command_failure("bursar observe", &output));
+        }
+        Ok(())
+    }
+}
+
+fn spawn_error(command: &str, error: &io::Error) -> BursarError {
+    match error.kind() {
+        io::ErrorKind::NotFound => BursarError::unavailable("bursar unavailable on PATH"),
+        _ => BursarError::command(format!("failed to spawn {command}: {error}")),
+    }
+}
+
+fn command_failure(command: &str, output: &std::process::Output) -> BursarError {
+    let status = output
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    BursarError::command(format!("{command} exited {status}: {detail}"))
+}
+
+#[allow(dead_code)]
+fn observation_args(request: &ObservationRequest) -> Vec<String> {
+    let mut args = vec![
+        "observe".to_string(),
+        "--provider".to_string(),
+        request.provider.clone(),
+        "--availability".to_string(),
+        "exhausted".to_string(),
+        "--expires-at".to_string(),
+        request.expires_at.clone(),
+        "--expiry-basis".to_string(),
+        request.expiry_basis.label().to_string(),
+        "--source".to_string(),
+        "conductor-runtime".to_string(),
+        "--reason".to_string(),
+        request.reason.label().to_string(),
+    ];
+    if let Some(model) = request.model.as_deref() {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    args
+}
+
+pub(crate) fn canonical_provider_key(provider: &str) -> &str {
+    match provider {
+        "openai-codex" => "codex",
+        other => other,
     }
 }
 
@@ -183,6 +336,20 @@ pub(crate) fn evaluate_budget<C: BursarClient + ?Sized>(
     provider: &str,
     use_bursar: bool,
 ) -> BudgetDecision {
+    evaluate_budget_at(client, provider, use_bursar, Utc::now())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear fail-closed validation keeps each evidence rejection explicit"
+)]
+fn evaluate_budget_at<C: BursarClient + ?Sized>(
+    client: &C,
+    provider: &str,
+    use_bursar: bool,
+    now: DateTime<Utc>,
+) -> BudgetDecision {
+    let provider = canonical_provider_key(provider);
     if !use_bursar {
         return decision(
             provider,
@@ -196,15 +363,15 @@ pub(crate) fn evaluate_budget<C: BursarClient + ?Sized>(
         Err(error) if error.is_unavailable() => {
             return decision(
                 provider,
-                BudgetAction::SpendCautiously,
-                format!("{provider}: spend-cautiously — bursar unavailable ({error})"),
+                BudgetAction::Defer,
+                format!("{provider}: defer — bursar unavailable ({error})"),
             );
         }
         Err(error) => {
             return decision(
                 provider,
-                BudgetAction::SpendCautiously,
-                format!("{provider}: spend-cautiously — bursar status error: {error}"),
+                BudgetAction::Defer,
+                format!("{provider}: defer — bursar status error: {error}"),
             );
         }
     };
@@ -212,74 +379,206 @@ pub(crate) fn evaluate_budget<C: BursarClient + ?Sized>(
     if report.schema != SCHEMA {
         return decision(
             provider,
-            BudgetAction::SpendCautiously,
+            BudgetAction::Defer,
             format!(
-                "{provider}: spend-cautiously — unsupported bursar schema {}",
+                "{provider}: defer — unsupported bursar schema {}",
                 report.schema
             ),
+        );
+    }
+    if report.providers.len() != PROVIDERS.len()
+        || !PROVIDERS
+            .iter()
+            .all(|provider| report.providers.contains_key(*provider))
+    {
+        return decision(
+            provider,
+            BudgetAction::Defer,
+            format!("{provider}: defer — malformed bursar/status@2 provider set"),
+        );
+    }
+
+    let report_checked_at = match parse_time("report checked_at", &report.checked_at) {
+        Ok(value) => value,
+        Err(error) => {
+            return decision(
+                provider,
+                BudgetAction::Defer,
+                format!("{provider}: defer — {error}"),
+            );
+        }
+    };
+    if report_checked_at > now {
+        return decision(
+            provider,
+            BudgetAction::Defer,
+            format!("{provider}: defer — bursar report checked_at is in the future"),
+        );
+    }
+    if now - report_checked_at > Duration::minutes(MAX_STATUS_AGE_MINS) {
+        return decision(
+            provider,
+            BudgetAction::Defer,
+            format!("{provider}: defer — bursar report is stale"),
         );
     }
 
     let Some(status) = report.providers.get(provider) else {
         return decision(
             provider,
-            BudgetAction::SpendCautiously,
-            format!("{provider}: spend-cautiously — provider absent from bursar/status@1"),
+            BudgetAction::Defer,
+            format!("{provider}: defer — provider absent from bursar/status@2"),
         );
     };
 
-    match status.status {
-        ProviderState::Unknown | ProviderState::Error => decision(
-            provider,
-            BudgetAction::SpendCautiously,
-            format!(
-                "{provider}: spend-cautiously — bursar status {}{}",
-                status.status,
-                reason_suffix(status.reason.as_deref())
-            ),
-        ),
-        ProviderState::Ok => evaluate_ok_provider(provider, status),
-    }
-}
-
-fn evaluate_ok_provider(provider: &str, status: &ProviderStatus) -> BudgetDecision {
-    if let Some(window) = status
-        .windows
-        .iter()
-        .filter_map(|window| window.percent.map(|percent| (window, percent)))
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
-    {
-        let (window, percent) = window;
-        if percent >= NEAR_EXHAUSTED_PERCENT {
-            return decision(
-                provider,
-                BudgetAction::Defer,
-                format!(
-                    "{provider}: defer — bursar window {} at {percent:.1}% (>= {NEAR_EXHAUSTED_PERCENT:.1}%)",
-                    window.label
-                ),
-            );
+    let status_checked_at = match parse_time("provider checked_at", &status.checked_at) {
+        Ok(value) => value,
+        Err(error) => {
+            return defer_with_status(provider, status, format!("{provider}: defer — {error}"));
         }
-        return decision(
+    };
+    if status_checked_at != report_checked_at {
+        return defer_with_status(
             provider,
-            BudgetAction::Proceed,
-            format!(
-                "{provider}: proceed — bursar window {} at {percent:.1}% (< {NEAR_EXHAUSTED_PERCENT:.1}%)",
-                window.label
-            ),
+            status,
+            format!("{provider}: defer — provider checked_at does not match report checked_at"),
         );
     }
 
-    decision(
+    if let Some(data_as_of) = status.data_as_of.as_deref() {
+        let parsed = match parse_time("provider data_as_of", data_as_of) {
+            Ok(value) => value,
+            Err(error) => {
+                return defer_with_status(provider, status, format!("{provider}: defer — {error}"));
+            }
+        };
+        if parsed > report_checked_at {
+            return defer_with_status(
+                provider,
+                status,
+                format!("{provider}: defer — provider data_as_of is in the future"),
+            );
+        }
+    }
+
+    if let Some(expires_at) = status.expires_at.as_deref() {
+        let expiry = match parse_time("provider expires_at", expires_at) {
+            Ok(value) => value,
+            Err(error) => {
+                return defer_with_status(provider, status, format!("{provider}: defer — {error}"));
+            }
+        };
+        if expiry <= now {
+            return defer_with_status(
+                provider,
+                status,
+                format!("{provider}: defer — bursar evidence expired at {expires_at}"),
+            );
+        }
+    }
+
+    let model = match optional_extra_string(status, "observation_model") {
+        Ok(value) => value,
+        Err(error) => {
+            return defer_with_status(provider, status, format!("{provider}: defer — {error}"));
+        }
+    };
+    let expiry_basis = match optional_expiry_basis(status) {
+        Ok(value) => value,
+        Err(error) => {
+            return decision_with_status(
+                provider,
+                status,
+                model,
+                None,
+                BudgetAction::Defer,
+                format!("{provider}: defer — {error}"),
+            );
+        }
+    };
+
+    let (action, label) = match status.availability {
+        Availability::Healthy => (BudgetAction::Proceed, "proceed"),
+        Availability::Caution => (BudgetAction::SpendCautiously, "spend-cautiously"),
+        Availability::Exhausted | Availability::Unknown => (BudgetAction::Defer, "defer"),
+    };
+    decision_with_status(
         provider,
-        BudgetAction::SpendCautiously,
-        format!("{provider}: spend-cautiously — bursar status ok but no percent windows"),
+        status,
+        model,
+        expiry_basis,
+        action,
+        format!(
+            "{provider}: {label} — bursar availability {}{}",
+            status.availability,
+            reason_suffix(status.reason.as_deref())
+        ),
     )
+}
+
+fn parse_time(label: &str, value: &str) -> std::result::Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|error| format!("malformed {label} {value:?}: {error}"))
+}
+
+fn optional_extra_string(
+    status: &ProviderStatus,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    match status.extra.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("malformed bursar extra.{key}")),
+    }
+}
+
+fn optional_expiry_basis(status: &ProviderStatus) -> std::result::Result<Option<String>, String> {
+    let value = optional_extra_string(status, "observation_expiry_basis")?;
+    match value.as_deref() {
+        None | Some("provider-reset" | "local-cooldown" | "human-override") => Ok(value),
+        Some(other) => Err(format!(
+            "unsupported bursar extra.observation_expiry_basis {other:?}"
+        )),
+    }
 }
 
 fn decision(provider: &str, action: BudgetAction, summary: String) -> BudgetDecision {
     BudgetDecision {
         provider: provider.to_string(),
+        model: None,
+        availability: None,
+        source: None,
+        checked_at: None,
+        data_as_of: None,
+        expires_at: None,
+        expiry_basis: None,
+        action,
+        summary,
+    }
+}
+
+fn defer_with_status(provider: &str, status: &ProviderStatus, summary: String) -> BudgetDecision {
+    decision_with_status(provider, status, None, None, BudgetAction::Defer, summary)
+}
+
+fn decision_with_status(
+    provider: &str,
+    status: &ProviderStatus,
+    model: Option<String>,
+    expiry_basis: Option<String>,
+    action: BudgetAction,
+    summary: String,
+) -> BudgetDecision {
+    BudgetDecision {
+        provider: provider.to_string(),
+        model,
+        availability: Some(status.availability),
+        source: Some(status.source.clone()),
+        checked_at: Some(status.checked_at.clone()),
+        data_as_of: status.data_as_of.clone(),
+        expires_at: status.expires_at.clone(),
+        expiry_basis,
         action,
         summary,
     }
@@ -305,38 +604,67 @@ pub(crate) mod test_support {
             }
         }
 
-        pub(crate) fn with_provider_status(
+        pub(crate) fn with_provider_availability(
             provider: &str,
-            state: ProviderState,
-            percent: Option<f64>,
+            availability: Availability,
         ) -> Self {
-            let mut providers = BTreeMap::new();
-            let windows = percent
-                .map(|percent| {
-                    vec![Window {
-                        label: "5h".to_string(),
-                        percent: Some(percent),
-                        reset_at: Some("2026-07-07T12:00:00Z".to_string()),
-                    }]
+            let checked_at = Utc::now().to_rfc3339();
+            let mut providers: BTreeMap<String, ProviderStatus> = PROVIDERS
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        ProviderStatus {
+                            availability: Availability::Unknown,
+                            source: "test".to_string(),
+                            checked_at: checked_at.clone(),
+                            data_as_of: None,
+                            expires_at: None,
+                            windows: Vec::new(),
+                            reason: Some("test status".to_string()),
+                            extra: Map::new(),
+                        },
+                    )
                 })
-                .unwrap_or_default();
-            providers.insert(
-                provider.to_string(),
-                ProviderStatus {
-                    status: state,
-                    source: "test".to_string(),
-                    checked_at: "2026-07-07T00:00:00Z".to_string(),
-                    data_as_of: None,
-                    windows,
-                    reason: (state != ProviderState::Ok).then(|| "test status".to_string()),
-                    extra: Map::new(),
-                },
-            );
+                .collect();
+            let provider = canonical_provider_key(provider);
+            if let Some(status) = providers.get_mut(provider) {
+                status.availability = availability;
+                status.reason =
+                    (availability != Availability::Healthy).then(|| "test status".to_string());
+            }
             Self {
                 result: Ok(StatusReport {
                     schema: SCHEMA.to_string(),
-                    checked_at: "2026-07-07T00:00:00Z".to_string(),
+                    checked_at,
                     providers,
+                }),
+            }
+        }
+
+        pub(crate) fn without_provider() -> Self {
+            Self {
+                result: Ok(StatusReport {
+                    schema: SCHEMA.to_string(),
+                    checked_at: Utc::now().to_rfc3339(),
+                    providers: PROVIDERS
+                        .into_iter()
+                        .map(|provider| {
+                            (
+                                provider.to_string(),
+                                ProviderStatus {
+                                    availability: Availability::Unknown,
+                                    source: "test".to_string(),
+                                    checked_at: Utc::now().to_rfc3339(),
+                                    data_as_of: None,
+                                    expires_at: None,
+                                    windows: Vec::new(),
+                                    reason: Some("test status".to_string()),
+                                    extra: Map::new(),
+                                },
+                            )
+                        })
+                        .collect(),
                 }),
             }
         }
@@ -354,18 +682,234 @@ mod tests {
     use super::*;
     use test_support::FakeBursarClient;
 
+    #[derive(Clone)]
+    struct FakeClient {
+        result: Result<StatusReport>,
+    }
+
+    impl BursarClient for FakeClient {
+        fn status(&self) -> Result<StatusReport> {
+            self.result.clone()
+        }
+    }
+
+    fn at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    fn client_from_json(json: &str) -> FakeClient {
+        FakeClient {
+            result: serde_json::from_str(json)
+                .map_err(|error| BursarError::json(error.to_string())),
+        }
+    }
+
     #[test]
-    fn evaluate_budget_unavailable_bursar_spends_cautiously_not_static_caps() {
-        let client = FakeBursarClient::unavailable();
+    fn status_v2_fixture_maps_all_availability_values_and_evidence() {
+        let client = client_from_json(include_str!("../tests/fixtures/bursar-status-v2.json"));
+        let now = at("2026-07-13T10:03:00Z");
 
-        let decision = evaluate_budget(&client, "opencode-go", true);
+        let anthropic = evaluate_budget_at(&client, "anthropic", true, now);
+        assert_eq!(anthropic.action, BudgetAction::SpendCautiously);
+        assert_eq!(anthropic.expiry_basis.as_deref(), Some("human-override"));
+        assert_eq!(anthropic.model.as_deref(), Some("claude-opus-4-8"));
 
-        // A missing bursar binary is not less uncertain than a bursar that ran
-        // and reported "unknown" — it must inherit the same cautious floor,
-        // never the permissive static-caps path (that path is reserved for
-        // the explicit `budgets.use_bursar = false` override).
-        assert_ne!(decision.action, BudgetAction::StaticCaps);
-        assert_eq!(decision.action, BudgetAction::SpendCautiously);
-        assert!(decision.summary.contains("bursar unavailable"));
+        let codex = evaluate_budget_at(&client, "openai-codex", true, now);
+        assert_eq!(codex.provider, "codex");
+        assert_eq!(codex.action, BudgetAction::Proceed);
+
+        let opencode = evaluate_budget_at(&client, "opencode-go", true, now);
+        assert_eq!(opencode.action, BudgetAction::Defer);
+        assert_eq!(opencode.expiry_basis.as_deref(), Some("local-cooldown"));
+
+        let agy = evaluate_budget_at(&client, "agy", true, now);
+        assert_eq!(agy.action, BudgetAction::Defer);
+        assert_eq!(agy.availability, Some(Availability::Unknown));
+    }
+
+    #[test]
+    fn status_v2_fail_closed_cases_defer() {
+        let now = at("2026-07-13T10:03:00Z");
+        for json in [
+            r#"{"schema":"bursar/status@1","checked_at":"2026-07-13T10:02:00Z","providers":{}}"#,
+            r#"{"schema":"bursar/status@2","checked_at":"not-time","providers":{}}"#,
+            r#"{"schema":"bursar/status@2","checked_at":"2026-07-13T09:00:00Z","providers":{}}"#,
+            r#"{"schema":"bursar/status@2","checked_at":"2026-07-13T11:00:00Z","providers":{}}"#,
+        ] {
+            assert_eq!(
+                evaluate_budget_at(&client_from_json(json), "codex", true, now).action,
+                BudgetAction::Defer
+            );
+        }
+
+        assert_eq!(
+            evaluate_budget_at(&FakeBursarClient::unavailable(), "codex", true, now).action,
+            BudgetAction::Defer
+        );
+        assert_eq!(
+            evaluate_budget_at(
+                &FakeBursarClient::without_provider(),
+                "missing",
+                true,
+                Utc::now(),
+            )
+            .action,
+            BudgetAction::Defer
+        );
+    }
+
+    #[test]
+    fn status_v2_requires_complete_fixed_provider_contract() {
+        let now = at("2026-07-13T10:03:00Z");
+        for field in ["data_as_of", "expires_at", "windows", "reason", "extra"] {
+            let mut value: Value =
+                serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                    .expect("fixture JSON");
+            value["providers"]["codex"]
+                .as_object_mut()
+                .expect("provider object")
+                .remove(field);
+            assert_eq!(
+                evaluate_budget_at(&client_from_json(&value.to_string()), "codex", true, now,)
+                    .action,
+                BudgetAction::Defer,
+                "missing {field}"
+            );
+        }
+
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                .expect("fixture JSON");
+        let unsupported = value["providers"]["agy"].take();
+        let providers = value["providers"]
+            .as_object_mut()
+            .expect("providers object");
+        providers.remove("agy");
+        providers.insert("ollama-cloud".to_string(), unsupported);
+        let decision = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "ollama-cloud",
+            true,
+            now,
+        );
+        assert_eq!(decision.action, BudgetAction::Defer);
+        assert!(decision.summary.contains("provider set"));
+    }
+
+    #[test]
+    fn status_v2_rejects_even_near_future_checked_at() {
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                .expect("fixture JSON");
+        value["checked_at"] = Value::String("2026-07-13T10:03:01Z".to_string());
+        for provider in PROVIDERS {
+            value["providers"][provider]["checked_at"] =
+                Value::String("2026-07-13T10:03:01Z".to_string());
+        }
+        let decision = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "codex",
+            true,
+            at("2026-07-13T10:03:00Z"),
+        );
+        assert_eq!(decision.action, BudgetAction::Defer);
+        assert!(decision.summary.contains("future"));
+    }
+
+    #[test]
+    fn provider_timestamps_and_expiry_fail_closed() {
+        let now = at("2026-07-13T10:03:00Z");
+        for (field, value) in [
+            ("checked_at", "bad"),
+            ("checked_at", "2026-07-13T10:01:00Z"),
+            ("data_as_of", "2026-07-13T10:04:00Z"),
+            ("data_as_of", "bad"),
+            ("expires_at", "2026-07-13T10:03:00Z"),
+            ("expires_at", "bad"),
+        ] {
+            let mut value_json: Value =
+                serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                    .expect("fixture JSON");
+            value_json["providers"]["codex"][field] = Value::String(value.to_string());
+            let client = client_from_json(&value_json.to_string());
+            assert_eq!(
+                evaluate_budget_at(&client, "codex", true, now).action,
+                BudgetAction::Defer,
+                "{field}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_observation_metadata_fails_closed() {
+        let now = at("2026-07-13T10:03:00Z");
+        for bad in [Value::Bool(true), Value::String("invented".to_string())] {
+            let mut value: Value =
+                serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                    .expect("fixture JSON");
+            value["providers"]["anthropic"]["extra"]["observation_expiry_basis"] = bad;
+            let decision = evaluate_budget_at(
+                &client_from_json(&value.to_string()),
+                "anthropic",
+                true,
+                now,
+            );
+            assert_eq!(decision.action, BudgetAction::Defer);
+            assert!(decision.summary.contains("observation_expiry_basis"));
+        }
+    }
+
+    #[test]
+    fn disabled_mode_is_the_only_static_caps_override() {
+        let decision = evaluate_budget(&FakeBursarClient::unavailable(), "openai-codex", false);
+        assert_eq!(decision.provider, "codex");
+        assert_eq!(decision.action, BudgetAction::StaticCaps);
+        assert!(decision.summary.contains("budgets.use_bursar is false"));
+    }
+
+    #[test]
+    fn observation_request_builds_exact_sanitized_bursar_argv() {
+        let request = ObservationRequest::runtime_limit(
+            "openai-codex",
+            Some("gpt-5.6-terra".to_string()),
+            "2026-07-13T10:18:00Z",
+            ObservationExpiryBasis::LocalCooldown,
+            RuntimeLimitReason::Http429,
+        );
+        assert_eq!(
+            observation_args(&request),
+            [
+                "observe",
+                "--provider",
+                "codex",
+                "--availability",
+                "exhausted",
+                "--expires-at",
+                "2026-07-13T10:18:00Z",
+                "--expiry-basis",
+                "local-cooldown",
+                "--source",
+                "conductor-runtime",
+                "--reason",
+                "runtime HTTP 429",
+                "--model",
+                "gpt-5.6-terra",
+            ]
+        );
+    }
+
+    #[test]
+    fn observation_reason_and_basis_are_closed_enums() {
+        assert_eq!(
+            ObservationExpiryBasis::ProviderReset.label(),
+            "provider-reset"
+        );
+        assert_eq!(
+            RuntimeLimitReason::QuotaExceeded.label(),
+            "runtime quota exceeded"
+        );
+        assert_eq!(RuntimeLimitReason::RateLimit.label(), "runtime rate limit");
     }
 }

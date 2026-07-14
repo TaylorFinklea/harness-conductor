@@ -641,10 +641,7 @@ fn bursar_provider_for(roster: &RosterEntry) -> String {
             .split_once('/')
             .map_or(roster.dispatch_id.as_str(), |(provider, _)| provider)
     };
-    match raw {
-        "openai-codex" => "codex".to_string(),
-        other => other.to_string(),
-    }
+    bursar::canonical_provider_key(raw).to_string()
 }
 
 fn record_budget_decision(
@@ -665,12 +662,21 @@ fn record_budget_decision(
         level,
         "BURSAR",
         &format!(
-            "bursar budget decision: {}/{} → {} ({})\n- model: {}\n- {}",
+            "bursar budget decision: {}/{} → {} ({})\n- roster: {}\n- model: {}\n- availability: {}\n- source: {}\n- checked_at: {}\n- data_as_of: {}\n- expires_at: {}\n- expiry_basis: {}\n- {}",
             item.repo,
             item.issue_id,
             decision.action.label(),
             decision.provider,
             roster.name,
+            decision.model.as_deref().unwrap_or("-"),
+            decision
+                .availability
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+            decision.source.as_deref().unwrap_or("-"),
+            decision.checked_at.as_deref().unwrap_or("-"),
+            decision.data_as_of.as_deref().unwrap_or("-"),
+            decision.expires_at.as_deref().unwrap_or("-"),
+            decision.expiry_basis.as_deref().unwrap_or("-"),
             decision.summary
         ),
     )
@@ -1074,7 +1080,7 @@ mod tests {
     use serde_json::json;
 
     use crate::bd::{BdClient, BdError, CommandBdClient, Comment, Issue};
-    use crate::bursar::{test_support::FakeBursarClient, ProviderState};
+    use crate::bursar::{test_support::FakeBursarClient, Availability};
     use crate::config;
     use crate::deck::{Block, Report, ReportStatus};
     use crate::dispatch::{
@@ -1180,6 +1186,7 @@ root = "{}"
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 max_external_dispatches = 4
+use_bursar = false
 item_wall_clock_mins = 1
 cycle_wall_clock_mins = 1
 
@@ -1295,6 +1302,7 @@ root = "{}"
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 max_external_dispatches = 8
+use_bursar = false
 item_wall_clock_mins = 1
 cycle_wall_clock_mins = 1
 
@@ -1388,6 +1396,7 @@ root = "{}"
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 max_external_dispatches = 8
+use_bursar = false
 item_wall_clock_mins = 1
 cycle_wall_clock_mins = 1
 
@@ -1494,6 +1503,7 @@ root = "{}"
 max_dispatches_per_cycle = 8
 max_active_per_repo = 1
 max_external_dispatches = 8
+use_bursar = false
 item_wall_clock_mins = 1
 cycle_wall_clock_mins = 1
 
@@ -1629,7 +1639,10 @@ dispatch_id = "fallback-worker"
     fn bursar_budget_healthy_provider_proceeds_and_reports_decision() {
         let run = run_bursar_budget_case(
             "healthy",
-            &FakeBursarClient::with_provider_status("opencode-go", ProviderState::Ok, Some(42.0)),
+            &FakeBursarClient::with_provider_availability(
+                "opencode-go",
+                Availability::Healthy,
+            ),
         );
 
         assert_eq!(run.result.dispatched, 1);
@@ -1642,29 +1655,33 @@ dispatch_id = "fallback-worker"
     }
 
     #[test]
-    fn bursar_budget_unknown_provider_spends_cautiously_and_reports_decision() {
+    fn bursar_budget_unknown_provider_defers_and_reports_decision() {
         let run = run_bursar_budget_case(
             "unknown",
-            &FakeBursarClient::with_provider_status("opencode-go", ProviderState::Unknown, None),
+            &FakeBursarClient::with_provider_availability(
+                "opencode-go",
+                Availability::Unknown,
+            ),
         );
 
-        assert_eq!(run.result.dispatched, 1);
-        assert_eq!(run.result.verified, 1);
-        assert_eq!(
-            run.exec.spawns().len(),
-            2,
-            "unknown still spends cautiously"
-        );
+        assert_eq!(run.result.dispatched, 0);
+        assert_eq!(run.result.verified, 0);
+        assert_eq!(run.result.failed, 1);
+        assert!(run.exec.spawns().is_empty());
+        assert_eq!(run.bd.release_count(), 1);
         let report = report_json_string(&run.reports, &run.cycle_id);
-        assert!(report.contains("spend-cautiously"));
+        assert!(report.contains("defer"));
         assert!(report.contains("opencode-go"));
     }
 
     #[test]
-    fn bursar_budget_near_exhausted_provider_defers_and_reports_decision() {
+    fn bursar_budget_exhausted_provider_defers_and_reports_decision() {
         let run = run_bursar_budget_case(
-            "near-exhausted",
-            &FakeBursarClient::with_provider_status("opencode-go", ProviderState::Ok, Some(96.0)),
+            "exhausted",
+            &FakeBursarClient::with_provider_availability(
+                "opencode-go",
+                Availability::Exhausted,
+            ),
         );
 
         assert_eq!(run.result.dispatched, 0);
@@ -1674,22 +1691,20 @@ dispatch_id = "fallback-worker"
         assert_eq!(run.bd.release_count(), 1, "deferred bead is released");
         let report = report_json_string(&run.reports, &run.cycle_id);
         assert!(report.contains("defer"));
-        assert!(report.contains("96.0%"));
+        assert!(report.contains("exhausted"));
     }
 
     #[test]
-    fn bursar_budget_absent_binary_spends_cautiously_cleanly() {
+    fn bursar_budget_absent_binary_defers_cleanly() {
         let run = run_bursar_budget_case("absent", &FakeBursarClient::unavailable());
 
-        assert_eq!(run.result.dispatched, 1);
-        assert_eq!(run.result.verified, 1);
-        assert_eq!(
-            run.exec.spawns().len(),
-            2,
-            "worker + verify under spend-cautiously"
-        );
+        assert_eq!(run.result.dispatched, 0);
+        assert_eq!(run.result.verified, 0);
+        assert_eq!(run.result.failed, 1);
+        assert!(run.exec.spawns().is_empty());
+        assert_eq!(run.bd.release_count(), 1);
         let report = report_json_string(&run.reports, &run.cycle_id);
-        assert!(report.contains("spend-cautiously"));
+        assert!(report.contains("defer"));
         assert!(report.contains("bursar unavailable"));
         assert!(!report.contains("static-caps"));
     }
