@@ -14,6 +14,10 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             print_usage();
             ExitCode::from(2)
         }
+        Some("--help" | "-h") => {
+            print_help();
+            ExitCode::SUCCESS
+        }
         Some("--version") => {
             println!("conductor {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -884,6 +888,23 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 
 fn print_usage() {
     eprintln!("{USAGE}");
+}
+
+fn print_help() {
+    println!("{USAGE}");
+    println!();
+    println!("Commands:");
+    println!("  config check   Validate conductor.toml and run preflight checks");
+    println!("  roster drift   Diff conductor.toml's roster against ~/.claude/model-scorecard.md");
+    println!("  scan           Enumerate fleet repos and snapshot ready work");
+    println!("  status         Show the most recently recorded cycle");
+    println!("  cycle          Dry-run scan -> triage -> plan and publish a report");
+    println!("  dispatch       Dispatch an approved cycle's ready items");
+    println!("  arena run      Head-to-head harness/model arena on one bead");
+    println!();
+    println!("Notes:");
+    println!("  arena run applies the winning patch by default; pass --no-apply to opt out.");
+    println!("  cycle --dry-run still writes a report file even though it makes no bd writes.");
 }
 
 #[cfg(test)]

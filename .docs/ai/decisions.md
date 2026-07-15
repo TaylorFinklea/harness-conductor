@@ -113,3 +113,121 @@ process-dependent standard hashing; shell out to `shasum`.
 visible and immutable before the user grants it. Standard hashing is not a
 stable cross-process contract, and a subprocess would add platform and PATH
 failure modes to a correctness boundary.
+
+## [2026-07-13] Roster enablement is config-level, with a provider gate
+
+**Context**: Taking a model or a whole provider lane out of rotation meant
+deleting `[[roster]]` rows and losing their config — and `fallback` chains name
+roster entries, so a deletion silently orphans other models' chains.
+**Decision**: `[[roster]]` rows gain an optional `enabled` (default `true`); a
+new first-class `[[provider]]` table gains the same. `effective_enabled =
+roster.enabled && provider.enabled` is resolved at parse time. A non-empty
+`provider` MUST resolve to a declared `[[provider]]` block (fail closed on
+typos); an empty `provider` bypasses the gate (legacy/test shape). A disabled
+model is **never selected** and is **skipped** in the fallback walk — the same
+rule, so there is no special case for `chain[0]`. Manual `enabled` is the hard
+off knob; Bursar's per-cycle `Defer` remains the soft one. Details:
+`phases/roster-tui-spec.md`.
+**Alternatives considered**: Delete-only (loses config); a runtime overlay file
+(leaves `conductor.toml` non-authoritative); "disabled primary is still
+selectable, dispatch walks to its first enabled fallback" (routing-alias
+framing).
+**Rationale**: Rejected the routing-alias framing because `select_candidate`
+must return a model that will actually run — otherwise the ledger names a model
+that never executed. Provider is the natural toggle unit because it is the unit
+that actually goes down (quota, rate limit), and it is where `provider_policy`
+(conductor-d5j) will land.
+
+## [2026-07-13] `enabled` must NOT enter `candidate_rejection`
+
+**Context**: `candidate_rejection` (`triage.rs:183`) is shared by
+`select_candidate`, the fallback walk, and `next_eligible_roster` — so folding
+the enabled check into it is the obvious implementation.
+**Decision**: Do not. Keep a separate effective-enabled predicate applied
+*after* `candidate_rejection`, and add `Flag::AllDisabled` for "candidates
+qualify but all are dark". A disabled link in the walk is a hard skip
+(`record_fallback_skip`), never the Bursar `Deferred` path.
+**Alternatives considered**: Fold it in (one predicate, less code).
+**Rationale**: Folding it in makes `select_candidate` return `None` for a fully
+darkened tier, and `route` flags that as `Flag::OverCeiling` (`triage.rs:351`) —
+reporting "the operator turned these off" as "this item is too hard." Silent
+misattribution, and worse for a ratchet-unlocked auto-dispatch item.
+
+## [2026-07-13] TOML write-back is a line-span editor gated by structural equivalence
+
+**Context**: A roster TUI must write `conductor.toml` — 535 lines carrying
+load-bearing comments. `config.rs` hand-rolls a read-only TOML parser and the
+crate holds only three dependencies.
+**Decision**: Hand-roll a line-span editor (`src/config_edit.rs`) that splices
+only the lines it touches, so comments survive by construction. Take ratatui +
+crossterm for the UI (feature-gated). Do **not** add `toml_edit`. Every write is
+gated by a **structural-equivalence check**: re-parse and assert the resulting
+`Config` differs from the pre-edit `Config` only in the intended field.
+**Alternatives considered**: `toml_edit` (battle-tested round-tripping);
+hand-roll the terminal layer too; gate writes on `parse_str` alone.
+**Rationale**: `toml_edit` would put two TOML semantics in one tree that can
+disagree — the TUI could write what `config.rs` rejects. Rendering, by contrast,
+is toil with no domain value, so ratatui is worth the dep. Critically, gating on
+`parse_str` alone is **insufficient**: the parser accepts `[[roster]] # comment`
+(`config.rs:1944`), so an indexer whose header match is stricter than the
+parser's mis-attributes keys to the previous block and silently edits the WRONG
+model while still emitting valid TOML. Parseability is not correctness — hence
+structural equivalence. (Found by adversarial review, opencode-go/glm-5.2.)
+
+## [2026-07-14] backnotprop/orchestrator is mined for design, never adopted as a dependency
+
+**Context**: `backnotprop/orchestrator` (BUSL-1.1, ~31k LoC TS) is a kubectl-style
+process-supervision layer for agent workers across Claude Code, Codex, Copilot,
+Grok, and Pi. It explicitly disclaims Conductor's layer — ADR 0008 "do not require
+structured worker output in v1", ADR 0011 "parent-directed, no prebaked recipes" —
+so it competes with `dispatch.rs` alone, not with scan/triage/verify/ledger. Its
+README and ADR titles advertise worktree isolation, session resume, and provider-limit
+intelligence: three things we want. A title-deep comparison recommended adopting it
+behind the `Exec` trait (`dispatch.rs:129`).
+
+**Decision**: **Mine the design; take no dependency.** Reading the source
+(`conductor-iz7`, pinned `583acf4`, memo `docs/notes/orchestrator-recon.md`) refuted
+the premise. Concretely: (a) take their provider-limit detectors into Bursar —
+endpoints, the two-tier CLI fallback, the window+reset shape, the typed auth-failure
+taxonomy (`bursar-ejf`); (b) build a **native Rust client** over Codex's *own*
+app-server protocol (`conductor-2d4`); (c) borrow the tri-state degrade-honestly
+catalog shape for `roster_drift`; (d) build worktree isolation clean (`conductor-fia`).
+Close `conductor-kfq` (wrap-orchestrator spike) as wont-fix. Do not vendor or copy
+their code — BUSL-1.1 would carry into our tree.
+
+**Alternatives considered**: Adopt as one `Exec` impl behind the existing trait
+(the original recommendation); reject wholesale and revisit later.
+
+**Rationale**: Adoption's two justifying capabilities did not survive verification.
+**Worktree isolation does not exist** — `supportsWorktree`/`CwdPolicy` are unconsumed
+type surface (`runtime/types.ts:30-31,40`) and orchestrator never invokes git at all;
+our Arena worktrees already exceed it. **Session resume is codex-app-server-only** —
+Claude Code, Pi, Copilot and Grok all use the process executor, whose handle is
+`{completed, interrupt}` (`process.ts:399-401`), one-shot and identical to
+`dispatch.rs`; `sendMessage?`/`startGoal?` are optional members precisely because
+most executors lack them (`executors/types.ts:44-48`). Wrapping would therefore buy
+nothing for three of our four backends. And the resume protocol we *do* want —
+`thread/start`, `thread/resume`, `turn/start`, `account/rateLimits/read` — is
+**Codex's API, not orchestrator's**; we already depend on the `codex` binary, so we
+can speak it from Rust with no BUSL exposure and no Node toolchain.
+
+The disqualifier is verification. Their success oracle is `code === 0`
+(`process.ts:257-264`), cross-checked only against the worker's own output stream —
+so an **agy quota-exhausted no-op reports `succeeded`**. That is the exact failure the
+charter names ("exit codes are testimony; artifacts are evidence"), and `dispatch.rs`'s
+`CommitProbe` classify (`dispatch.rs:140,483`, and the `exit_zero_with_no_new_commit_*`
+tests) is materially better: it at least demands an artifact. We would have had to
+override their status model on day one. A supervisor whose notion of success we must
+overrule is not a supervisor we should depend on — it is a design to read and a
+protocol to reimplement.
+
+**Correction (same day, on discovering `conductor-1i9`)**: an earlier draft of this ADR
+called our classify "strictly better." That overclaims. `conductor-1i9` establishes that
+`CommitProbe` is **itself forgeable** — it declares success on *any* HEAD change
+(`dispatch.rs:350-352`, `verify.rs:161-162,223`), not on the worker's *own* commit, so a
+concurrent commit satisfies it. Ours demands an artifact but does not check who produced
+it; theirs demands nothing but an exit code. The decision above is unchanged — we would
+still be importing the weaker of two flawed oracles, and would still have to override it
+— but the honest statement is that **both success models are broken, ours less badly**,
+and `conductor-1i9` is the P0 that fixes ours. This ADR is not a claim that our
+verification is sound; it is a claim that theirs is not worth adopting.
