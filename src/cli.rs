@@ -5,7 +5,10 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
+
+const DEFAULT_ADVERSARIAL_QUESTION: &str =
+    "What are the highest-risk flaws in this artifact, and what must change before proceeding?";
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
     let mut it = args.into_iter();
@@ -22,6 +25,7 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             println!("conductor {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Some("adversarial-review") => run_adversarial(&mut it),
         Some("arena") => run_arena(&mut it),
         Some("config") => run_config(&mut it),
         Some("cycle") => run_cycle(&mut it),
@@ -36,6 +40,414 @@ pub(crate) fn run(args: Vec<String>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdversarialPlanOptions {
+    artifact: PathBuf,
+    reviewers: usize,
+    question: String,
+    models: Option<Vec<String>>,
+    config: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdversarialDispatchOptions {
+    review_id: String,
+    config: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdversarialPaths {
+    state_root: PathBuf,
+    reports_home: PathBuf,
+    ledger_path: PathBuf,
+}
+
+impl AdversarialPaths {
+    fn from_environment() -> Self {
+        Self {
+            state_root: state_dir().join("adversarial-reviews"),
+            reports_home: reports_home(),
+            ledger_path: ledger_path(),
+        }
+    }
+}
+
+fn run_adversarial(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    match it.next().as_deref() {
+        Some("plan") => run_adversarial_plan(it),
+        Some("dispatch") => run_adversarial_dispatch(it),
+        None => {
+            eprintln!(
+                "usage: conductor adversarial-review <plan --artifact <path> --reviewers <N>|dispatch <review-id>> [options]"
+            );
+            ExitCode::from(2)
+        }
+        Some(subcommand) => {
+            eprintln!("unknown adversarial-review subcommand: {subcommand}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn parse_adversarial_plan_options(args: &[String]) -> Result<AdversarialPlanOptions, String> {
+    let mut artifact = None;
+    let mut reviewers = None;
+    let mut question = None;
+    let mut models = None;
+    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_seen = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--artifact" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--artifact requires a path".to_string())?;
+                if artifact.replace(PathBuf::from(value)).is_some() {
+                    return Err("--artifact may only be supplied once".to_string());
+                }
+            }
+            "--reviewers" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--reviewers requires an integer".to_string())?;
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| "--reviewers must be a positive integer".to_string())?;
+                if parsed == 0 {
+                    return Err("--reviewers must be at least 1".to_string());
+                }
+                if reviewers.replace(parsed).is_some() {
+                    return Err("--reviewers may only be supplied once".to_string());
+                }
+            }
+            "--question" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--question requires text".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("--question must not be empty".to_string());
+                }
+                if question.replace(value.clone()).is_some() {
+                    return Err("--question may only be supplied once".to_string());
+                }
+            }
+            "--models" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--models requires comma-separated roster names".to_string())?;
+                let parsed = value
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if parsed.is_empty() || parsed.iter().any(String::is_empty) {
+                    return Err(
+                        "--models requires non-empty comma-separated roster names".to_string()
+                    );
+                }
+                if models.replace(parsed).is_some() {
+                    return Err("--models may only be supplied once".to_string());
+                }
+            }
+            "--config" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_string())?;
+                if config_seen {
+                    return Err("--config may only be supplied once".to_string());
+                }
+                config_seen = true;
+                config_path = PathBuf::from(value);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    let reviewers =
+        reviewers.ok_or_else(|| "adversarial-review plan requires --reviewers <N>".to_string())?;
+    if let Some(explicit) = &models
+        && explicit.len() != reviewers
+    {
+        return Err(format!(
+            "--models contains {} entries; expected {reviewers}",
+            explicit.len()
+        ));
+    }
+    Ok(AdversarialPlanOptions {
+        artifact: artifact
+            .ok_or_else(|| "adversarial-review plan requires --artifact <path>".to_string())?,
+        reviewers,
+        question: question.unwrap_or_else(|| DEFAULT_ADVERSARIAL_QUESTION.to_string()),
+        models,
+        config: config_path,
+    })
+}
+
+fn parse_adversarial_dispatch_options(
+    args: &[String],
+) -> Result<AdversarialDispatchOptions, String> {
+    let Some(review_id) = args.first() else {
+        return Err("adversarial-review dispatch requires <review-id>".to_string());
+    };
+    if !valid_cli_review_id(review_id) {
+        return Err("review id must contain only alphanumeric, '_' or '-' bytes".to_string());
+    }
+    let mut config_path = PathBuf::from("conductor.toml");
+    let mut config_seen = false;
+    let mut it = args[1..].iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--config requires a path argument".to_string())?;
+                if config_seen {
+                    return Err("--config may only be supplied once".to_string());
+                }
+                config_seen = true;
+                config_path = PathBuf::from(value);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(AdversarialDispatchOptions {
+        review_id: review_id.clone(),
+        config: config_path,
+    })
+}
+
+fn valid_cli_review_id(review_id: &str) -> bool {
+    let mut bytes = review_id.bytes();
+    !review_id.is_empty()
+        && review_id.len() <= 128
+        && bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn run_adversarial_plan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let args = it.collect::<Vec<_>>();
+    let options = match parse_adversarial_plan_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("adversarial-review plan: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match config::load(&options.config) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if options.reviewers > cfg.adversarial_review.max_reviewers as usize {
+        eprintln!(
+            "adversarial-review plan: --reviewers must be between 1 and {}",
+            cfg.adversarial_review.max_reviewers
+        );
+        return ExitCode::from(2);
+    }
+    let paths = AdversarialPaths::from_environment();
+    let bursar = crate::bursar::CommandBursarClient::new();
+    let validator = crate::deck::CommandDeckValidator::new();
+    let review_id = new_adversarial_review_id();
+    let created_at = chrono::Utc::now().to_rfc3339();
+    match execute_adversarial_plan(
+        &cfg,
+        &options,
+        &paths,
+        &bursar,
+        &validator,
+        &review_id,
+        &created_at,
+    ) {
+        Ok(published) => {
+            println!(
+                "adversarial-review plan {}: awaiting approval",
+                published.plan.review_id
+            );
+            println!(
+                "calls: nominal {}, worst-case {}",
+                published.plan.limits.nominal_calls, published.plan.limits.worst_case_calls
+            );
+            println!(
+                "state: {}",
+                paths.state_root.join(&published.plan.review_id).display()
+            );
+            println!("report: {}", published.report_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("adversarial-review plan: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn execute_adversarial_plan<C, V>(
+    cfg: &crate::config::Config,
+    options: &AdversarialPlanOptions,
+    paths: &AdversarialPaths,
+    bursar: &C,
+    validator: &V,
+    review_id: &str,
+    created_at: &str,
+) -> Result<crate::adversarial::PublishedApproval, String>
+where
+    C: crate::bursar::BursarClient + ?Sized,
+    V: crate::deck::DeckValidator,
+{
+    let provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
+    let panel = crate::adversarial::plan_panel(
+        &cfg.roster,
+        &cfg.adversarial_review,
+        &provider_snapshot,
+        options.reviewers,
+        options.models.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let snapshot =
+        crate::adversarial::snapshot_artifact(&options.artifact, &paths.state_root, review_id)
+            .map_err(|error| error.to_string())?;
+    crate::adversarial::publish_approval_plan(
+        crate::adversarial::ApprovalPlanRequest {
+            snapshot: &snapshot,
+            roster: &cfg.roster,
+            config: &cfg.adversarial_review,
+            provider_snapshot: &provider_snapshot,
+            panel,
+            question: &options.question,
+            created_at,
+            deck_home: &paths.reports_home,
+        },
+        validator,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn run_adversarial_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
+    let args = it.collect::<Vec<_>>();
+    let options = match parse_adversarial_dispatch_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("adversarial-review dispatch: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match config::load(&options.config) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("config: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let paths = AdversarialPaths::from_environment();
+    let bursar = crate::bursar::CommandBursarClient::new();
+    let exec = crate::dispatch::CommandExec;
+    let result = execute_adversarial_dispatch(&cfg, &options, &paths, &bursar, &exec);
+    match &result {
+        Ok(run) => {
+            let outcome = match run.outcome {
+                crate::adversarial::ReviewLifecycleOutcome::Complete => "complete",
+                crate::adversarial::ReviewLifecycleOutcome::Partial => "partial",
+            };
+            println!(
+                "adversarial-review dispatch {}: {outcome}",
+                options.review_id
+            );
+            println!("report: {}", run.report_path.display());
+            for failure in &run.failures {
+                eprintln!("failure: {failure}");
+            }
+        }
+        Err(error) => eprintln!("adversarial-review dispatch {}: {error}", options.review_id),
+    }
+    adversarial_dispatch_result_exit_code(&result)
+}
+
+fn execute_adversarial_dispatch<C, E>(
+    cfg: &crate::config::Config,
+    options: &AdversarialDispatchOptions,
+    paths: &AdversarialPaths,
+    bursar: &C,
+    exec: &E,
+) -> Result<crate::adversarial::AdversarialRun, String>
+where
+    C: crate::bursar::BursarClient + ?Sized,
+    E: crate::dispatch::Exec + Sync,
+{
+    let review_dir = paths.state_root.join(&options.review_id);
+    let plan =
+        crate::adversarial::load_review_plan(&review_dir).map_err(|error| error.to_string())?;
+    let artifact_path = PathBuf::from(plan.artifact_source_path());
+    let provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
+    let authorized = crate::adversarial::authorize_approved_execution(
+        &review_dir,
+        &paths.reports_home,
+        &artifact_path,
+        &cfg.roster,
+        &cfg.adversarial_review,
+        &provider_snapshot,
+    )
+    .map_err(|error| error.to_string())?;
+    let calls =
+        crate::adversarial::ReviewerCallBudget::new(authorized.plan.limits.worst_case_calls);
+    let timeout = std::time::Duration::from_secs(
+        u64::from(cfg.budgets.item_wall_clock_mins).saturating_mul(60),
+    );
+    let reviewer_run =
+        crate::adversarial::run_reviewers(&authorized, &cfg.roster, exec, timeout, &calls)
+            .map_err(|error| error.to_string())?;
+
+    let judge_provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
+    crate::adversarial::finalize_review(crate::adversarial::SynthesisRequest {
+        authorized: &authorized,
+        reviewer_run,
+        roster: &cfg.roster,
+        judge_provider_snapshot: &judge_provider_snapshot,
+        exec,
+        timeout,
+        calls: &calls,
+        ledger_path: &paths.ledger_path,
+        deck_home: &paths.reports_home,
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn adversarial_provider_snapshot<C: crate::bursar::BursarClient + ?Sized>(
+    cfg: &crate::config::Config,
+    bursar: &C,
+) -> std::collections::BTreeMap<String, crate::bursar::BudgetDecision> {
+    crate::bursar::evaluate_provider_snapshot(
+        bursar,
+        cfg.roster.iter().map(|entry| entry.provider.as_str()),
+        cfg.budgets.use_bursar,
+    )
+}
+
+fn adversarial_dispatch_result_exit_code(
+    result: &Result<crate::adversarial::AdversarialRun, String>,
+) -> ExitCode {
+    match result {
+        Ok(run)
+            if run.outcome == crate::adversarial::ReviewLifecycleOutcome::Complete
+                && run.synthesis.is_some() =>
+        {
+            ExitCode::SUCCESS
+        }
+        Ok(_) | Err(_) => ExitCode::from(1),
+    }
+}
+
+fn new_adversarial_review_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("adversarial-{nanos}-{}", std::process::id())
 }
 
 fn run_route(it: &mut std::vec::IntoIter<String>) -> ExitCode {
@@ -894,6 +1306,7 @@ fn print_help() {
     println!("{USAGE}");
     println!();
     println!("Commands:");
+    println!("  adversarial-review  Plan or dispatch an approval-gated read-only design review");
     println!("  config check   Validate conductor.toml and run preflight checks");
     println!("  roster drift   Diff conductor.toml's roster against ~/.claude/model-scorecard.md");
     println!("  scan           Enumerate fleet repos and snapshot ready work");
@@ -903,6 +1316,7 @@ fn print_help() {
     println!("  arena run      Head-to-head harness/model arena on one bead");
     println!();
     println!("Notes:");
+    println!("  adversarial-review dispatch exits 0 only for complete validated synthesis.");
     println!("  arena run applies the winning patch by default; pass --no-apply to opt out.");
     println!("  cycle --dry-run still writes a report file even though it makes no bd writes.");
 }
@@ -910,8 +1324,242 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bursar::Availability;
     use crate::scan::{Freshness, RepoSnapshot, SkipReason, ZeroState};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn adversarial_plan_and_dispatch_parsers_enforce_exact_grammar() {
+        let plan = parse_adversarial_plan_options(&[
+            "--artifact".to_string(),
+            "/tmp/design.md".to_string(),
+            "--reviewers".to_string(),
+            "2".to_string(),
+            "--question".to_string(),
+            "Should this ship?".to_string(),
+            "--models".to_string(),
+            "reviewer-one,reviewer-two".to_string(),
+            "--config".to_string(),
+            "/tmp/conductor.toml".to_string(),
+        ])
+        .expect("exact plan grammar");
+        assert_eq!(plan.artifact, PathBuf::from("/tmp/design.md"));
+        assert_eq!(plan.reviewers, 2);
+        assert_eq!(plan.question, "Should this ship?");
+        assert_eq!(
+            plan.models,
+            Some(vec!["reviewer-one".to_string(), "reviewer-two".to_string()])
+        );
+        assert_eq!(plan.config, PathBuf::from("/tmp/conductor.toml"));
+
+        let dispatch = parse_adversarial_dispatch_options(&[
+            "review-123".to_string(),
+            "--config".to_string(),
+            "/tmp/conductor.toml".to_string(),
+        ])
+        .expect("exact dispatch grammar");
+        assert_eq!(dispatch.review_id, "review-123");
+        assert_eq!(dispatch.config, PathBuf::from("/tmp/conductor.toml"));
+
+        for invalid in [
+            vec![],
+            vec!["--artifact".to_string(), "/tmp/design.md".to_string()],
+            vec![
+                "--artifact".to_string(),
+                "/tmp/design.md".to_string(),
+                "--reviewers".to_string(),
+                "0".to_string(),
+            ],
+            vec![
+                "--artifact".to_string(),
+                "/tmp/design.md".to_string(),
+                "--reviewers".to_string(),
+                "2".to_string(),
+                "--models".to_string(),
+                ",".to_string(),
+            ],
+            vec![
+                "--artifact".to_string(),
+                "/tmp/design.md".to_string(),
+                "--reviewers".to_string(),
+                "2".to_string(),
+                "--wide".to_string(),
+            ],
+        ] {
+            assert!(
+                parse_adversarial_plan_options(&invalid).is_err(),
+                "invalid plan parsed: {invalid:?}"
+            );
+        }
+        assert!(parse_adversarial_dispatch_options(&[]).is_err());
+        assert!(
+            parse_adversarial_dispatch_options(&[
+                "review-123".to_string(),
+                "--artifact".to_string(),
+                "/tmp/design.md".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adversarial_usage_and_config_errors_exit_two() {
+        assert_eq!(
+            run(vec!["adversarial-review".to_string()]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            run(vec![
+                "adversarial-review".to_string(),
+                "plan".to_string(),
+                "--artifact".to_string(),
+                "/tmp/design.md".to_string(),
+            ]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            run(vec![
+                "adversarial-review".to_string(),
+                "dispatch".to_string(),
+                "review-123".to_string(),
+                "--config".to_string(),
+                "/definitely/missing/conductor.toml".to_string(),
+            ]),
+            ExitCode::from(2)
+        );
+    }
+
+    #[test]
+    fn adversarial_explicit_models_must_match_reviewer_count_before_state_write() {
+        let fixture = AdversarialCliFixture::new("cli-explicit-count");
+        let mut options = fixture.plan_options();
+        options.models = Some(vec!["reviewer-one".to_string()]);
+
+        let error = execute_adversarial_plan(
+            &fixture.config,
+            &options,
+            &fixture.paths,
+            &fixture.bursar,
+            &NoopDeckValidator,
+            "review-explicit-count",
+            "2026-07-15T12:00:00Z",
+        )
+        .expect_err("one explicit model cannot fill two slots");
+
+        assert!(error.contains("expected 2"));
+        assert!(!fixture.paths.state_root.exists());
+    }
+
+    #[test]
+    fn adversarial_reviewer_upper_bound_exits_two_before_state_write() {
+        let fixture = AdversarialCliFixture::new("cli-reviewer-bound");
+        let mut options = fixture.plan_options();
+        options.reviewers = 4;
+        options.models = None;
+
+        let error = execute_adversarial_plan(
+            &fixture.config,
+            &options,
+            &fixture.paths,
+            &fixture.bursar,
+            &NoopDeckValidator,
+            "review-upper-bound",
+            "2026-07-15T12:00:00Z",
+        )
+        .expect_err("configured reviewer maximum is enforced");
+
+        assert!(error.contains("between 1 and 3"));
+        assert!(!fixture.paths.state_root.exists());
+        assert_eq!(
+            run(vec![
+                "adversarial-review".to_string(),
+                "plan".to_string(),
+                "--artifact".to_string(),
+                fixture.artifact.display().to_string(),
+                "--reviewers".to_string(),
+                "4".to_string(),
+                "--config".to_string(),
+                fixture.config_path.display().to_string(),
+            ]),
+            ExitCode::from(2)
+        );
+    }
+
+    #[test]
+    fn adversarial_missing_approval_exits_one() {
+        let fixture = AdversarialCliFixture::new("cli-approval-failure");
+        let published = fixture.plan("review-approval-failure");
+        let exec = CliReviewExec::default();
+        let result = execute_adversarial_dispatch(
+            &fixture.config,
+            &AdversarialDispatchOptions {
+                review_id: published.plan.review_id.clone(),
+                config: fixture.config_path.clone(),
+            },
+            &fixture.paths,
+            &fixture.bursar,
+            &exec,
+        );
+
+        assert_eq!(
+            adversarial_dispatch_result_exit_code(&result),
+            ExitCode::from(1)
+        );
+        assert!(result.unwrap_err().contains("awaiting approval"));
+        assert!(exec.spawns().is_empty());
+    }
+
+    #[test]
+    fn adversarial_successful_dispatch_keeps_all_mutation_sentinels_untouched() {
+        let fixture = AdversarialCliFixture::new("cli-no-mutation");
+        let sentinels = fixture.seed_mutation_sentinels();
+        let published = fixture.plan("review-no-mutation");
+        fixture.approve(&published.plan);
+        let exec = CliReviewExec::default();
+
+        let result = execute_adversarial_dispatch(
+            &fixture.config,
+            &AdversarialDispatchOptions {
+                review_id: published.plan.review_id.clone(),
+                config: fixture.config_path.clone(),
+            },
+            &fixture.paths,
+            &fixture.bursar,
+            &exec,
+        );
+
+        assert_eq!(
+            adversarial_dispatch_result_exit_code(&result),
+            ExitCode::SUCCESS
+        );
+        let run = result.expect("approved fake dispatch completes");
+        assert_eq!(
+            run.outcome,
+            crate::adversarial::ReviewLifecycleOutcome::Complete
+        );
+        assert!(run.synthesis.is_some());
+        assert_eq!(run.report_path, published.report_path);
+        assert_eq!(exec.spawns().len(), 3);
+        assert!(fixture.paths.ledger_path.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.artifact).unwrap(),
+            "immutable design"
+        );
+        for (path, expected) in sentinels {
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                expected,
+                "mutation sentinel changed: {}",
+                path.display()
+            );
+        }
+        for spawn in exec.spawns() {
+            assert!(spawn.cwd.starts_with(&fixture.paths.state_root));
+            assert!(!spawn.cwd.starts_with(&fixture.target_repo));
+        }
+    }
 
     #[test]
     fn dispatch_rejects_scope_selectors_that_could_widen_an_approved_plan() {
@@ -1238,5 +1886,313 @@ provider = "fixture-provider"
 
         let snapshots = vec![s1, s2, s3, s4];
         print_scan_table(&snapshots);
+    }
+
+    struct AdversarialCliFixture {
+        _temp: CliTempDir,
+        target_repo: PathBuf,
+        artifact: PathBuf,
+        config_path: PathBuf,
+        config: crate::config::Config,
+        paths: AdversarialPaths,
+        bursar: crate::bursar::test_support::FakeBursarClient,
+    }
+
+    impl AdversarialCliFixture {
+        fn new(label: &str) -> Self {
+            let temp = CliTempDir::new(label);
+            let target_repo = temp.path().join("target-repo");
+            std::fs::create_dir_all(&target_repo).unwrap();
+            let artifact = target_repo.join("design.md");
+            std::fs::write(&artifact, b"immutable design").unwrap();
+            let config_path = temp.path().join("conductor.toml");
+            let config = crate::config::parse_str(
+                r#"
+[budgets]
+use_bursar = true
+item_wall_clock_mins = 1
+
+[adversarial_review]
+max_reviewers = 3
+parallel = 2
+judge = "judge"
+
+[[roster]]
+name = "reviewer-one"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "reviewer-one"
+provider = "opencode-go"
+
+[[roster]]
+name = "reviewer-two"
+tier = "lead"
+ceiling = "L"
+efficiency = "std"
+backend = "pi"
+dispatch_id = "reviewer-two"
+provider = "agy"
+
+[[roster]]
+name = "judge"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "pi"
+dispatch_id = "judge"
+provider = "codex"
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                &config_path,
+                r#"
+[budgets]
+use_bursar = true
+item_wall_clock_mins = 1
+
+[adversarial_review]
+max_reviewers = 3
+parallel = 2
+judge = "judge"
+
+[[roster]]
+name = "reviewer-one"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "reviewer-one"
+provider = "opencode-go"
+
+[[roster]]
+name = "reviewer-two"
+tier = "lead"
+ceiling = "L"
+efficiency = "std"
+backend = "pi"
+dispatch_id = "reviewer-two"
+provider = "agy"
+
+[[roster]]
+name = "judge"
+tier = "lead"
+ceiling = "XL"
+efficiency = "heavy"
+backend = "pi"
+dispatch_id = "judge"
+provider = "codex"
+"#,
+            )
+            .unwrap();
+            let paths = AdversarialPaths {
+                state_root: temp.path().join("state").join("adversarial-reviews"),
+                reports_home: temp.path().join("reports-home"),
+                ledger_path: temp.path().join("ledger").join("model-bench.jsonl"),
+            };
+            let bursar =
+                crate::bursar::test_support::FakeBursarClient::with_provider_availabilities(&[
+                    ("opencode-go", Availability::Healthy),
+                    ("agy", Availability::Healthy),
+                    ("codex", Availability::Healthy),
+                ]);
+            Self {
+                _temp: temp,
+                target_repo,
+                artifact,
+                config_path,
+                config,
+                paths,
+                bursar,
+            }
+        }
+
+        fn plan_options(&self) -> AdversarialPlanOptions {
+            AdversarialPlanOptions {
+                artifact: self.artifact.clone(),
+                reviewers: 2,
+                question: "Should this architecture proceed?".to_string(),
+                models: Some(vec!["reviewer-one".to_string(), "reviewer-two".to_string()]),
+                config: self.config_path.clone(),
+            }
+        }
+
+        fn plan(&self, review_id: &str) -> crate::adversarial::PublishedApproval {
+            execute_adversarial_plan(
+                &self.config,
+                &self.plan_options(),
+                &self.paths,
+                &self.bursar,
+                &NoopDeckValidator,
+                review_id,
+                "2026-07-15T12:00:00Z",
+            )
+            .unwrap()
+        }
+
+        fn approve(&self, plan: &crate::adversarial::AdversarialReviewPlan) {
+            let run_dir =
+                crate::deck::report_run_dir(&self.paths.reports_home, &plan.review_id).unwrap();
+            std::fs::write(
+                run_dir.join("responses.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "version": 1,
+                    "responses": {
+                        crate::adversarial::approval_block_id(plan): {
+                            "value": "approved",
+                            "at": "2026-07-15T12:01:00Z"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn seed_mutation_sentinels(&self) -> Vec<(PathBuf, Vec<u8>)> {
+            [
+                "beads.sentinel",
+                "git.sentinel",
+                "worktree.sentinel",
+                "cycle.sentinel",
+                "repository.sentinel",
+                "chezmoi-apply.sentinel",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = self.target_repo.join(name);
+                let bytes = format!("sentinel-{index}").into_bytes();
+                std::fs::write(&path, &bytes).unwrap();
+                (path, bytes)
+            })
+            .collect()
+        }
+    }
+
+    struct CliTempDir(PathBuf);
+
+    impl CliTempDir {
+        fn new(label: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "conductor-cli-{label}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for CliTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct NoopDeckValidator;
+
+    impl crate::deck::DeckValidator for NoopDeckValidator {
+        fn validate(&self, report_path: &Path) -> crate::deck::Result<()> {
+            assert!(report_path.is_file());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CliReviewExec {
+        spawns: Mutex<Vec<crate::dispatch::SpawnRequest>>,
+    }
+
+    impl CliReviewExec {
+        fn spawns(&self) -> Vec<crate::dispatch::SpawnRequest> {
+            self.spawns.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::dispatch::Exec for CliReviewExec {
+        fn spawn(
+            &self,
+            request: &crate::dispatch::SpawnRequest,
+        ) -> crate::dispatch::Result<Box<dyn crate::dispatch::ChildProcess>> {
+            let prompt_index = request
+                .argv
+                .iter()
+                .position(|arg| arg == "-p")
+                .expect("read-only prompt flag");
+            let prompt = &request.argv[prompt_index + 1];
+            let output = if prompt.contains("adversarial synthesis") {
+                serde_json::json!({
+                    "verdict": "conditional-go",
+                    "consensus": ["preserve the boundary"],
+                    "disagreements": [{
+                        "topic": "timing",
+                        "positions": [
+                            {"reviewers": ["R1"], "position": "ship"},
+                            {"reviewers": ["R2"], "position": "wait"}
+                        ]
+                    }],
+                    "unique_risks": [{"reviewer": "R2", "risk": "timing"}],
+                    "required_changes": ["document the boundary"],
+                    "deferred_questions": ["none"],
+                    "confidence": "high",
+                    "coverage": ["R1", "R2"]
+                })
+                .to_string()
+            } else {
+                serde_json::json!({
+                    "verdict": "conditional-go",
+                    "findings": [{
+                        "id": "boundary",
+                        "severity": "high",
+                        "claim": "boundary required",
+                        "evidence": "artifact",
+                        "consequence": "drift",
+                        "recommendation": "document it"
+                    }],
+                    "assumptions": ["artifact is authoritative"],
+                    "scope_to_cut": ["migration"],
+                    "recommended_sequencing": ["boundary first"]
+                })
+                .to_string()
+            };
+            std::fs::create_dir_all(request.stdout_path.parent().unwrap()).unwrap();
+            std::fs::write(&request.stdout_path, output).unwrap();
+            std::fs::write(&request.stderr_path, b"").unwrap();
+            self.spawns.lock().unwrap().push(request.clone());
+            Ok(Box::new(CliReviewChild))
+        }
+    }
+
+    struct CliReviewChild;
+
+    impl crate::dispatch::ChildProcess for CliReviewChild {
+        fn wait_for(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> crate::dispatch::Result<Option<crate::dispatch::ProcessStatus>> {
+            Ok(Some(crate::dispatch::ProcessStatus::code(0)))
+        }
+
+        fn terminate(&mut self) -> crate::dispatch::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&mut self) -> crate::dispatch::Result<()> {
+            Ok(())
+        }
+
+        fn wait(&mut self) -> crate::dispatch::Result<crate::dispatch::ProcessStatus> {
+            Ok(crate::dispatch::ProcessStatus::code(0))
+        }
     }
 }

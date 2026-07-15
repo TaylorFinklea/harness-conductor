@@ -1,4 +1,4 @@
-//! Conductor — fleet cycle runner: scan → triage → plan → dispatch → verify → report.
+//! Conductor — fleet cycles plus approval-gated, read-only adversarial design review.
 
 mod adversarial;
 mod arena;

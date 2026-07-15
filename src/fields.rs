@@ -176,11 +176,7 @@ fn max_complexity(a: Ceiling, b: Ceiling) -> Ceiling {
         Ceiling::L => 2,
         Ceiling::Xl => 3,
     };
-    if rank(a) >= rank(b) {
-        a
-    } else {
-        b
-    }
+    if rank(a) >= rank(b) { a } else { b }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +322,7 @@ mod tests {
         ];
         for (tier, tier_s) in tiers {
             for (comp, comp_s) in complexities {
-                let metadata =
-                    md(&[("tier_floor", json!(tier_s)), ("complexity", json!(comp_s))]);
+                let metadata = md(&[("tier_floor", json!(tier_s)), ("complexity", json!(comp_s))]);
                 let issue = make_issue("", Some(metadata));
                 assert_eq!(
                     extract(&issue),
@@ -410,10 +405,7 @@ mod tests {
     fn notes_range_upper_bound_is_max_regardless_of_order() {
         // "XL-S" is a malformed range; spec says "upper bound" => the larger value (XL).
         let issue = make_issue("tier_floor: senior · complexity: XL-S", None);
-        assert_eq!(
-            extract(&issue),
-            triaged(Tier::Senior, Ceiling::Xl, None)
-        );
+        assert_eq!(extract(&issue), triaged(Tier::Senior, Ceiling::Xl, None));
     }
 
     #[test]
@@ -488,8 +480,7 @@ mod tests {
     #[test]
     fn real_tesela_notes_format_yields_senior_m_no_verify_cmd() {
         // Exact format from the task data and the live tesela notes.
-        let notes =
-            "tier_floor: senior · complexity: S-M · verify_type: wrangler dev + cargo test";
+        let notes = "tier_floor: senior · complexity: S-M · verify_type: wrangler dev + cargo test";
         let issue = make_issue(notes, None);
         assert_eq!(extract(&issue), triaged(Tier::Senior, Ceiling::M, None));
     }
@@ -533,10 +524,7 @@ mod tests {
     fn complexity_from_notes_tier_floor_from_metadata() {
         let metadata = md(&[("tier_floor", json!("junior"))]);
         let issue = make_issue("complexity: S-XL", Some(metadata));
-        assert_eq!(
-            extract(&issue),
-            triaged(Tier::Junior, Ceiling::Xl, None)
-        );
+        assert_eq!(extract(&issue), triaged(Tier::Junior, Ceiling::Xl, None));
     }
 
     // --- case insensitivity ---

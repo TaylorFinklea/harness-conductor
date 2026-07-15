@@ -136,6 +136,12 @@ pub(crate) struct AdversarialReviewPlan {
     pub(crate) plan_sha256: String,
 }
 
+impl AdversarialReviewPlan {
+    pub(crate) fn artifact_source_path(&self) -> &str {
+        &self.artifact.source_path
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedApproval {
     pub(crate) plan: AdversarialReviewPlan,
@@ -3150,6 +3156,28 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn no_mutation_runtime_has_no_cycle_repository_or_apply_process_seams() {
+        let production = include_str!("adversarial.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production module prefix");
+        for forbidden in [
+            "crate::bd::",
+            "GitCommitProbe",
+            "run_dispatch_cycle",
+            "std::process::Command",
+            "Command::new(",
+            "git worktree",
+            "chezmoi apply",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "adversarial runtime gained forbidden mutation seam: {forbidden}"
+            );
+        }
+    }
 
     #[test]
     fn panel_distinct_providers_health_and_deterministic_ordering() {

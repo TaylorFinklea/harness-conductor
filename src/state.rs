@@ -43,8 +43,7 @@ pub(crate) fn write_journal(state_dir: &Path, entry: &JournalEntry) -> io::Resul
     let journal = Journal {
         last_cycle: entry.clone(),
     };
-    let json = serde_json::to_vec_pretty(&journal)
-        .map_err(io::Error::other)?;
+    let json = serde_json::to_vec_pretty(&journal).map_err(io::Error::other)?;
     let path = state_dir.join("journal.json");
     std::fs::write(path, json)?;
     Ok(())

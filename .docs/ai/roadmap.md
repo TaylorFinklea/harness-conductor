@@ -9,16 +9,17 @@ Conductor: a single Rust binary that runs autonomous work-routing cycles over th
 ## Now / Next / Later
 
 ### Now
-- [ ] Provider-trust integration + bounded approvals + adversarial design
-  review. Provider-trust and bounded-approval slices complete: provider state
-  fails closed, runtime 429 observations precede approved fallback, and an
-  approval cannot exceed its persisted repository/item scope. Remaining: add
-  isolated `N` provider reviewers + one Lead synthesis call. Specs:
+- [x] Provider-trust integration + bounded approvals + adversarial design
+  review — COMPLETE (2026-07-15). Provider state fails closed, runtime 429
+  observations precede approved fallback, approval cannot exceed its persisted
+  repository/item scope, and isolated adversarial review runs `N` distinct-
+  provider reviewers plus one Lead synthesis judge. Specs:
   `phases/provider-trust-integration-spec.md`,
   `phases/bounded-dispatch-approval-spec.md`, and
   `phases/adversarial-design-review-spec.md`. **Landmine:** adversarial review
   performs no bd/git/worktree/apply mutation and must not share normal-cycle
-  dispatch semantics.
+  dispatch semantics. The later Conductor-core consolidation and migration to
+  a `review` job are not implemented here.
 - [x] **Rebrand cutover `harness-conductor` → `conductor` — COMPLETE** (2026-07-12). In-repo refs + chezmoi-personal source (`f95115b`); GitHub repo + backlog repo renamed (`backlog-conductor` resolves); dir moved; `chezmoi apply` published to live HOME (verified zero stale refs across `~/AGENTS.md`, `ralph`, scorecard digest, all skill copies); formerly-unmanaged `~/.agents/skills/conductor-arena` is now chezmoi-managed (chezmoi-personal `2c46d98`, mirrors the `dot_claude` copy). `conductor config check` passes against `~/git/conductor/conductor.toml`. Old path-keyed session dir (`-Users-tfinklea-git-harness-conductor`) held only 2 transcripts, no memory — not migrated.
   - Preserved deliberately (do not "fix"): `docs/notes/agy-dispatch.md` verbatim CLI transcript, the executed `arena-harness-scorecard-{plan,spec}.md`, and chezmoi-personal `roadmap.md:27` dated prose.
 - [ ] `cargo test` has 1 pre-existing env failure: `deck::tests::generated_sample_report_passes_harness_deck_validate` shells `Command::new("harness-deck")`, which is not on PATH (237/238 pass). Fails on a clean tree at `0c801d3` too — unrelated to the rebrand. Either install `harness-deck` or gate the test on the binary being present.

@@ -2033,10 +2033,7 @@ mod tests {
         assert_eq!(
             spawn.env,
             vec![
-                (
-                    "RALPH_CODEX_MODEL".to_string(),
-                    "gpt-5.6-terra".to_string(),
-                ),
+                ("RALPH_CODEX_MODEL".to_string(), "gpt-5.6-terra".to_string(),),
                 (
                     "RALPH_CODEX_REASONING_EFFORT".to_string(),
                     "xhigh".to_string(),

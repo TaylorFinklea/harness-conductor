@@ -490,7 +490,9 @@ pub(crate) fn diff(
                     report.items.push(DriftItem {
                         kind: DriftKind::ReasoningMismatch,
                         model: sc_entry.model.clone(),
-                        detail: format!("scorecard: {sc_reasoning_effort}, config: {cfg_reasoning_effort}"),
+                        detail: format!(
+                            "scorecard: {sc_reasoning_effort}, config: {cfg_reasoning_effort}"
+                        ),
                     });
                 }
             }
