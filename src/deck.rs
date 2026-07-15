@@ -113,6 +113,16 @@ impl Report {
         })
     }
 
+    /// Creates a terminal report that no longer expects interactive responses.
+    pub(crate) fn completed(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        created: impl Into<String>,
+        blocks: Vec<Block>,
+    ) -> Result<Self> {
+        Self::new(id, title, created, ReportStatus::Done, blocks)
+    }
+
     /// Returns the run id used as the harness-deck run directory name.
     #[must_use]
     pub(crate) fn id(&self) -> &str {
@@ -863,6 +873,27 @@ mod tests {
         assert_eq!(manifest["project"], json!("conductor"));
         assert_eq!(manifest["harness"], json!("conductor"));
         assert_eq!(manifest["status"], json!("awaiting-review"));
+    }
+
+    #[test]
+    fn completed_report_serializes_terminal_done_status() {
+        let temp = TempDir::new("deck-completed");
+        let report = Report::completed(
+            "adversarial-review-1",
+            "Adversarial design review",
+            "2026-07-15T00:00:00Z",
+            vec![Block::callout(
+                CalloutLevel::Info,
+                "OUTCOME",
+                "Complete synthesis",
+            )],
+        )
+        .expect("completed report");
+
+        let path = write_report(temp.path(), &report).expect("write completed report");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(manifest["status"], json!("done"));
+        assert_eq!(manifest["blocks"][0]["tag"], json!("OUTCOME"));
     }
 
     fn sample_report() -> Result<Report> {

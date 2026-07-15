@@ -81,8 +81,30 @@ pub(crate) struct LedgerRow {
     pub(crate) cost_usd: Option<String>,
 }
 
+/// Structured adversarial-review metadata layered onto the shared model-bench row.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AdversarialLedgerRow {
+    #[serde(flatten)]
+    pub(crate) base: LedgerRow,
+    pub(crate) review_id: String,
+    pub(crate) provider: String,
+    pub(crate) attempt_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reviewer_id: Option<String>,
+    pub(crate) schema_valid: bool,
+}
+
 /// Appends one JSON row and trailing newline to `path`, creating parent dirs.
 pub(crate) fn append(path: &Path, row: &LedgerRow) -> Result<()> {
+    append_serialized(path, row)
+}
+
+/// Appends one adversarial attempt row with structured review metadata.
+pub(crate) fn append_adversarial(path: &Path, row: &AdversarialLedgerRow) -> Result<()> {
+    append_serialized(path, row)
+}
+
+fn append_serialized(path: &Path, row: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             LedgerError::new(format!(
@@ -175,7 +197,9 @@ mod tests {
             complexity: "S".to_string(),
             project: "warden".to_string(),
             bias_note: Some("arena blind panel".to_string()),
-            notes: "conductor arena arena-20260704-225738-warden-vy1 profile=pi-nw-kimi-k26 reason=".to_string(),
+            notes:
+                "conductor arena arena-20260704-225738-warden-vy1 profile=pi-nw-kimi-k26 reason="
+                    .to_string(),
             arena_run_id: Some("arena-20260704-225738-warden-vy1".to_string()),
             winner: Some(true),
             applied: Some(true),
@@ -191,7 +215,10 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).expect("read ledger");
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).expect("json row");
-        assert_eq!(parsed["arena_run_id"], json!("arena-20260704-225738-warden-vy1"));
+        assert_eq!(
+            parsed["arena_run_id"],
+            json!("arena-20260704-225738-warden-vy1")
+        );
         assert_eq!(parsed["winner"], json!(true));
         assert_eq!(parsed["applied"], json!(true));
         assert_eq!(parsed["duration_ms"], json!(120_000));
@@ -200,6 +227,57 @@ mod tests {
         assert_eq!(parsed["tokens_used"], json!(309_466));
         assert_eq!(parsed["reasoning_effort"], json!("high"));
         assert!(parsed.get("cost_usd").is_none());
+    }
+
+    #[test]
+    fn adversarial_append_serializes_structured_attempt_metadata() {
+        let temp = TempDir::new("ledger-adversarial");
+        let path = temp.path().join("model-bench.jsonl");
+        let row = AdversarialLedgerRow {
+            base: LedgerRow {
+                date: "2026-07-15".to_string(),
+                model: "openai-codex/gpt-5.6-luna".to_string(),
+                harness: Some("pi".to_string()),
+                profile: Some("luna-reviewer".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                role: "adversarial-reviewer".to_string(),
+                task: "review-123".to_string(),
+                score_1_5: None,
+                blind_rank: None,
+                judge: None,
+                verify_passed: false,
+                complexity: "L".to_string(),
+                project: "conductor".to_string(),
+                bias_note: None,
+                notes: "reviewer schema failure".to_string(),
+                arena_run_id: None,
+                winner: None,
+                applied: None,
+                failure_reason: Some("invalid JSON".to_string()),
+                duration_ms: Some(17),
+                ralph_duration_ms: None,
+                verify_duration_ms: None,
+                tokens_used: None,
+                cost_usd: None,
+            },
+            review_id: "review-123".to_string(),
+            provider: "openai".to_string(),
+            attempt_kind: "repair".to_string(),
+            reviewer_id: Some("R1".to_string()),
+            schema_valid: false,
+        };
+
+        append_adversarial(&path, &row).expect("append adversarial row");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(parsed["role"], json!("adversarial-reviewer"));
+        assert_eq!(parsed["review_id"], json!("review-123"));
+        assert_eq!(parsed["provider"], json!("openai"));
+        assert_eq!(parsed["attempt_kind"], json!("repair"));
+        assert_eq!(parsed["reviewer_id"], json!("R1"));
+        assert_eq!(parsed["schema_valid"], json!(false));
+        assert_eq!(parsed["failure_reason"], json!("invalid JSON"));
     }
 
     struct TempDir(PathBuf);
