@@ -1562,6 +1562,38 @@ mod tests {
     }
 
     #[test]
+    fn adversarial_partial_dispatch_exits_one_without_spawning_judge() {
+        let fixture = AdversarialCliFixture::new("cli-partial-exit");
+        let published = fixture.plan("review-partial-exit");
+        fixture.approve(&published.plan);
+        let exec = CliReviewExec::malformed_reviewers();
+
+        let result = execute_adversarial_dispatch(
+            &fixture.config,
+            &AdversarialDispatchOptions {
+                review_id: published.plan.review_id.clone(),
+                config: fixture.config_path.clone(),
+            },
+            &fixture.paths,
+            &fixture.bursar,
+            &exec,
+        );
+
+        assert_eq!(
+            adversarial_dispatch_result_exit_code(&result),
+            ExitCode::from(1)
+        );
+        let run = result.expect("reviewer schema failures produce a partial result");
+        assert_eq!(
+            run.outcome,
+            crate::adversarial::ReviewLifecycleOutcome::Partial
+        );
+        assert!(run.synthesis.is_none());
+        assert!(run.judge_attempt.is_none());
+        assert_eq!(exec.spawns().len(), 4);
+    }
+
+    #[test]
     fn dispatch_rejects_scope_selectors_that_could_widen_an_approved_plan() {
         assert_eq!(
             run(vec![
@@ -2111,9 +2143,17 @@ provider = "codex"
     #[derive(Default)]
     struct CliReviewExec {
         spawns: Mutex<Vec<crate::dispatch::SpawnRequest>>,
+        malformed_reviewers: bool,
     }
 
     impl CliReviewExec {
+        fn malformed_reviewers() -> Self {
+            Self {
+                spawns: Mutex::new(Vec::new()),
+                malformed_reviewers: true,
+            }
+        }
+
         fn spawns(&self) -> Vec<crate::dispatch::SpawnRequest> {
             self.spawns.lock().unwrap().clone()
         }
@@ -2148,6 +2188,8 @@ provider = "codex"
                     "coverage": ["R1", "R2"]
                 })
                 .to_string()
+            } else if self.malformed_reviewers {
+                "not-json".to_string()
             } else {
                 serde_json::json!({
                     "verdict": "conditional-go",

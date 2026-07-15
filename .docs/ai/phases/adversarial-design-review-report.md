@@ -1,7 +1,8 @@
 # Adversarial design review report
 
 Status: complete, 2026-07-15. Beads: `conductor-i8r`, `conductor-0zv`,
-`conductor-b35`, `conductor-2cr`, `conductor-vly`, `conductor-j84`.
+`conductor-b35`, `conductor-2cr`, `conductor-vly`, `conductor-j84`,
+`conductor-vcr`.
 
 ## Shipped
 
@@ -49,12 +50,37 @@ Status: complete, 2026-07-15. Beads: `conductor-i8r`, `conductor-0zv`,
 - Artifact/question/model outputs treated as untrusted data.
 - Fake executor tests keep Beads/Git/worktree/cycle/repository/chezmoi
   sentinels byte-identical and place every process cwd under review state.
-- Live/metered model dispatch was not used for tests.
+- Automated tests use injected fake execution. One explicitly authorized,
+  disposable post-land E2E used live model execution as recorded below.
+
+## Post-land review and live E2E
+
+- Read-only Luna and GLM 5.2 reviews completed through `pi-liveness`; every
+  finding was checked against the final tree before action.
+- Fixed one confirmed crash-ordering defect: a schema-valid spawned judge is
+  now ledgered before the fallible synthesis sidecar write. A forced sidecar
+  publication failure proves the judge row survives.
+- Expanded the static no-mutation seam guard and added a real fake-executor
+  partial-panel CLI test proving exit `1` with no judge or synthesis.
+- The checked-in production config failed closed at planning under its live
+  provider snapshot when no approved reviewer/judge combination remained;
+  no artifact state was created.
+- A disposable static-cap plan used one Ollama Cloud GLM 5.2 Senior reviewer
+  plus one distinct Terra Lead judge. The first dispatch correctly returned
+  partial/exit `1` and ledgered both attempts when Codex rejected the isolated
+  non-Git cwd.
+- Added Codex `--skip-git-repo-check` only to the tools-disabled,
+  `--sandbox read-only` adversarial argv. A fresh approved plan then returned
+  exit `0`: one valid anonymous `R1` review, one valid synthesis with exact
+  coverage, zero lifecycle failures, and exactly two structured ledger rows.
+- `harness-deck validate` accepted the six-block terminal report. The source
+  artifact SHA-256 stayed byte-identical, and redispatching the terminal ID
+  returned exit `1` without adding ledger rows.
 
 ## Verification
 
 - Focused CLI grammar/approval/no-mutation tests pass.
-- `cargo test`: 316 unit + 1 integration pass.
+- `cargo test`: 318 unit + 1 integration pass.
 - `cargo clippy --all-targets -- -D warnings`: pass.
 - `cargo fmt -- --check`: pass.
 - `git diff --check`: pass.

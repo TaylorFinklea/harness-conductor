@@ -1112,6 +1112,12 @@ pub(crate) fn finalize_review<E: Exec>(request: SynthesisRequest<'_, E>) -> Resu
         calls,
     )?;
     append_judge_ledger_row(ledger_path, &authorized.plan, judge, &judge_attempt)?;
+    if let Some(response) = &synthesis {
+        replace_json(
+            &authorized.review_dir.join("judge").join("synthesis.json"),
+            response,
+        )?;
+    }
 
     let outcome = if synthesis.is_some() {
         ReviewLifecycleOutcome::Complete
@@ -1327,7 +1333,6 @@ fn run_judge_attempt<E: Exec>(
             )),
             Ok(stdout) => match parse_judge_response(&stdout, expected_ids) {
                 Ok(response) => {
-                    replace_json(&judge_dir.join("synthesis.json"), &response)?;
                     return Ok((
                         JudgeAttempt {
                             model: judge.name.clone(),
@@ -3165,6 +3170,11 @@ mod tests {
             .expect("production module prefix");
         for forbidden in [
             "crate::bd::",
+            "crate::arena::",
+            "crate::cycle::",
+            "crate::dispatch_cycle::",
+            "crate::verify::",
+            "CommandExec",
             "GitCommitProbe",
             "run_dispatch_cycle",
             "std::process::Command",
@@ -4325,6 +4335,44 @@ mod tests {
                 .expect_err("coverage must contain every reviewer exactly once");
             assert!(error.to_string().contains("coverage"));
         }
+    }
+
+    #[test]
+    fn judge_attempt_is_ledgered_before_synthesis_persistence_failure() {
+        let fixture = ApprovalFixture::new("judge-ledger-before-persistence");
+        let published = fixture.publish();
+        let authorized = fixture.authorized(published.plan);
+        let reviewer_run = complete_manual_reviewer_run(&authorized);
+        let calls = ReviewerCallBudget::new(authorized.plan.limits.worst_case_calls);
+        calls.reserve().unwrap();
+        calls.reserve().unwrap();
+        let judge_exec = ReviewerExec::new([Process::success(valid_judge_json(&["R1", "R2"]))]);
+        let ledger_path = fixture.snapshot.review_dir.join("model-bench.jsonl");
+        let synthesis_path = fixture
+            .snapshot
+            .review_dir
+            .join("judge")
+            .join("synthesis.json");
+        std::fs::create_dir_all(&synthesis_path).unwrap();
+
+        let error = finalize_review(SynthesisRequest {
+            authorized: &authorized,
+            reviewer_run,
+            roster: &fixture.roster,
+            judge_provider_snapshot: &fixture.providers,
+            exec: &judge_exec,
+            timeout: std::time::Duration::from_secs(1),
+            calls: &calls,
+            ledger_path: &ledger_path,
+            deck_home: &fixture.deck_home,
+        })
+        .expect_err("synthesis persistence must fail over an existing directory");
+
+        assert!(error.to_string().contains("replacement state"));
+        let rows = read_jsonl(&ledger_path);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2]["role"], serde_json::json!("adversarial-judge"));
+        assert_eq!(rows[2]["schema_valid"], serde_json::json!(true));
     }
 
     #[test]

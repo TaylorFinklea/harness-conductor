@@ -328,6 +328,7 @@ pub(crate) fn readonly_argv_for_backend(
                 format!("model_reasoning_effort=\"{}\"", effort.as_str()),
                 "--sandbox".to_string(),
                 "read-only".to_string(),
+                "--skip-git-repo-check".to_string(),
                 prompt.to_string(),
             ]
         }
@@ -770,6 +771,7 @@ mod tests {
                 "model_reasoning_effort=\"xhigh\"",
                 "--sandbox",
                 "read-only",
+                "--skip-git-repo-check",
                 PROMPT,
             ]
         );
