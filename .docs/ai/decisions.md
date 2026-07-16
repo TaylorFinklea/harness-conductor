@@ -231,3 +231,25 @@ still be importing the weaker of two flawed oracles, and would still have to ove
 — but the honest statement is that **both success models are broken, ours less badly**,
 and `conductor-1i9` is the P0 that fixes ours. This ADR is not a claim that our
 verification is sound; it is a claim that theirs is not worth adopting.
+
+## [2026-07-15] Codex is the terminal approved fallback for fleet ownership
+
+**Context**: Live Bursar evidence can fail closed for otherwise usable provider
+accounts: Anthropic currently returns an authentication error, opencode-go has
+no positive availability signal, and Ollama Cloud is not represented in
+`bursar/status@2`. The GPT-5.6 Codex lane is positively healthy and already in
+the closed roster, but was outside the legacy primary models' fallback chains.
+
+**Decision**: With explicit human approval, append the matching-tier GPT-5.6
+Codex profile to every non-Codex roster chain. Preserve opencode-go and Ollama
+Cloud as preferred cheap-work lanes and NeuralWatt as reserve; Codex remains the
+terminal fallback. Lead chains may use both Terra and Sol in capability order.
+
+**Alternatives considered**: Disable Bursar; record operator assertions as
+provider health; promote Codex to the default primary; bypass Conductor and
+dispatch the blocked Bead manually.
+
+**Rationale**: A configured fallback is reviewable policy and becomes part of
+the immutable approved route. It restores forward progress from real positive
+Codex evidence without treating prose as quota truth, weakening fail-closed
+provider checks, or moving claim/verify/close ownership out of Conductor.
