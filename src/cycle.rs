@@ -21,6 +21,7 @@ use crate::plan::{
     ApprovalScope, ApprovalScopeKind, CyclePlan, ItemAuthorizationRecord, ProviderRouteRecord,
     ScopeSelector, item_authorization_hash,
 };
+use crate::run::{NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier};
 use crate::scan::{self, RepoSnapshot, SkipReason, ZeroState};
 use crate::state::{self, JournalEntry, JournalSummary};
 use crate::triage::{self, Flag, Plan, RatchetState, SkipCode};
@@ -233,6 +234,43 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     };
     state::write_journal(state_dir, &entry)
         .map_err(|e| CycleError::new(format!("journal: {e}")))?;
+
+    let target_repo = if cycle_plan.approval_scope.repo_paths.len() == 1 {
+        cycle_plan.approval_scope.repo_paths[0].clone()
+    } else {
+        "fleet".to_string()
+    };
+    let mut run = RunHandle::create(
+        state_dir,
+        RunJob::Consult,
+        NewRun {
+            target: RunTarget {
+                repo: target_repo,
+                bead: None,
+            },
+            approved_profiles: Vec::new(),
+            bursar_roster_artifact: None,
+            limits: RunLimits::default(),
+            verifier: RunVerifier::default(),
+            approval: None,
+        },
+    )
+    .map_err(|error| CycleError::new(format!("run artifact: {error}")))?;
+    let plan_path = state_dir.join("plans").join(format!("{cycle_id}.json"));
+    let artifact_refs = [
+        (&plan_path, Path::new("artifacts/cycle-plan.json")),
+        (&report_path, Path::new("artifacts/report.json")),
+        (
+            &state_dir.join("journal.json"),
+            Path::new("artifacts/journal.json"),
+        ),
+    ]
+    .into_iter()
+    .map(|(source, destination)| run.capture_artifact(source, destination))
+    .collect::<crate::run::Result<Vec<_>>>()
+    .map_err(|error| CycleError::new(format!("run artifact: {error}")))?;
+    run.finish_with_artifacts("planned", artifact_refs)
+        .map_err(|error| CycleError::new(format!("run artifact: {error}")))?;
 
     Ok(CycleResult {
         cycle_id: cycle_id.to_string(),
@@ -1626,6 +1664,25 @@ fallback = []
         assert_eq!(table_rows.len(), 3); // alpha, beta, gamma
     }
 
+    fn assert_cycle_contract_run(state: &Path) {
+        let run_dirs = std::fs::read_dir(crate::run::runs_dir(state))
+            .expect("cycle runs dir")
+            .map(|entry| entry.expect("cycle run entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(run_dirs.len(), 1);
+        let manifest = crate::run::read_manifest(&run_dirs[0].join("manifest.json"))
+            .expect("cycle run manifest");
+        assert_eq!(manifest.job, RunJob::Consult);
+        assert_eq!(manifest.lifecycle, crate::run::RunLifecycle::Finished);
+        assert_eq!(manifest.outcome.as_deref(), Some("planned"));
+        let events =
+            crate::run::read_events(&run_dirs[0].join("events.jsonl")).expect("cycle run events");
+        assert_eq!(
+            events.last().map(|event| event.kind),
+            Some(crate::run::EventKind::RunFinished)
+        );
+    }
+
     #[test]
     fn cycle_report_surfaces_scan_gaps() {
         let fleet = TempDir::new("scan-gap-fleet");
@@ -1832,6 +1889,8 @@ dispatch_id = "test/junior"
         let plan_bytes = std::fs::read(&plan_path).unwrap();
         let plan_json: serde_json::Value = serde_json::from_slice(&plan_bytes).unwrap();
         assert_eq!(plan_json["cycle_id"], cycle_id);
+
+        assert_cycle_contract_run(state.path());
 
         // --- Verify no bd writes happened (dry-run invariant) ---
         // The FakeBdClient's claim/release/close/set_metadata all return errors,

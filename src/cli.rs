@@ -394,28 +394,261 @@ where
         &provider_snapshot,
     )
     .map_err(|error| error.to_string())?;
+    let approved_profiles = adversarial_approved_profiles(&authorized.plan);
+    let approval = serde_json::json!({
+        "schema": "conductor/review-approval@1",
+        "decision": "approved",
+        "plan": &authorized.plan,
+    });
+    let run_state_dir = paths.state_root.parent().unwrap_or(&paths.state_root);
+    let mut run_artifacts = crate::run::RunHandle::create(
+        run_state_dir,
+        crate::run::RunJob::Review,
+        crate::run::NewRun {
+            target: crate::run::RunTarget {
+                repo: authorized.plan.artifact_source_path().to_string(),
+                bead: None,
+            },
+            approved_profiles,
+            bursar_roster_artifact: None,
+            limits: crate::run::RunLimits {
+                item_wall_clock_mins: Some(u64::from(cfg.budgets.item_wall_clock_mins)),
+                max_attempts: Some(u64::from(authorized.plan.limits.worst_case_calls)),
+            },
+            verifier: crate::run::RunVerifier {
+                mechanical: None,
+                qualitative: Some("adversarial-synthesis-schema".to_string()),
+            },
+            approval: Some(approval),
+        },
+    )
+    .map_err(|error| format!("run artifact: {error}"))?;
     let calls =
         crate::adversarial::ReviewerCallBudget::new(authorized.plan.limits.worst_case_calls);
     let timeout = std::time::Duration::from_secs(
         u64::from(cfg.budgets.item_wall_clock_mins).saturating_mul(60),
     );
     let reviewer_run =
-        crate::adversarial::run_reviewers(&authorized, &cfg.roster, exec, timeout, &calls)
-            .map_err(|error| error.to_string())?;
+        match crate::adversarial::run_reviewers(&authorized, &cfg.roster, exec, timeout, &calls) {
+            Ok(run) => run,
+            Err(error) => {
+                run_artifacts
+                    .finish("reviewer_error")
+                    .map_err(|run_error| format!("run artifact: {run_error}"))?;
+                return Err(error.to_string());
+            }
+        };
+    record_adversarial_reviewer_events(&mut run_artifacts, &reviewer_run)?;
 
     let judge_provider_snapshot = adversarial_provider_snapshot(cfg, bursar);
-    crate::adversarial::finalize_review(crate::adversarial::SynthesisRequest {
-        authorized: &authorized,
-        reviewer_run,
-        roster: &cfg.roster,
-        judge_provider_snapshot: &judge_provider_snapshot,
-        exec,
-        timeout,
-        calls: &calls,
-        ledger_path: &paths.ledger_path,
-        deck_home: &paths.reports_home,
+    let adversarial_run =
+        match crate::adversarial::finalize_review(crate::adversarial::SynthesisRequest {
+            authorized: &authorized,
+            reviewer_run,
+            roster: &cfg.roster,
+            judge_provider_snapshot: &judge_provider_snapshot,
+            exec,
+            timeout,
+            calls: &calls,
+            ledger_path: &paths.ledger_path,
+            deck_home: &paths.reports_home,
+        }) {
+            Ok(run) => run,
+            Err(error) => {
+                run_artifacts
+                    .finish("synthesis_error")
+                    .map_err(|run_error| format!("run artifact: {run_error}"))?;
+                return Err(error.to_string());
+            }
+        };
+    record_adversarial_terminal_events(&mut run_artifacts, &adversarial_run)?;
+    Ok(adversarial_run)
+}
+
+fn adversarial_approved_profiles(plan: &crate::adversarial::AdversarialReviewPlan) -> Vec<String> {
+    let mut profiles = Vec::new();
+    for reviewer in &plan.panel.reviewers {
+        for model in std::iter::once(&reviewer.model).chain(reviewer.alternatives.iter()) {
+            if !profiles.contains(model) {
+                profiles.push(model.clone());
+            }
+        }
+    }
+    for model in std::iter::once(&plan.panel.judge.model).chain(plan.panel.judge.fallbacks.iter()) {
+        if !profiles.contains(model) {
+            profiles.push(model.clone());
+        }
+    }
+    profiles
+}
+
+fn record_adversarial_reviewer_events(
+    run_artifacts: &mut crate::run::RunHandle,
+    reviewer_run: &crate::adversarial::ReviewerRun,
+) -> Result<(), String> {
+    for (index, attempt) in reviewer_run.attempts.iter().enumerate() {
+        run_artifacts
+            .append_event(
+                crate::run::EventKind::AttemptStarted,
+                crate::run::EventInput {
+                    profile_id: Some(attempt.model.clone()),
+                    outcome: Some(adversarial_reviewer_attempt_kind(attempt.kind).to_string()),
+                    ..crate::run::EventInput::default()
+                },
+            )
+            .map_err(|error| format!("run artifact: {error}"))?;
+        let destination = PathBuf::from(format!(
+            "attempts/reviewer-{:03}-slot-{}",
+            index + 1,
+            attempt.slot
+        ));
+        let artifact_refs = capture_adversarial_logs(
+            run_artifacts,
+            &attempt.stdout_path,
+            &attempt.stderr_path,
+            &destination,
+        )?;
+        run_artifacts
+            .append_event(
+                crate::run::EventKind::AttemptFinished,
+                crate::run::EventInput {
+                    profile_id: Some(attempt.model.clone()),
+                    artifact_refs,
+                    outcome: Some(adversarial_reviewer_outcome(&attempt.outcome)),
+                },
+            )
+            .map_err(|error| format!("run artifact: {error}"))?;
+    }
+    Ok(())
+}
+
+fn record_adversarial_terminal_events(
+    run_artifacts: &mut crate::run::RunHandle,
+    adversarial_run: &crate::adversarial::AdversarialRun,
+) -> Result<(), String> {
+    if let Some(attempt) = adversarial_run.judge_attempt.as_ref() {
+        run_artifacts
+            .append_event(
+                crate::run::EventKind::AttemptStarted,
+                crate::run::EventInput {
+                    profile_id: Some(attempt.model.clone()),
+                    outcome: Some(adversarial_judge_attempt_kind(attempt.kind).to_string()),
+                    ..crate::run::EventInput::default()
+                },
+            )
+            .map_err(|error| format!("run artifact: {error}"))?;
+        let artifact_refs = capture_adversarial_logs(
+            run_artifacts,
+            &attempt.stdout_path,
+            &attempt.stderr_path,
+            PathBuf::from("attempts/judge-001").as_path(),
+        )?;
+        run_artifacts
+            .append_event(
+                crate::run::EventKind::AttemptFinished,
+                crate::run::EventInput {
+                    profile_id: Some(attempt.model.clone()),
+                    artifact_refs,
+                    outcome: Some(adversarial_judge_outcome(&attempt.outcome)),
+                },
+            )
+            .map_err(|error| format!("run artifact: {error}"))?;
+    } else {
+        run_artifacts
+            .append_event(
+                crate::run::EventKind::CoverageGap,
+                crate::run::EventInput {
+                    outcome: Some("adversarial_judge_not_run".to_string()),
+                    ..crate::run::EventInput::default()
+                },
+            )
+            .map_err(|error| format!("run artifact: {error}"))?;
+    }
+
+    let report_ref = run_artifacts
+        .capture_artifact(
+            &adversarial_run.report_path,
+            PathBuf::from("artifacts/report.json").as_path(),
+        )
+        .map_err(|error| format!("run artifact: {error}"))?;
+    let outcome = match adversarial_run.outcome {
+        crate::adversarial::ReviewLifecycleOutcome::Complete => "complete",
+        crate::adversarial::ReviewLifecycleOutcome::Partial => "partial",
+    };
+    run_artifacts
+        .append_event(
+            crate::run::EventKind::ReviewFinished,
+            crate::run::EventInput {
+                artifact_refs: vec![report_ref],
+                outcome: Some(outcome.to_string()),
+                ..crate::run::EventInput::default()
+            },
+        )
+        .map_err(|error| format!("run artifact: {error}"))?;
+    run_artifacts
+        .finish(outcome)
+        .map_err(|error| format!("run artifact: {error}"))
+}
+
+fn capture_adversarial_logs(
+    run_artifacts: &crate::run::RunHandle,
+    stdout: &std::path::Path,
+    stderr: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<Vec<crate::run::ArtifactRef>, String> {
+    [
+        (stdout, destination.join("stdout.log")),
+        (stderr, destination.join("stderr.log")),
+    ]
+    .into_iter()
+    .filter(|(source, _)| source.is_file())
+    .map(|(source, destination)| {
+        run_artifacts
+            .capture_artifact(source, &destination)
+            .map_err(|error| format!("run artifact: {error}"))
     })
-    .map_err(|error| error.to_string())
+    .collect()
+}
+
+fn adversarial_reviewer_attempt_kind(
+    kind: crate::adversarial::ReviewerAttemptKind,
+) -> &'static str {
+    match kind {
+        crate::adversarial::ReviewerAttemptKind::Initial => "initial",
+        crate::adversarial::ReviewerAttemptKind::Repair => "repair",
+        crate::adversarial::ReviewerAttemptKind::Fallback => "fallback",
+    }
+}
+
+fn adversarial_reviewer_outcome(outcome: &crate::adversarial::ReviewerAttemptOutcome) -> String {
+    match outcome {
+        crate::adversarial::ReviewerAttemptOutcome::Valid => "schema_valid".to_string(),
+        crate::adversarial::ReviewerAttemptOutcome::InvalidSchema { reason, .. } => {
+            format!("invalid_schema: {reason}")
+        }
+        crate::adversarial::ReviewerAttemptOutcome::ProcessFailed(reason) => {
+            format!("process_failed: {reason}")
+        }
+    }
+}
+
+fn adversarial_judge_attempt_kind(kind: crate::adversarial::JudgeAttemptKind) -> &'static str {
+    match kind {
+        crate::adversarial::JudgeAttemptKind::Primary => "primary",
+        crate::adversarial::JudgeAttemptKind::Fallback => "fallback",
+    }
+}
+
+fn adversarial_judge_outcome(outcome: &crate::adversarial::JudgeAttemptOutcome) -> String {
+    match outcome {
+        crate::adversarial::JudgeAttemptOutcome::Valid => "schema_valid".to_string(),
+        crate::adversarial::JudgeAttemptOutcome::InvalidSchema { reason, .. } => {
+            format!("invalid_schema: {reason}")
+        }
+        crate::adversarial::JudgeAttemptOutcome::ProcessFailed(reason) => {
+            format!("process_failed: {reason}")
+        }
+    }
 }
 
 fn adversarial_provider_snapshot<C: crate::bursar::BursarClient + ?Sized>(
@@ -1330,6 +1563,16 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn single_contract_run(state_dir: &Path) -> PathBuf {
+        let mut runs = std::fs::read_dir(crate::run::runs_dir(state_dir))
+            .expect("runs dir")
+            .map(|entry| entry.expect("run dir entry").path())
+            .collect::<Vec<_>>();
+        runs.sort();
+        assert_eq!(runs.len(), 1, "expected exactly one contract run");
+        runs.pop().expect("one run")
+    }
+
     #[test]
     fn adversarial_plan_and_dispatch_parsers_enforce_exact_grammar() {
         let plan = parse_adversarial_plan_options(&[
@@ -1559,6 +1802,36 @@ mod tests {
             assert!(spawn.cwd.starts_with(&fixture.paths.state_root));
             assert!(!spawn.cwd.starts_with(&fixture.target_repo));
         }
+
+        let state_dir = fixture
+            .paths
+            .state_root
+            .parent()
+            .expect("adversarial state parent");
+        let run_dir = single_contract_run(state_dir);
+        let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
+            .expect("adversarial run manifest");
+        assert_eq!(manifest.job, crate::run::RunJob::Review);
+        assert_eq!(
+            manifest.target.repo,
+            std::fs::canonicalize(&fixture.artifact)
+                .expect("canonical artifact")
+                .display()
+                .to_string()
+        );
+        assert_eq!(manifest.lifecycle, crate::run::RunLifecycle::Finished);
+        assert_eq!(manifest.outcome.as_deref(), Some("complete"));
+        assert!(run_dir.join("approval.json").is_file());
+        let events =
+            crate::run::read_events(&run_dir.join("events.jsonl")).expect("adversarial run events");
+        assert!(events.iter().any(|event| {
+            event.kind == crate::run::EventKind::ReviewFinished
+                && event.outcome.as_deref() == Some("complete")
+        }));
+        assert_eq!(
+            events.last().map(|event| event.kind),
+            Some(crate::run::EventKind::RunFinished)
+        );
     }
 
     #[test]
@@ -1591,6 +1864,15 @@ mod tests {
         assert!(run.synthesis.is_none());
         assert!(run.judge_attempt.is_none());
         assert_eq!(exec.spawns().len(), 4);
+        let state_dir = fixture
+            .paths
+            .state_root
+            .parent()
+            .expect("adversarial state parent");
+        let run_dir = single_contract_run(state_dir);
+        let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
+            .expect("partial adversarial manifest");
+        assert_eq!(manifest.outcome.as_deref(), Some("partial"));
     }
 
     #[test]

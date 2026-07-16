@@ -18,6 +18,9 @@ use crate::deck::{self, Bar, Block, CalloutLevel, Metric, Report, ReportStatus};
 use crate::dispatch;
 use crate::fields::{self, Triage};
 use crate::ledger::{self, LedgerRow};
+use crate::run::{
+    EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArenaHarness {
@@ -253,6 +256,12 @@ impl From<crate::ledger::LedgerError> for ArenaError {
     }
 }
 
+impl From<crate::run::RunError> for ArenaError {
+    fn from(value: crate::run::RunError) -> Self {
+        Self::new(format!("run artifact: {value}"))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RunContext {
     repo: PathBuf,
@@ -386,12 +395,82 @@ pub(crate) fn run(
     let parallel = options.parallel.unwrap_or(cfg.arena.parallel).max(1);
     let auto_apply = options.auto_apply && cfg.arena.auto_apply;
 
+    let approved_profiles = profiles
+        .iter()
+        .map(|profile| profile.name.clone())
+        .chain(cfg.arena.judges.iter().map(|judge| judge.name.clone()))
+        .collect::<Vec<_>>();
+    let max_attempts = u64::try_from(approved_profiles.len())
+        .map_err(|_| ArenaError::new("arena attempt count exceeds u64"))?;
+    let mut run_artifacts = RunHandle::create(
+        state_dir,
+        RunJob::Arena,
+        NewRun {
+            target: RunTarget {
+                repo: repo.display().to_string(),
+                bead: Some(options.bead.clone()),
+            },
+            approved_profiles,
+            bursar_roster_artifact: None,
+            limits: RunLimits {
+                item_wall_clock_mins: Some(u64::from(cfg.budgets.item_wall_clock_mins)),
+                max_attempts: Some(max_attempts),
+            },
+            verifier: RunVerifier {
+                mechanical: Some(ctx.verify_cmd.clone()),
+                qualitative: (!cfg.arena.judges.is_empty()).then(|| "arena-judges".to_string()),
+            },
+            approval: None,
+        },
+    )?;
+    for profile in &profiles {
+        run_artifacts.append_event(
+            EventKind::AttemptStarted,
+            EventInput {
+                profile_id: Some(profile.name.clone()),
+                outcome: Some("running".to_string()),
+                ..EventInput::default()
+            },
+        )?;
+    }
+
     let candidate_runs = run_candidates(&ctx, profiles, parallel)?;
+    record_arena_candidates(&mut run_artifacts, &ctx, &candidate_runs)?;
     let candidates: Vec<CandidateSummary> = candidate_runs
         .iter()
         .map(|run| run.summary.clone())
         .collect();
+    let has_eligible_candidate = candidate_runs
+        .iter()
+        .any(|candidate| candidate.summary.eligible);
+    if has_eligible_candidate {
+        for judge in &cfg.arena.judges {
+            run_artifacts.append_event(
+                EventKind::AttemptStarted,
+                EventInput {
+                    profile_id: Some(judge.name.clone()),
+                    outcome: Some("running".to_string()),
+                    ..EventInput::default()
+                },
+            )?;
+        }
+    } else {
+        run_artifacts.append_event(
+            EventKind::CoverageGap,
+            EventInput {
+                outcome: Some("arena_judges_not_run_no_eligible_candidates".to_string()),
+                ..EventInput::default()
+            },
+        )?;
+    }
     let judge_run = run_judges(cfg, &ctx, &candidate_runs)?;
+    record_arena_judges(
+        &mut run_artifacts,
+        cfg,
+        &ctx,
+        &judge_run.verdicts,
+        &judge_run.failures,
+    )?;
     let judgements = judge_run.verdicts;
     let judge_failures = judge_run.failures;
     let mut decision = decide_winner(&candidates, &judgements, cfg.arena.min_score_x10);
@@ -460,12 +539,155 @@ pub(crate) fn run(
         cleanup_worktrees(&ctx, &candidate_runs)?;
     }
 
+    let report_ref =
+        run_artifacts.capture_artifact(&report_path, Path::new("artifacts/report.json"))?;
+    let terminal_outcome = decision.winner_profile.as_ref().map_or_else(
+        || "no_winner".to_string(),
+        |winner| {
+            if applied {
+                format!("applied:{winner}")
+            } else {
+                format!("winner_not_applied:{winner}")
+            }
+        },
+    );
+    run_artifacts.finish_with_artifacts(terminal_outcome, vec![report_ref])?;
+
     Ok(ArenaRunResult {
         run_id,
         winner_profile: decision.winner_profile,
         applied,
         report_path,
     })
+}
+
+fn record_arena_candidates(
+    run_artifacts: &mut RunHandle,
+    ctx: &RunContext,
+    candidates: &[CandidateRun],
+) -> Result<()> {
+    for (index, candidate) in candidates.iter().enumerate() {
+        let profile = &candidate.summary.profile;
+        let destination = PathBuf::from(format!(
+            "attempts/{:03}-{}",
+            index + 1,
+            sanitize_run_piece(profile)
+        ));
+        let attempt_refs = capture_arena_log_pair(
+            run_artifacts,
+            &ctx.log_dir.join(format!("{profile}.ralph.out")),
+            &ctx.log_dir.join(format!("{profile}.ralph.err")),
+            &destination,
+            "worker",
+        )?;
+        run_artifacts.append_event(
+            EventKind::AttemptFinished,
+            EventInput {
+                profile_id: Some(profile.clone()),
+                artifact_refs: attempt_refs,
+                outcome: Some(if candidate.summary.eligible {
+                    "eligible".to_string()
+                } else {
+                    candidate.summary.reason.clone()
+                }),
+            },
+        )?;
+
+        let verify_refs = capture_arena_log_pair(
+            run_artifacts,
+            &ctx.log_dir.join(format!("{profile}.verify.out")),
+            &ctx.log_dir.join(format!("{profile}.verify.err")),
+            &destination,
+            "verify",
+        )?;
+        if verify_refs.is_empty() {
+            run_artifacts.append_event(
+                EventKind::CoverageGap,
+                EventInput {
+                    profile_id: Some(profile.clone()),
+                    outcome: Some("arena_candidate_verify_not_run".to_string()),
+                    ..EventInput::default()
+                },
+            )?;
+        } else {
+            run_artifacts.append_event(
+                EventKind::VerifyFinished,
+                EventInput {
+                    profile_id: Some(profile.clone()),
+                    artifact_refs: verify_refs,
+                    outcome: Some(if candidate.summary.eligible {
+                        "passed".to_string()
+                    } else {
+                        candidate.summary.reason.clone()
+                    }),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn record_arena_judges(
+    run_artifacts: &mut RunHandle,
+    cfg: &Config,
+    ctx: &RunContext,
+    verdicts: &[JudgeVerdict],
+    failures: &[JudgeFailure],
+) -> Result<()> {
+    for (index, judge) in cfg.arena.judges.iter().enumerate() {
+        let stdout = ctx.log_dir.join(format!("judge-{}.out", judge.name));
+        let stderr = ctx.log_dir.join(format!("judge-{}.err", judge.name));
+        let verdict = verdicts.iter().find(|verdict| verdict.judge == judge.name);
+        let failure = failures.iter().find(|failure| failure.judge == judge.name);
+        if !stdout.is_file() && !stderr.is_file() && verdict.is_none() && failure.is_none() {
+            continue;
+        }
+        let destination = PathBuf::from(format!(
+            "artifacts/judges/{:03}-{}",
+            index + 1,
+            sanitize_run_piece(&judge.name)
+        ));
+        let artifact_refs =
+            capture_arena_log_pair(run_artifacts, &stdout, &stderr, &destination, "review")?;
+        let outcome = failure.map_or_else(
+            || {
+                if verdict.is_some() {
+                    "valid".to_string()
+                } else {
+                    "missing_verdict".to_string()
+                }
+            },
+            |failure| failure.reason.clone(),
+        );
+        run_artifacts.append_event(
+            EventKind::ReviewFinished,
+            EventInput {
+                profile_id: Some(judge.name.clone()),
+                artifact_refs,
+                outcome: Some(outcome),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn capture_arena_log_pair(
+    run_artifacts: &RunHandle,
+    stdout: &Path,
+    stderr: &Path,
+    destination: &Path,
+    label: &str,
+) -> Result<Vec<crate::run::ArtifactRef>> {
+    let mut refs = Vec::new();
+    for (source, name) in [
+        (stdout, format!("{label}.stdout.log")),
+        (stderr, format!("{label}.stderr.log")),
+    ] {
+        if source.is_file() {
+            refs.push(run_artifacts.capture_artifact(source, &destination.join(name))?);
+        }
+    }
+    Ok(refs)
 }
 
 struct ClaimGuard<'a> {

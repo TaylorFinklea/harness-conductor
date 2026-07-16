@@ -22,6 +22,9 @@ use crate::plan::{
     ApprovalScope, ApprovalScopeKind, CyclePlan, ProviderRouteRecord, ScopeSelector,
     item_authorization_hash,
 };
+use crate::run::{
+    EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier,
+};
 use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
 
@@ -521,10 +524,38 @@ fn dispatch_one<
         }
     };
 
+    let mut run_artifacts = match create_work_run(
+        cfg,
+        state_dir,
+        cycle_id,
+        item,
+        &canonical_repo,
+        &extracted.verify_cmd,
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            bd.release(&repo_path, &item.issue_id)
+                .map_err(|release_error| {
+                    DispatchCycleError::message(format!(
+                        "run artifact failed and claim release failed: {release_error}"
+                    ))
+                })?;
+            return Err(error);
+        }
+    };
+
     let prompt = render_worker_prompt(&claimed, &repo_path, &extracted.verify_cmd);
-    let before_head = commits
-        .head(&repo_path)
-        .map_err(|e| DispatchCycleError::message(format!("git head before worker: {e}")))?;
+    let before_head = match commits.head(&repo_path) {
+        Ok(head) => head,
+        Err(error) => {
+            run_artifacts
+                .finish("failed_before_dispatch")
+                .map_err(run_artifact_error)?;
+            return Err(DispatchCycleError::message(format!(
+                "git head before worker: {error}"
+            )));
+        }
+    };
     let worker_step = format!("worker {}/{}", item.repo, item.issue_id);
     let worker_outcome = run_worker_chain(
         cfg,
@@ -546,27 +577,37 @@ fn dispatch_one<
         &worker_step,
         progress,
         bursar,
-    )
-    .map_err(|e| {
-        let _ = bd.release(&repo_path, &item.issue_id);
-        let _ = bd.comment(
-            &repo_path,
-            &item.issue_id,
-            &format!("conductor: {cycle_id} {} worker failed: {e}", item.issue_id),
-        );
-        let _ = append_ledger(
-            ledger_path,
-            roster,
-            &item.repo,
-            &claimed,
-            &extracted,
-            "implement",
-            false,
-            cycle_id,
-            &format!("worker spawn failed: {e}"),
-        );
-        DispatchCycleError::message(format!("dispatch: {e}"))
-    })?;
+        &mut run_artifacts,
+    );
+    let worker_outcome = match worker_outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = bd.release(&repo_path, &item.issue_id);
+            let _ = bd.comment(
+                &repo_path,
+                &item.issue_id,
+                &format!(
+                    "conductor: {cycle_id} {} worker failed: {error}",
+                    item.issue_id
+                ),
+            );
+            let _ = append_ledger(
+                ledger_path,
+                roster,
+                &item.repo,
+                &claimed,
+                &extracted,
+                "implement",
+                false,
+                cycle_id,
+                &format!("worker spawn failed: {error}"),
+            );
+            run_artifacts
+                .finish("dispatch_error")
+                .map_err(run_artifact_error)?;
+            return Err(DispatchCycleError::message(format!("dispatch: {error}")));
+        }
+    };
     let worker_attempt = match worker_outcome {
         WorkerChainOutcome::Ran(worker_attempt) => worker_attempt,
         WorkerChainOutcome::Deferred { summary, attempts } => {
@@ -581,6 +622,9 @@ fn dispatch_one<
                 &item.issue_id,
                 &format!("conductor: {cycle_id} {} {disposition}", item.issue_id),
             );
+            run_artifacts
+                .finish("deferred")
+                .map_err(run_artifact_error)?;
             append_ledger(
                 ledger_path,
                 roster,
@@ -600,13 +644,18 @@ fn dispatch_one<
     };
     let active_roster = worker_attempt.roster;
 
-    patch_live(
+    if let Err(error) = patch_live(
         live,
         report_path,
         cycle_start,
         format!("verify {}/{}", item.repo, item.issue_id),
         progress,
-    )?;
+    ) {
+        run_artifacts
+            .finish("report_update_error")
+            .map_err(run_artifact_error)?;
+        return Err(error);
+    }
     let verify_request = VerifyRequest {
         repo: repo_path,
         state_dir: state_dir.to_path_buf(),
@@ -623,8 +672,25 @@ fn dispatch_one<
         dispatched_model: active_roster.clone(),
         item_tier_floor: extracted.routing.tier_floor,
     };
-    let outcome = verify::run_with_review(bd, exec, commits, &verify_request, &review)
-        .map_err(|e| DispatchCycleError::message(format!("verify: {e}")))?;
+    let outcome = match verify::run_with_review(bd, exec, commits, &verify_request, &review) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            run_artifacts
+                .finish("verify_error")
+                .map_err(run_artifact_error)?;
+            return Err(DispatchCycleError::message(format!("verify: {error}")));
+        }
+    };
+    record_verify_events(
+        &mut run_artifacts,
+        state_dir,
+        cycle_id,
+        &item.issue_id,
+        &outcome,
+    )?;
+    run_artifacts
+        .finish(verify_decision_label(outcome.decision))
+        .map_err(run_artifact_error)?;
     for review in &outcome.review_attempts {
         let reviewer = cfg
             .roster
@@ -690,6 +756,7 @@ fn run_worker_chain<E, C, L, U>(
     worker_step: &str,
     progress: Option<f64>,
     bursar_client: &U,
+    run_artifacts: &mut RunHandle,
 ) -> std::result::Result<WorkerChainOutcome, DispatchCycleError>
 where
     E: Exec + ?Sized,
@@ -753,6 +820,16 @@ where
         }
 
         attempts += 1;
+        run_artifacts
+            .append_event(
+                EventKind::AttemptStarted,
+                EventInput {
+                    profile_id: Some(roster.name.clone()),
+                    outcome: Some("running".to_string()),
+                    ..EventInput::default()
+                },
+            )
+            .map_err(run_artifact_error)?;
         let request = DispatchRequest {
             repo: repo_path.to_path_buf(),
             cycle_id: cycle_id.to_string(),
@@ -778,8 +855,43 @@ where
                 live.patch(report_path, &live_update)
                     .map_err(dispatch::DispatchError::new)
             },
-        )
-        .map_err(|e| DispatchCycleError::message(e.to_string()))?;
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let artifact_refs = capture_worker_logs_if_present(
+                    run_artifacts,
+                    state_dir,
+                    cycle_id,
+                    &item.issue_id,
+                    attempts,
+                    &roster.name,
+                )?;
+                run_artifacts
+                    .append_event(
+                        EventKind::AttemptFinished,
+                        EventInput {
+                            profile_id: Some(roster.name.clone()),
+                            artifact_refs,
+                            outcome: Some(format!("dispatch_error: {error}")),
+                        },
+                    )
+                    .map_err(run_artifact_error)?;
+                return Err(DispatchCycleError::message(error.to_string()));
+            }
+        };
+        let artifact_refs =
+            capture_dispatch_result(run_artifacts, attempts, &roster.name, &result)?;
+        run_artifacts
+            .append_event(
+                EventKind::AttemptFinished,
+                EventInput {
+                    profile_id: Some(roster.name.clone()),
+                    artifact_refs,
+                    outcome: Some(dispatch_status_label(&result.status)),
+                },
+            )
+            .map_err(run_artifact_error)?;
 
         let Some(failure) = retryable_failure_reason(&result)? else {
             return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
@@ -884,6 +996,252 @@ where
     Err(DispatchCycleError::message(
         "empty eligible worker fallback chain",
     ))
+}
+
+fn create_work_run(
+    cfg: &Config,
+    state_dir: &Path,
+    cycle_id: &str,
+    item: &PlannedItem,
+    canonical_repo: &str,
+    verify_cmd: &str,
+) -> std::result::Result<RunHandle, DispatchCycleError> {
+    let route = item.approved_route.as_ref().ok_or_else(|| {
+        DispatchCycleError::message("approved provider envelope is missing at run creation")
+    })?;
+    let max_attempts = u64::try_from(route.approved_models.len())
+        .map_err(|_| DispatchCycleError::message("approved attempt count exceeds u64"))?;
+    let approval = serde_json::json!({
+        "schema": "conductor/work-approval@1",
+        "cycle_id": cycle_id,
+        "decision": "approved",
+        "scope": &item.approval_scope,
+        "item": {
+            "repo": canonical_repo,
+            "issue_id": &item.issue_id,
+            "authorization_sha256": &item.authorization_sha256,
+            "provider_route": route,
+        }
+    });
+    RunHandle::create(
+        state_dir,
+        RunJob::Work,
+        NewRun {
+            target: RunTarget {
+                repo: canonical_repo.to_string(),
+                bead: Some(item.issue_id.clone()),
+            },
+            approved_profiles: route.approved_models.clone(),
+            bursar_roster_artifact: None,
+            limits: RunLimits {
+                item_wall_clock_mins: Some(u64::from(cfg.budgets.item_wall_clock_mins)),
+                max_attempts: Some(max_attempts),
+            },
+            verifier: RunVerifier {
+                mechanical: Some(verify_cmd.to_string()),
+                qualitative: cfg
+                    .review
+                    .enabled
+                    .then(|| "tiered-qualitative-review".to_string()),
+            },
+            approval: Some(approval),
+        },
+    )
+    .map_err(run_artifact_error)
+}
+
+fn capture_dispatch_result(
+    run_artifacts: &RunHandle,
+    attempt: u64,
+    profile: &str,
+    result: &dispatch::DispatchResult,
+) -> std::result::Result<Vec<crate::run::ArtifactRef>, DispatchCycleError> {
+    let directory = format!("attempts/{attempt:03}-{}", sanitize_artifact_piece(profile));
+    Ok(vec![
+        run_artifacts
+            .capture_artifact(
+                &result.stdout_path,
+                &PathBuf::from(&directory).join("worker.stdout.log"),
+            )
+            .map_err(run_artifact_error)?,
+        run_artifacts
+            .capture_artifact(
+                &result.stderr_path,
+                &PathBuf::from(directory).join("worker.stderr.log"),
+            )
+            .map_err(run_artifact_error)?,
+    ])
+}
+
+fn record_verify_events(
+    run_artifacts: &mut RunHandle,
+    state_dir: &Path,
+    cycle_id: &str,
+    bead_id: &str,
+    outcome: &verify::VerifyOutcome,
+) -> std::result::Result<(), DispatchCycleError> {
+    let log_dir = state_dir.join("logs").join(cycle_id);
+    let verify_refs = capture_named_logs_if_present(
+        run_artifacts,
+        &log_dir,
+        bead_id,
+        "verify",
+        Path::new("artifacts/verify"),
+    )?;
+    if verify_refs.is_empty() {
+        run_artifacts
+            .append_event(
+                EventKind::CoverageGap,
+                EventInput {
+                    outcome: Some("mechanical_verifier_not_run".to_string()),
+                    ..EventInput::default()
+                },
+            )
+            .map_err(run_artifact_error)?;
+    } else {
+        run_artifacts
+            .append_event(
+                EventKind::VerifyFinished,
+                EventInput {
+                    artifact_refs: verify_refs,
+                    outcome: Some(if outcome.verify_passed {
+                        "passed".to_string()
+                    } else {
+                        "failed".to_string()
+                    }),
+                    ..EventInput::default()
+                },
+            )
+            .map_err(run_artifact_error)?;
+    }
+
+    if outcome.review_attempts.is_empty() {
+        run_artifacts
+            .append_event(
+                EventKind::CoverageGap,
+                EventInput {
+                    outcome: Some("qualitative_review_not_run".to_string()),
+                    ..EventInput::default()
+                },
+            )
+            .map_err(run_artifact_error)?;
+        return Ok(());
+    }
+
+    for (index, review) in outcome.review_attempts.iter().enumerate() {
+        let suffix = if index == 0 {
+            "review"
+        } else {
+            "review-repair"
+        };
+        let destination = PathBuf::from(format!("artifacts/review-{:03}", index + 1));
+        let artifact_refs =
+            capture_named_logs_if_present(run_artifacts, &log_dir, bead_id, suffix, &destination)?;
+        run_artifacts
+            .append_event(
+                EventKind::ReviewFinished,
+                EventInput {
+                    profile_id: Some(review.model.clone()),
+                    artifact_refs,
+                    outcome: Some(review.summary.clone()),
+                },
+            )
+            .map_err(run_artifact_error)?;
+    }
+    Ok(())
+}
+
+fn capture_named_logs_if_present(
+    run_artifacts: &RunHandle,
+    log_dir: &Path,
+    bead_id: &str,
+    suffix: &str,
+    destination: &Path,
+) -> std::result::Result<Vec<crate::run::ArtifactRef>, DispatchCycleError> {
+    let mut refs = Vec::new();
+    for (extension, name) in [("out", "stdout.log"), ("err", "stderr.log")] {
+        let source = log_dir.join(format!("{bead_id}.{suffix}.{extension}"));
+        if source.is_file() {
+            refs.push(
+                run_artifacts
+                    .capture_artifact(&source, &destination.join(name))
+                    .map_err(run_artifact_error)?,
+            );
+        }
+    }
+    Ok(refs)
+}
+
+fn verify_decision_label(decision: VerifyDecision) -> &'static str {
+    match decision {
+        VerifyDecision::Passed => "verified",
+        VerifyDecision::Failed => "failed",
+        VerifyDecision::HardError => "hard_error",
+    }
+}
+
+fn capture_worker_logs_if_present(
+    run_artifacts: &RunHandle,
+    state_dir: &Path,
+    cycle_id: &str,
+    bead_id: &str,
+    attempt: u64,
+    profile: &str,
+) -> std::result::Result<Vec<crate::run::ArtifactRef>, DispatchCycleError> {
+    let log_dir = state_dir.join("logs").join(cycle_id);
+    let directory = PathBuf::from(format!(
+        "attempts/{attempt:03}-{}",
+        sanitize_artifact_piece(profile)
+    ));
+    let mut refs = Vec::new();
+    for (source, name) in [
+        (log_dir.join(format!("{bead_id}.out")), "worker.stdout.log"),
+        (log_dir.join(format!("{bead_id}.err")), "worker.stderr.log"),
+    ] {
+        if source.is_file() {
+            refs.push(
+                run_artifacts
+                    .capture_artifact(&source, &directory.join(name))
+                    .map_err(run_artifact_error)?,
+            );
+        }
+    }
+    Ok(refs)
+}
+
+fn dispatch_status_label(status: &dispatch::DispatchStatus) -> String {
+    match status {
+        dispatch::DispatchStatus::Success => "success".to_string(),
+        dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::TimedOut) => {
+            "timed_out".to_string()
+        }
+        dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::ExitNonZero { code }) => {
+            code.map_or_else(|| "signal".to_string(), |code| format!("exit_{code}"))
+        }
+        dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::NoNewCommit) => {
+            "no_new_commit".to_string()
+        }
+        dispatch::DispatchStatus::Failed(
+            dispatch::DispatchFailure::BackendFlakeZeroStdoutNoCommit,
+        ) => "backend_flake_zero_stdout_no_commit".to_string(),
+    }
+}
+
+fn sanitize_artifact_piece(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn run_artifact_error(error: crate::run::RunError) -> DispatchCycleError {
+    DispatchCycleError::message(format!("run artifact: {}", error.into_message()))
 }
 
 fn is_metered_worker_backend(backend: Backend) -> bool {
@@ -1962,6 +2320,65 @@ dispatch_id = "fake-worker"
                 .unwrap()
                 .contains("complete")
         );
+
+        let run_dir = single_contract_run(&state);
+        let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
+            .expect("real dispatch writes a valid run manifest");
+        assert_eq!(manifest.job, RunJob::Work);
+        assert_eq!(
+            manifest.target.repo,
+            std::fs::canonicalize(&repo)
+                .expect("canonical sandbox repo")
+                .display()
+                .to_string()
+        );
+        assert_eq!(manifest.target.bead.as_deref(), Some("sandbox-1"));
+        assert_eq!(
+            manifest.approved_profiles.profiles,
+            vec!["fake-worker".to_string()]
+        );
+        assert_eq!(
+            manifest.verifier.mechanical.as_deref(),
+            Some("test -f worker.txt")
+        );
+        assert_eq!(manifest.lifecycle, crate::run::RunLifecycle::Finished);
+        assert_eq!(manifest.outcome.as_deref(), Some("verified"));
+        assert!(run_dir.join("approval.json").is_file());
+        assert!(run_dir.join("attempts").is_dir());
+        assert!(run_dir.join("artifacts").is_dir());
+
+        let events = crate::run::read_events(&run_dir.join("events.jsonl"))
+            .expect("real dispatch writes a valid ordered event log");
+        assert_eq!(
+            events.first().map(|event| event.kind),
+            Some(EventKind::RunStarted)
+        );
+        assert_eq!(
+            events.last().map(|event| event.kind),
+            Some(EventKind::RunFinished)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::AttemptFinished)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::VerifyFinished)
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == EventKind::CoverageGap
+                && event.outcome.as_deref() == Some("bursar_roster_artifact_unavailable")
+        }));
+        assert!(
+            events
+                .iter()
+                .flat_map(|event| &event.artifact_refs)
+                .all(|artifact| {
+                    artifact.sha256.len() == 64 && run_dir.join(&artifact.path).is_file()
+                })
+        );
     }
 
     #[test]
@@ -2070,6 +2487,8 @@ dispatch_id = "senior-reviewer"
         assert_eq!(rows[1]["model"], "senior-reviewer");
         assert_eq!(rows[2]["role"], "implement");
         assert_eq!(rows[2]["model"], "fake-worker");
+
+        assert_qualitative_contract_run(&state);
     }
 
     #[test]
@@ -2823,6 +3242,34 @@ dispatch_id = "fake-worker"
             .join(".harness/reports/conductor")
             .join(cycle_id)
             .join("report.json")
+    }
+
+    fn single_contract_run(state: &Path) -> PathBuf {
+        let mut runs = std::fs::read_dir(crate::run::runs_dir(state))
+            .expect("runs dir")
+            .map(|entry| entry.expect("run dir entry").path())
+            .collect::<Vec<_>>();
+        runs.sort();
+        assert_eq!(runs.len(), 1, "expected exactly one contract run");
+        runs.pop().expect("one run")
+    }
+
+    fn assert_qualitative_contract_run(state: &Path) {
+        let run_dir = single_contract_run(state);
+        let events = crate::run::read_events(&run_dir.join("events.jsonl"))
+            .expect("qualitative review run event log");
+        let review_events = events
+            .iter()
+            .filter(|event| event.kind == EventKind::ReviewFinished)
+            .collect::<Vec<_>>();
+        assert_eq!(review_events.len(), 2);
+        assert!(review_events.iter().all(|event| {
+            event.profile_id.as_deref() == Some("senior-reviewer")
+                && event
+                    .artifact_refs
+                    .iter()
+                    .all(|artifact| run_dir.join(&artifact.path).is_file())
+        }));
     }
 
     fn init_sandbox_repo(repo: &Path) {
