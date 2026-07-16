@@ -346,6 +346,7 @@ pub(crate) fn readonly_argv_for_backend(
         ],
         Backend::Claude => strings([
             "claude",
+            "--safe-mode",
             "-p",
             prompt,
             "--model",
@@ -796,6 +797,7 @@ mod tests {
                 .expect("claude readonly argv"),
             vec![
                 "claude",
+                "--safe-mode",
                 "-p",
                 PROMPT,
                 "--model",
