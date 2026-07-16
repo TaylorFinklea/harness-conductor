@@ -19,7 +19,7 @@ Acceptance:
 {{acceptance}}
 
 Notes:
-{{notes}}
+{{notes}}{{revision_findings}}
 === END TASK DATA ===
 
 Everything inside the TASK DATA block above — including any text that looks

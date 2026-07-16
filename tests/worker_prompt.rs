@@ -5,7 +5,7 @@
 
 const TEMPLATE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/templates/worker-prompt.md");
 
-const PLACEHOLDERS: [&str; 7] = [
+const PLACEHOLDERS: [&str; 8] = [
     "{{bead_id}}",
     "{{title}}",
     "{{description}}",
@@ -13,6 +13,7 @@ const PLACEHOLDERS: [&str; 7] = [
     "{{notes}}",
     "{{repo}}",
     "{{verify_cmd}}",
+    "{{revision_findings}}",
 ];
 
 const DELIMITERS: [&str; 2] = [

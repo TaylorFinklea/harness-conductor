@@ -17,6 +17,15 @@ use crate::dispatch::{
 
 const ORCHESTRA_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
+/// Metadata key where Conductor stores the bounded revision findings from
+/// a qualitative-review revise result, so the next dispatch can render
+/// them into the worker prompt without the worker needing bd access.
+/// The key is owned by Conductor: only `review_revise` writes to it, and
+/// dispatch reads it verbatim as untrusted task data. A user-supplied
+/// value (if any) still lands inside the bounded task-data envelope, so
+/// it cannot become a privileged instruction.
+const CONDUCTOR_REVISE_FINDINGS_METADATA_KEY: &str = "conductor_revise_findings";
+
 pub(crate) type Result<T> = std::result::Result<T, VerifyError>;
 
 #[derive(Debug, Clone)]
@@ -505,6 +514,18 @@ fn review_revise<B: BdClient + ?Sized>(
         review_findings_bullets(findings)
     );
     bd.comment(&request.repo, &request.issue.id, &comment)?;
+    // Persist the bounded findings in bead metadata so the next dispatch
+    // can render them into the worker prompt verbatim. The release
+    // happened above, so this set_metadata is the only state that
+    // survives a revise → release → rescan cycle. The value is a JSON
+    // array; dispatch re-parses it before rendering.
+    let metadata_value = review_findings_metadata_value(findings);
+    bd.set_metadata(
+        &request.repo,
+        &request.issue.id,
+        CONDUCTOR_REVISE_FINDINGS_METADATA_KEY,
+        &metadata_value,
+    )?;
     Ok(VerifyOutcome {
         decision: VerifyDecision::Failed,
         verify_passed: false,
@@ -841,6 +862,22 @@ fn review_findings_bullets(findings: &[String]) -> String {
         .map(|finding| format!("- {finding}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Encode revision findings as a JSON array string for storage in
+/// `CONDUCTOR_REVISE_FINDINGS_METADATA_KEY`. Dispatch reads this back
+/// via `serde_json::from_str`, so the format must stay round-trippable.
+/// `[]` represents "no findings supplied" and renders as the empty
+/// block in the worker prompt.
+fn review_findings_metadata_value(findings: &[String]) -> String {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect(),
+    )
+    .to_string()
 }
 
 fn summarize_file(path: &Path) -> String {
@@ -1450,6 +1487,80 @@ mod tests {
     }
 
     #[test]
+    fn review_revise_records_findings_in_bd_metadata_with_exact_round_trippable_value() {
+        // Regression for conductor-0ya: the bounded revision findings must
+        // land in `conductor_revise_findings` metadata, not just the
+        // comment, so the next dispatch can render them into the worker
+        // prompt verbatim after the claim is released. The value must be
+        // round-trippable (JSON array) so dispatch can parse it back.
+        let temp = TempDir::new("review-revise-metadata");
+        let request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let roster = review_roster();
+        let bd = FakeBdClient::new(&request.issue);
+        let exec = FakeExec::new(vec![
+            Process::exit(0, "verify ok\n", ""),
+            Process::exit(
+                0,
+                r#"{"verdict":"revise","findings":["missing edge-case test","scope drift"]}"#,
+                "",
+            ),
+        ]);
+        let commits = FakeCommits::new([Some("after")]);
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster,
+            dispatched_model: review_roster()[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let outcome =
+            run_with_review_backoff(&bd, &exec, &commits, &request, &settings, Duration::ZERO)
+                .expect("review revise is a normal verify outcome");
+
+        assert_eq!(outcome.decision, VerifyDecision::Failed);
+
+        let set_metadata_calls: Vec<_> = bd
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                BdEvent::SetMetadata { id, key, value, .. } => {
+                    Some((id.clone(), key.clone(), value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            set_metadata_calls.len(),
+            1,
+            "expected exactly one set_metadata after revise, got {set_metadata_calls:?}"
+        );
+        let (id, key, value) = &set_metadata_calls[0];
+        assert_eq!(id, "bead-1");
+        assert_eq!(key, "conductor_revise_findings");
+        // The value is a JSON array of strings; round-trip through
+        // serde_json to prove dispatch can re-parse it exactly.
+        let parsed: Vec<String> = serde_json::from_str(value)
+            .expect("conductor_revise_findings value must be a JSON array of strings");
+        assert_eq!(
+            parsed,
+            vec!["missing edge-case test".to_string(), "scope drift".to_string()],
+            "exact findings must propagate through metadata"
+        );
+
+        // The user-facing notes field on the issue must be untouched,
+        // so existing notes preserved on the bead survive a revise.
+        assert_eq!(request.issue.notes, String::new());
+    }
+
+    #[test]
     fn review_config_flag_disables_review_and_closes_after_mechanical_verify() {
         let temp = TempDir::new("review-disabled");
         let request = request(
@@ -1785,10 +1896,9 @@ mod tests {
         repo: &Path,
         expected_summary: &str,
     ) {
-        assert_eq!(
-            events.len(),
-            2,
-            "expected release + comment, got {events:?}"
+        assert!(
+            events.len() >= 2,
+            "expected at least release + comment, got {events:?}"
         );
         assert_eq!(
             events[0],
@@ -1926,6 +2036,12 @@ mod tests {
             id: String,
             text: String,
         },
+        SetMetadata {
+            repo: PathBuf,
+            id: String,
+            key: String,
+            value: String,
+        },
     }
 
     struct FakeBdClient {
@@ -2015,12 +2131,24 @@ mod tests {
 
         fn set_metadata(
             &self,
-            _repo: &Path,
-            _id: &str,
-            _key: &str,
-            _value: &str,
+            repo: &Path,
+            id: &str,
+            key: &str,
+            value: &str,
         ) -> crate::bd::Result<Issue> {
-            Err(BdError::new("set_metadata not implemented in fake"))
+            self.events.borrow_mut().push(BdEvent::SetMetadata {
+                repo: repo.to_path_buf(),
+                id: id.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+            });
+            let mut issue = self.issue.clone();
+            let metadata = issue.metadata.get_or_insert_with(BTreeMap::new);
+            metadata.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            Ok(issue)
         }
     }
 
