@@ -438,15 +438,14 @@ fn evaluate_budget_at<C: BursarClient + ?Sized>(
             ),
         );
     }
-    if report.providers.len() != PROVIDERS.len()
-        || !PROVIDERS
-            .iter()
-            .all(|provider| report.providers.contains_key(*provider))
+    if !PROVIDERS
+        .iter()
+        .all(|provider| report.providers.contains_key(*provider))
     {
         return decision(
             provider,
             BudgetAction::Defer,
-            format!("{provider}: defer — malformed bursar/status@2 provider set"),
+            format!("{provider}: defer — bursar/status@2 missing baseline provider"),
         );
     }
 
@@ -927,7 +926,107 @@ mod tests {
             now,
         );
         assert_eq!(decision.action, BudgetAction::Defer);
-        assert!(decision.summary.contains("provider set"));
+        assert!(decision.summary.contains("baseline"));
+    }
+
+    #[test]
+    fn status_v2_accepts_superset_with_new_providers() {
+        // Regression for cycle-20260716-204555: Bursar commit e588018 extended
+        // status@2 to cover every roster provider, but Conductor's length check
+        // still required the legacy four. Every cycle candidate deferred as
+        // "malformed bursar/status@2 provider set" and the fleet stopped.
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                .expect("fixture JSON");
+        let now = at("2026-07-13T10:03:00Z");
+        for (name, availability) in [
+            ("ollama-cloud", "healthy"),
+            ("google-ai-studio", "caution"),
+            ("neuralwatt", "exhausted"),
+        ] {
+            let mut provider = value["providers"]["codex"].clone();
+            provider["availability"] = Value::String(availability.to_string());
+            provider["reason"] = Value::String("test".to_string());
+            value["providers"][name] = provider;
+        }
+
+        // Baseline providers keep their normal decisions on a superset report.
+        let codex = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "codex",
+            true,
+            now,
+        );
+        assert_eq!(codex.action, BudgetAction::Proceed);
+
+        // Added providers get their own Healthy/Caution/Exhausted decision.
+        let ollama = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "ollama-cloud",
+            true,
+            now,
+        );
+        assert_eq!(ollama.action, BudgetAction::Proceed);
+        assert_eq!(ollama.availability, Some(Availability::Healthy));
+
+        let google = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "google-ai-studio",
+            true,
+            now,
+        );
+        assert_eq!(google.action, BudgetAction::SpendCautiously);
+        assert_eq!(google.availability, Some(Availability::Caution));
+
+        let neuralwatt = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "neuralwatt",
+            true,
+            now,
+        );
+        assert_eq!(neuralwatt.action, BudgetAction::Defer);
+        assert_eq!(neuralwatt.availability, Some(Availability::Exhausted));
+
+        // Requested provider absent from a superset still defers.
+        let missing = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "missing-provider",
+            true,
+            now,
+        );
+        assert_eq!(missing.action, BudgetAction::Defer);
+        assert!(missing.summary.contains("absent"));
+    }
+
+    #[test]
+    fn status_v2_superset_missing_baseline_defers() {
+        // Forward-compatible provider set must still require the legacy four.
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                .expect("fixture JSON");
+        let now = at("2026-07-13T10:03:00Z");
+        let providers = value["providers"]
+            .as_object_mut()
+            .expect("providers object");
+        let anthropic = providers.remove("anthropic").expect("anthropic present");
+        providers.insert("ollama-cloud".to_string(), anthropic);
+        providers.insert(
+            "google-ai-studio".to_string(),
+            providers.get("codex").expect("codex present").clone(),
+        );
+        providers.insert(
+            "neuralwatt".to_string(),
+            providers.get("opencode-go").expect("opencode-go present").clone(),
+        );
+
+        let decision = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "codex",
+            true,
+            now,
+        );
+        assert_eq!(decision.action, BudgetAction::Defer);
+        assert!(decision.summary.contains("baseline"));
     }
 
     #[test]
