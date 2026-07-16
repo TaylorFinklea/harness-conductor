@@ -103,6 +103,7 @@ pub(crate) fn run_dry_run_scoped(
 ) -> Result<CycleResult, CycleError> {
     let now = Utc::now();
     let cycle_id = now.format("cycle-%Y%m%d-%H%M%S").to_string();
+    let cycle_id = unique_cycle_id(state_dir, &cycle_id);
     let created_at = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     run_dry_run_with_timestamps_scoped(
@@ -115,6 +116,27 @@ pub(crate) fn run_dry_run_scoped(
         &created_at,
         scope,
     )
+}
+
+/// Ensures a unique cycle-id within `state_dir`, appending a monotonic `-N`
+/// suffix when the second-granular `base` would collide with an existing
+/// plan. Without this, two cycles started within the same second (manual
+/// re-run, cron double-fire) share an id and clobber each other's plan,
+/// report, and log state.
+fn unique_cycle_id(state_dir: &Path, base: &str) -> String {
+    let plans_dir = state_dir.join("plans");
+    let plan_path = |id: &str| plans_dir.join(format!("{id}.json"));
+    if !plan_path(base).exists() {
+        return base.to_string();
+    }
+    let mut counter = 2_u64;
+    loop {
+        let candidate = format!("{base}-{counter}");
+        if !plan_path(&candidate).exists() {
+            return candidate;
+        }
+        counter += 1;
+    }
 }
 
 /// Runs a dry-run cycle with explicit timestamps (for deterministic tests).
@@ -992,6 +1014,28 @@ mod tests {
         std::fs::create_dir_all(&beads_dir).expect("mkdir .beads");
         let metadata = beads_dir.join("metadata.json");
         std::fs::write(&metadata, r#"{"backend":"dolt"}"#).expect("write metadata.json");
+    }
+
+    #[test]
+    fn unique_cycle_id_disambiguates_same_second() {
+        let state = TempDir::new("cycle-id-collision-state");
+        let plans_dir = state.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        let base = "cycle-20260716-120000";
+
+        // First cycle in the second: clean id, no plan yet.
+        assert_eq!(unique_cycle_id(state.path(), base), base);
+
+        // Seed the first cycle's plan so a same-second re-run sees a collision.
+        std::fs::write(plans_dir.join(format!("{base}.json")), "{}").unwrap();
+
+        // Second cycle in the same second: bumped, distinct, no clobber.
+        assert_eq!(unique_cycle_id(state.path(), base), format!("{base}-2"));
+
+        // Seed the bumped plan too; a third same-second run must keep advancing.
+        std::fs::write(plans_dir.join(format!("{base}-2.json")), "{}").unwrap();
+        assert_eq!(unique_cycle_id(state.path(), base), format!("{base}-3"));
     }
 
     fn make_issue_with_metadata(id: &str, priority: u32, tier: &str, complexity: &str) -> Issue {
