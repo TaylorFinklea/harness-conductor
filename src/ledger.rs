@@ -3,7 +3,6 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::io::Write;
 use std::path::Path;
 
 use serde::Serialize;
@@ -113,15 +112,49 @@ fn append_serialized(path: &Path, row: &impl Serialize) -> Result<()> {
             ))
         })?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| LedgerError::new(format!("failed to open ledger {}: {e}", path.display())))?;
-    serde_json::to_writer(&mut file, row)
+
+    // Serialize the new row (with its trailing newline) into a buffer up
+    // front. Reading any existing contents lets us replace the whole file
+    // in one shot, so the temp + rename below is a true atomic replacement
+    // — not just an append to the original. Mirrors `ratchet.rs::save`:
+    // an interrupted write cannot leave the ledger in a partially-written
+    // state because the original file is untouched until the rename lands.
+    let mut new_row = serde_json::to_vec(row)
         .map_err(|e| LedgerError::new(format!("failed to serialize ledger row: {e}")))?;
-    file.write_all(b"\n")
-        .map_err(|e| LedgerError::new(format!("failed to write ledger {}: {e}", path.display())))
+    new_row.push(b'\n');
+
+    let existing = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(LedgerError::new(format!(
+                "failed to read ledger {}: {e}",
+                path.display()
+            )));
+        }
+    };
+
+    let mut contents = existing;
+    contents.extend_from_slice(&new_row);
+
+    // Write the full intended contents to a sibling temp file in the same
+    // directory, then rename it over the original. A sibling (not /tmp)
+    // keeps the rename atomic on the same filesystem.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &contents).map_err(|e| {
+        LedgerError::new(format!(
+            "failed to write ledger temp {}: {e}",
+            tmp.display()
+        ))
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        LedgerError::new(format!(
+            "failed to rename ledger temp {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -278,6 +311,67 @@ mod tests {
         assert_eq!(parsed["reviewer_id"], json!("R1"));
         assert_eq!(parsed["schema_valid"], json!(false));
         assert_eq!(parsed["failure_reason"], json!("invalid JSON"));
+    }
+
+    fn minimal_row(task: &str) -> LedgerRow {
+        LedgerRow {
+            date: "2026-07-16".to_string(),
+            model: "fake-worker".to_string(),
+            harness: None,
+            profile: None,
+            reasoning_effort: None,
+            role: "implement".to_string(),
+            task: task.to_string(),
+            score_1_5: None,
+            blind_rank: None,
+            judge: None,
+            verify_passed: true,
+            complexity: "S".to_string(),
+            project: "sandbox-repo".to_string(),
+            bias_note: None,
+            notes: String::new(),
+            arena_run_id: None,
+            winner: None,
+            applied: None,
+            failure_reason: None,
+            duration_ms: None,
+            ralph_duration_ms: None,
+            verify_duration_ms: None,
+            tokens_used: None,
+            cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn append_is_atomic_and_preserves_existing_rows() {
+        // Two appends must both survive the read-modify-write + rename,
+        // the ledger must hold two complete JSON lines (no partial row),
+        // and the sibling temp file must not be left behind after a
+        // successful append.
+        let temp = TempDir::new("ledger-atomic");
+        let path = temp.path().join("model-bench.jsonl");
+
+        append(&path, &minimal_row("sandbox-1")).expect("first append");
+        append(&path, &minimal_row("sandbox-2")).expect("second append");
+
+        assert_eq!(
+            path.with_extension("json.tmp").exists(),
+            false,
+            "temp file must be renamed away after a successful append"
+        );
+
+        let content = std::fs::read_to_string(&path).expect("read ledger");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "both rows must survive the append");
+        for line in &lines {
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("each line is a complete JSON row");
+            assert!(parsed.get("task").is_some());
+        }
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first["task"], json!("sandbox-1"));
+        assert_eq!(second["task"], json!("sandbox-2"));
     }
 
     struct TempDir(PathBuf);
