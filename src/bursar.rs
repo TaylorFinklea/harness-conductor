@@ -380,7 +380,15 @@ pub(crate) fn evaluate_budget<C: BursarClient + ?Sized>(
     provider: &str,
     use_bursar: bool,
 ) -> BudgetDecision {
-    evaluate_budget_at(client, provider, use_bursar, Utc::now())
+    let result = if use_bursar {
+        client.status()
+    } else {
+        Err(BursarError::unavailable(
+            "bursar intentionally bypassed by static caps",
+        ))
+    };
+    let snapshot = SnapshotBursarClient { result };
+    evaluate_budget_at(&snapshot, provider, use_bursar, Utc::now())
 }
 
 #[expect(
@@ -810,6 +818,24 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot["codex"].action, BudgetAction::Proceed);
         assert_eq!(snapshot["anthropic"].action, BudgetAction::SpendCautiously);
+    }
+
+    #[test]
+    fn budget_validation_clock_is_sampled_after_status_collection() {
+        struct PostScanClient;
+
+        impl BursarClient for PostScanClient {
+            fn status(&self) -> Result<StatusReport> {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                FakeBursarClient::with_provider_availability("codex", Availability::Healthy)
+                    .status()
+            }
+        }
+
+        let decision = evaluate_budget(&PostScanClient, "codex", true);
+
+        assert_eq!(decision.action, BudgetAction::Proceed);
+        assert!(!decision.summary.contains("future"));
     }
 
     #[test]
