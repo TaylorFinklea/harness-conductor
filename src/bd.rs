@@ -585,6 +585,116 @@ mod tests {
         assert_bd_round_trip(temp.path());
     }
 
+    #[test]
+    fn bd_client_real_subprocess_conductor_revise_findings_round_trip_keeps_string_scalar_shape() {
+        // Live-contract regression for conductor-0ya. A throwaway
+        // `bd` repo proved `bd update --set-metadata` returns the
+        // stored value as a JSON string scalar, not a native array,
+        // even when the caller wrote a JSON-encoded array. This test
+        // pins that contract: set the metadata through the real
+        // `CommandBdClient`, read it back via `show`, and assert the
+        // value is the JSON string literal, not a native
+        // `Value::Array`. Dispatch has to accept this shape; if the
+        // live bd ever flips back to native arrays, the parser will
+        // fail closed and this test will point at the change.
+        if !bd_on_path() {
+            return;
+        }
+
+        let temp = TempDir::new("bd-client-revise-findings");
+        init_bd_repo(temp.path());
+        setup_issue(
+            temp.path(),
+            &[
+                "create",
+                "revise findings round trip",
+                "--id",
+                "fixture-revise-findings",
+                "--description",
+                "revise round trip description",
+                "--acceptance",
+                "revise round trip acceptance",
+                "--notes",
+                "tier_floor: senior",
+                "-t",
+                "task",
+                "-p",
+                "1",
+            ],
+        );
+
+        let client = CommandBdClient::new();
+        let findings = serde_json::Value::Array(vec![
+            serde_json::Value::String("missing edge-case test".to_string()),
+            serde_json::Value::String("scope drift".to_string()),
+        ])
+        .to_string();
+        let set = client
+            .set_metadata(
+                temp.path(),
+                "fixture-revise-findings",
+                "conductor_revise_findings",
+                &findings,
+            )
+            .expect("set_metadata works against the live bd");
+        let stored = set
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("conductor_revise_findings"))
+            .expect("conductor_revise_findings lives in returned metadata");
+        assert_eq!(
+            stored,
+            &serde_json::Value::String(findings.clone()),
+            "live bd must round-trip the value as a JSON string scalar"
+        );
+
+        let ready_issue = client
+            .ready(temp.path())
+            .expect("ready works")
+            .into_iter()
+            .find(|issue| issue.id == "fixture-revise-findings")
+            .expect("ready returns the issue");
+        let ready_value = ready_issue
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("conductor_revise_findings"))
+            .expect("ready carries the metadata");
+        assert_eq!(
+            ready_value,
+            &serde_json::Value::String(findings.clone()),
+            "bd ready must also surface the JSON string scalar shape"
+        );
+
+        let shown = client
+            .show(temp.path(), "fixture-revise-findings")
+            .expect("show works");
+        let shown_value = shown
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("conductor_revise_findings"))
+            .expect("show carries the metadata");
+        assert_eq!(
+            shown_value,
+            &serde_json::Value::String(findings.clone()),
+            "bd show must surface the JSON string scalar shape"
+        );
+
+        // The stored scalar must be the exact JSON string the
+        // caller wrote; if a future bd change adds escapes or
+        // whitespace, the dispatch parser will silently drop the
+        // findings, so this assertion is the tripwire.
+        let stored_string = shown_value
+            .as_str()
+            .expect("stored value is a JSON string scalar");
+        let reparsed: Vec<String> = serde_json::from_str(stored_string)
+            .expect("stored JSON string scalar parses back to a string array");
+        assert_eq!(
+            reparsed,
+            vec!["missing edge-case test".to_string(), "scope drift".to_string()],
+            "the live round-trip must preserve the exact findings array"
+        );
+    }
+
     struct TempDir(PathBuf);
 
     impl TempDir {

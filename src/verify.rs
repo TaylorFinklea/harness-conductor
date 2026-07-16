@@ -505,7 +505,34 @@ fn review_revise<B: BdClient + ?Sized>(
     findings: &[String],
     attempts: Vec<ReviewRecord>,
 ) -> Result<VerifyOutcome> {
+    // 1. Persist the bounded findings in bead metadata FIRST. The
+    //    claim is still held here, so a failure at this step means
+    //    the bead stays claimed and the next dispatch will re-enter
+    //    this code path (no lost-retry-context race). The invariant
+    //    "released ⇒ retry context durable" is the whole point: a
+    //    released Bead must never race ahead of the bounded revision
+    //    findings that the next worker will need. The value is a JSON
+    //    array; dispatch re-parses it before rendering.
+    let metadata_value = review_findings_metadata_value(findings);
+    bd.set_metadata(
+        &request.repo,
+        &request.issue.id,
+        CONDUCTOR_REVISE_FINDINGS_METADATA_KEY,
+        &metadata_value,
+    )?;
+    // 2. Release the claim. The metadata is now durable, so the
+    //    released bead can never race ahead of the retry context
+    //    (any subsequent rescan that picks it up sees the same
+    //    findings this revise recorded). Preserve release-on-failure
+    //    behavior: if anything after this point errors, the bead is
+    //    still released and ready for the next cycle.
     bd.release(&request.repo, &request.issue.id)?;
+    // 3. Write the human-facing comment last. The metadata is the
+    //    authoritative retry context; the comment is a breadcrumb
+    //    surfaced to humans, not part of the worker prompt. A failure
+    //    here is non-fatal in spirit (metadata is already durable
+    //    and the claim is released) but the function still propagates
+    //    the error so callers see a failed verify.
     let summary = review_findings_summary(findings);
     let comment = format!(
         "conductor: {} {} qualitative review requested revisions:\n{}",
@@ -514,18 +541,6 @@ fn review_revise<B: BdClient + ?Sized>(
         review_findings_bullets(findings)
     );
     bd.comment(&request.repo, &request.issue.id, &comment)?;
-    // Persist the bounded findings in bead metadata so the next dispatch
-    // can render them into the worker prompt verbatim. The release
-    // happened above, so this set_metadata is the only state that
-    // survives a revise → release → rescan cycle. The value is a JSON
-    // array; dispatch re-parses it before rendering.
-    let metadata_value = review_findings_metadata_value(findings);
-    bd.set_metadata(
-        &request.repo,
-        &request.issue.id,
-        CONDUCTOR_REVISE_FINDINGS_METADATA_KEY,
-        &metadata_value,
-    )?;
     Ok(VerifyOutcome {
         decision: VerifyDecision::Failed,
         verify_passed: false,
@@ -1527,27 +1542,41 @@ mod tests {
 
         assert_eq!(outcome.decision, VerifyDecision::Failed);
 
-        let set_metadata_calls: Vec<_> = bd
-            .events()
+        let events = bd.events();
+        let set_metadata_index = events
             .iter()
-            .filter_map(|event| match event {
-                BdEvent::SetMetadata { id, key, value, .. } => {
-                    Some((id.clone(), key.clone(), value.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            set_metadata_calls.len(),
-            1,
-            "expected exactly one set_metadata after revise, got {set_metadata_calls:?}"
+            .position(|event| matches!(event, BdEvent::SetMetadata { .. }))
+            .expect("set_metadata event recorded");
+        let release_index = events
+            .iter()
+            .position(|event| matches!(event, BdEvent::Release { .. }))
+            .expect("release event recorded");
+        let comment_index = events
+            .iter()
+            .position(|event| matches!(event, BdEvent::Comment { .. }))
+            .expect("comment event recorded");
+        // Ordering invariant: a released Bead must never race ahead of
+        // the bounded retry context. The durable persistence
+        // (set_metadata) must precede the release; the comment is a
+        // human-facing breadcrumb and lands last.
+        assert!(
+            set_metadata_index < release_index,
+            "set_metadata must precede release, got {events:?}"
         );
-        let (id, key, value) = &set_metadata_calls[0];
+        assert!(
+            release_index < comment_index,
+            "release must precede comment, got {events:?}"
+        );
+        let set_metadata_call = &events[set_metadata_index];
+        let (id, key, value) = match set_metadata_call {
+            BdEvent::SetMetadata { id, key, value, .. } => (id.clone(), key.clone(), value.clone()),
+            _ => unreachable!("set_metadata_index points to a SetMetadata event"),
+        };
         assert_eq!(id, "bead-1");
         assert_eq!(key, "conductor_revise_findings");
         // The value is a JSON array of strings; round-trip through
         // serde_json to prove dispatch can re-parse it exactly.
-        let parsed: Vec<String> = serde_json::from_str(value)
+        let parsed: Vec<String> = serde_json::from_str(&value)
             .expect("conductor_revise_findings value must be a JSON array of strings");
         assert_eq!(
             parsed,
@@ -1558,6 +1587,66 @@ mod tests {
         // The user-facing notes field on the issue must be untouched,
         // so existing notes preserved on the bead survive a revise.
         assert_eq!(request.issue.notes, String::new());
+    }
+
+    #[test]
+    fn review_revise_persists_metadata_before_release_so_released_bead_never_races_retry_context() {
+        // Failure-path regression for conductor-0ya: if the durable
+        // metadata write fails, the claim must NOT be released. The
+        // invariant is "released ⇒ retry context durable" — releasing
+        // a bead whose retry context is missing would let the next
+        // dispatch pick up a context-free revise and silently drop
+        // the bounded findings. The bead stays claimed so the next
+        // cycle re-enters review_revise and re-tries the metadata
+        // write before the release ever happens.
+        let temp = TempDir::new("review-revise-metadata-fails");
+        let request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        let roster = review_roster();
+        let bd = FakeBdClient::new(&request.issue)
+            .with_set_metadata_error("simulated bd write failure");
+        let exec = FakeExec::new(vec![
+            Process::exit(0, "verify ok\n", ""),
+            Process::exit(
+                0,
+                r#"{"verdict":"revise","findings":["missing edge-case test"]}"#,
+                "",
+            ),
+        ]);
+        let commits = FakeCommits::new([Some("after")]);
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster,
+            dispatched_model: review_roster()[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let outcome =
+            run_with_review_backoff(&bd, &exec, &commits, &request, &settings, Duration::ZERO);
+
+        // A failed metadata write is a hard error: the function must
+        // bail before the release, so the claim stays held and the
+        // next cycle re-enters the revise path. We expect `Err`
+        // here, not a normal `VerifyOutcome`.
+        let error = outcome
+            .expect_err("metadata write failure must propagate as a hard error");
+        assert!(
+            error.to_string().contains("simulated bd write failure"),
+            "error must surface the bd failure cause, got {error}"
+        );
+        let events = bd.events();
+        assert!(
+            events.is_empty(),
+            "released Bead races ahead of durable retry context: {events:?}"
+        );
+        assert_eq!(bd.close_count(), 0, "bead must not close on metadata failure");
     }
 
     #[test]
@@ -1900,14 +1989,27 @@ mod tests {
             events.len() >= 2,
             "expected at least release + comment, got {events:?}"
         );
+        let release_index = events
+            .iter()
+            .position(|event| matches!(event, BdEvent::Release { .. }))
+            .unwrap_or_else(|| panic!("expected a release event, got {events:?}"));
+        let comment_index = events
+            .iter()
+            .position(|event| matches!(event, BdEvent::Comment { .. }))
+            .unwrap_or_else(|| panic!("expected a comment event, got {events:?}"));
+        assert!(
+            release_index < comment_index,
+            "release must precede comment, got {events:?}"
+        );
+        let release = &events[release_index];
         assert_eq!(
-            events[0],
-            BdEvent::Release {
+            release,
+            &BdEvent::Release {
                 repo: repo.to_path_buf(),
                 id: "bead-1".to_string(),
             }
         );
-        match &events[1] {
+        match &events[comment_index] {
             BdEvent::Comment {
                 repo: got_repo,
                 id,
@@ -2047,6 +2149,7 @@ mod tests {
     struct FakeBdClient {
         issue: Issue,
         events: RefCell<Vec<BdEvent>>,
+        set_metadata_error: RefCell<Option<String>>,
     }
 
     impl FakeBdClient {
@@ -2054,7 +2157,13 @@ mod tests {
             Self {
                 issue: issue.clone(),
                 events: RefCell::new(Vec::new()),
+                set_metadata_error: RefCell::new(None),
             }
+        }
+
+        fn with_set_metadata_error(self, message: &str) -> Self {
+            *self.set_metadata_error.borrow_mut() = Some(message.to_string());
+            self
         }
 
         fn events(&self) -> Vec<BdEvent> {
@@ -2136,6 +2245,9 @@ mod tests {
             key: &str,
             value: &str,
         ) -> crate::bd::Result<Issue> {
+            if let Some(message) = self.set_metadata_error.borrow().as_ref() {
+                return Err(BdError::new(message.clone()));
+            }
             self.events.borrow_mut().push(BdEvent::SetMetadata {
                 repo: repo.to_path_buf(),
                 id: id.to_string(),

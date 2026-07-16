@@ -1390,10 +1390,31 @@ fn render_worker_prompt(issue: &Issue, repo: &Path, verify_cmd: &str) -> String 
 /// The value lives inside the untrusted task-data envelope, so any text
 /// a user can write into bd metadata still renders as data, not as a
 /// privileged instruction to the worker.
+///
+/// Live `bd update --set-metadata` round-trips the value through its
+/// own metadata map and returns the stored entry as a JSON string
+/// scalar, not a native array, even when the caller wrote a
+/// JSON-encoded array. The live contract was proved against a
+/// throwaway `bd` repo (cycle-20260716-174305 audit): set
+/// `conductor_revise_findings='["one","two"]'` and `bd show` returns
+/// the metadata as `"[\"one\",\"two\"]"`. In-memory tests still build
+/// the issue with a native `Value::Array`. Dispatch must accept both
+/// shapes and fail closed on anything else (numbers, objects, empty
+/// strings, malformed JSON, JSON that isn't a string array).
 fn revision_findings_from_issue(issue: &Issue) -> Option<Vec<String>> {
     let metadata = issue.metadata.as_ref()?;
     let value = metadata.get(CONDUCTOR_REVISE_FINDINGS_METADATA_KEY)?;
-    let parsed: Vec<String> = serde_json::from_value(value.clone()).ok()?;
+    let parsed: Vec<String> = match value {
+        // Live bd: stored as a JSON string scalar; the string's
+        // contents are a JSON-encoded array of strings.
+        serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
+        // In-memory test / fake builds: native JSON array of strings.
+        serde_json::Value::Array(_) => serde_json::from_value(value.clone()).ok()?,
+        // Anything else (numbers, booleans, null, objects) is not the
+        // shape Conductor wrote, so fail closed rather than render a
+        // corrupt block.
+        _ => return None,
+    };
     if parsed.is_empty() {
         None
     } else {
@@ -3383,19 +3404,28 @@ provider = \"openai-codex\"
     }
 
     fn issue_with_revise_findings(findings: &[String]) -> Issue {
+        // Mirror the live `bd` shape: `bd update --set-metadata` stores
+        // the value and returns it as a JSON string scalar (the string
+        // contains a JSON-encoded array). The dispatch parser accepts
+        // both shapes; building the in-memory fixture with the live
+        // shape keeps the test contract aligned with what real
+        // `ready`/`show` will deliver, so a future regression that
+        // strips the string-decode path surfaces here first.
+        let payload = serde_json::Value::Array(
+            findings
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+        .to_string();
         let mut issue = sandbox_issue();
         let metadata = issue
             .metadata
             .get_or_insert_with(BTreeMap::new);
         metadata.insert(
             CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string(),
-            serde_json::Value::Array(
-                findings
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
+            serde_json::Value::String(payload),
         );
         issue
     }
@@ -3499,6 +3529,90 @@ provider = \"openai-codex\"
             !prompt.contains("Revision findings"),
             "malformed metadata must render no revision section, prompt: {prompt}"
         );
+    }
+
+    #[test]
+    fn render_worker_prompt_decodes_live_bd_string_scalar_for_conductor_revise_findings() {
+        // Live-contract regression for conductor-0ya: `bd update
+        // --set-metadata` stores the value and returns it as a JSON
+        // string scalar (the string contains a JSON-encoded array).
+        // The dispatch parser must accept that shape and render the
+        // findings verbatim; otherwise every live retry silently
+        // drops the bounded revision context.
+        let mut issue = sandbox_issue();
+        let metadata = issue.metadata.get_or_insert_with(BTreeMap::new);
+        let findings = vec![
+            "missing edge-case test".to_string(),
+            "scope drift".to_string(),
+        ];
+        let payload = serde_json::Value::Array(
+            findings
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+        .to_string();
+        metadata.insert(
+            CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string(),
+            serde_json::Value::String(payload),
+        );
+        let prompt = render_worker_prompt(&issue, Path::new("/tmp/example"), "cargo test");
+
+        let task_data_start = prompt
+            .find("=== TASK DATA")
+            .expect("prompt contains task data open marker");
+        let task_data_end = prompt
+            .find("=== END TASK DATA ===")
+            .expect("prompt contains task data close marker");
+        let inside_envelope = &prompt[task_data_start..task_data_end];
+        assert!(
+            inside_envelope.contains("Revision findings (from prior qualitative review, Conductor-authored):"),
+            "live string-scalar shape must render the revision header, prompt: {prompt}"
+        );
+        for finding in &findings {
+            let bullet = format!("- {finding}");
+            assert!(
+                inside_envelope.contains(&bullet),
+                "live string-scalar shape must render finding {bullet:?}, prompt: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn revision_findings_from_issue_fails_closed_on_malformed_live_bd_values() {
+        // Live bd can return surprising shapes for the metadata value
+        // (numbers, booleans, null, objects, malformed JSON, empty
+        // strings, JSON that's valid but not a string array). The
+        // parser must fail closed on every one of these so a worker
+        // never sees a corrupt or partial revision block.
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("native object", json!({"a": 1})),
+            ("native number", json!(42)),
+            ("native boolean", json!(true)),
+            ("native null", serde_json::Value::Null),
+            ("empty string", json!("")),
+            ("whitespace string", json!("   ")),
+            ("non-json string", json!("not json at all")),
+            ("valid json but not an array", json!("{\"a\":1}")),
+            ("valid json but a number scalar", json!("42")),
+            ("valid json but a non-string array", json!("[1,2,3]")),
+            ("valid empty array", json!("[]")),
+        ];
+        for (label, value) in cases {
+            let mut issue = sandbox_issue();
+            let metadata = issue.metadata.get_or_insert_with(BTreeMap::new);
+            metadata.insert(
+                CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string(),
+                value,
+            );
+            let prompt =
+                render_worker_prompt(&issue, Path::new("/tmp/example"), "cargo test");
+            assert!(
+                !prompt.contains("Revision findings"),
+                "{label}: malformed live-bd value must render no revision section, prompt: {prompt}"
+            );
+        }
     }
 
     #[test]
