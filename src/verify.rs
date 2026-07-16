@@ -439,6 +439,7 @@ enum ReviewDecision {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReviewVerdict {
     verdict: ReviewVerdictKind,
     findings: Vec<String>,
@@ -759,12 +760,57 @@ fn parse_review_verdict(path: &Path) -> std::result::Result<ReviewVerdict, Strin
             path.display()
         )
     })?;
-    serde_json::from_str(&stdout).map_err(|e| {
+    let verdict_json = normalize_review_verdict_json(&stdout);
+    serde_json::from_str(verdict_json).map_err(|e| {
         format!(
             "invalid qualitative review verdict JSON in {}: {e}",
             path.display()
         )
     })
+}
+
+fn normalize_review_verdict_json(stdout: &str) -> &str {
+    let trimmed = stdout.trim();
+    if trimmed.starts_with("```") {
+        return normalize_review_verdict_fence(trimmed).unwrap_or(trimmed);
+    }
+    if trimmed.starts_with("<think>") {
+        return normalize_review_verdict_think(trimmed).unwrap_or(trimmed);
+    }
+    trimmed
+}
+
+fn normalize_review_verdict_fence(stdout: &str) -> Option<&str> {
+    let (opening, body) = stdout.split_once('\n')?;
+    if opening.strip_suffix('\r').unwrap_or(opening) != "```json" {
+        return None;
+    }
+
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let line_without_cr = line_without_newline
+            .strip_suffix('\r')
+            .unwrap_or(line_without_newline);
+        if line_without_cr == "```" {
+            let after_closing = &body[offset + line.len()..];
+            if after_closing.trim().is_empty() {
+                return Some(body[..offset].trim());
+            }
+            return None;
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn normalize_review_verdict_think(stdout: &str) -> Option<&str> {
+    let rest = stdout.strip_prefix("<think>")?;
+    let closing = rest.find("</think>")?;
+    if rest[..closing].contains("<think>") {
+        return None;
+    }
+    Some(rest[closing + "</think>".len()..].trim())
 }
 
 fn review_record(reviewer: &RosterEntry, verify_passed: bool, summary: &str) -> ReviewRecord {
@@ -1216,6 +1262,105 @@ mod tests {
             .expect("repair prompt");
         assert!(repair_prompt.contains("Verdict: ship with evidence"));
         assert!(repair_prompt.contains("UNTRUSTED PREVIOUS REVIEW OUTPUT"));
+    }
+
+    #[test]
+    fn qualitative_review_accepts_bounded_provider_envelopes_without_repair() {
+        let outputs = [
+            (
+                "fenced",
+                "```json\n{\"verdict\":\"ship\",\"findings\":[]}\n```",
+            ),
+            (
+                "think-prefixed",
+                "<think>review reasoning</think>\n{\"verdict\":\"ship\",\"findings\":[]}",
+            ),
+            ("raw", "{\"verdict\":\"ship\",\"findings\":[]}"),
+        ];
+
+        for (label, output) in outputs {
+            let temp = TempDir::new(label);
+            let request = request(
+                temp.path(),
+                issue(false),
+                verify_config(false),
+                Some("before"),
+            );
+            let roster = review_roster();
+            let bd = FakeBdClient::new(&request.issue);
+            let exec = FakeExec::new(vec![
+                Process::exit(0, "verify ok\n", ""),
+                Process::exit(0, output, ""),
+            ]);
+            let commits = FakeCommits::new([Some("after")]);
+            let settings = ReviewSettings {
+                config: ReviewConfig {
+                    enabled: true,
+                    min_tier_gap: 1,
+                },
+                roster: roster.clone(),
+                dispatched_model: roster[0].clone(),
+                item_tier_floor: Tier::Junior,
+            };
+
+            let outcome =
+                run_with_review_backoff(&bd, &exec, &commits, &request, &settings, Duration::ZERO)
+                    .unwrap_or_else(|error| panic!("{label}: review pipeline succeeds: {error}"));
+
+            assert_eq!(outcome.decision, VerifyDecision::Passed, "{label}");
+            assert_eq!(outcome.review_dispatches, 1, "{label}");
+            assert_eq!(outcome.review_attempts.len(), 1, "{label}");
+            assert_eq!(exec.spawns().len(), 2, "{label}: no repair dispatch");
+            assert_eq!(bd.close_count(), 1, "{label}");
+        }
+    }
+
+    #[test]
+    fn qualitative_review_rejects_unbounded_or_malformed_envelopes() {
+        let outputs = [
+            (
+                "leading prose",
+                "review result:\n```json\n{\"verdict\":\"ship\",\"findings\":[]}\n```",
+            ),
+            (
+                "trailing prose",
+                "```json\n{\"verdict\":\"ship\",\"findings\":[]}\n```\nready",
+            ),
+            (
+                "multiple fences",
+                "```json\n{\"verdict\":\"ship\",\"findings\":[]}\n```\n```json\n{\"verdict\":\"ship\",\"findings\":[]}\n```",
+            ),
+            (
+                "multiple think blocks",
+                "<think>first</think>\n<think>second</think>\n{\"verdict\":\"ship\",\"findings\":[]}",
+            ),
+            (
+                "multiple objects",
+                "{\"verdict\":\"ship\",\"findings\":[]}\n{\"verdict\":\"ship\",\"findings\":[]}",
+            ),
+            (
+                "malformed fenced JSON",
+                "```json\n{\"verdict\":\"ship\",\"findings\":}\n```",
+            ),
+            (
+                "schema-invalid fenced JSON",
+                "```json\n{\"verdict\":\"ship\"}\n```",
+            ),
+            (
+                "unknown-field fenced JSON",
+                "```json\n{\"verdict\":\"ship\",\"findings\":[],\"extra\":true}\n```",
+            ),
+        ];
+
+        for (label, output) in outputs {
+            let temp = TempDir::new(label);
+            let stdout_path = temp.path().join("stdout");
+            fs::write(&stdout_path, output).expect("write review output");
+            assert!(
+                parse_review_verdict(&stdout_path).is_err(),
+                "{label} must be rejected"
+            );
+        }
     }
 
     #[test]
