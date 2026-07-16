@@ -690,7 +690,10 @@ mod tests {
             .expect("stored JSON string scalar parses back to a string array");
         assert_eq!(
             reparsed,
-            vec!["missing edge-case test".to_string(), "scope drift".to_string()],
+            vec![
+                "missing edge-case test".to_string(),
+                "scope drift".to_string()
+            ],
             "the live round-trip must preserve the exact findings array"
         );
     }

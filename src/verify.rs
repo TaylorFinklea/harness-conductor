@@ -1580,7 +1580,10 @@ mod tests {
             .expect("conductor_revise_findings value must be a JSON array of strings");
         assert_eq!(
             parsed,
-            vec!["missing edge-case test".to_string(), "scope drift".to_string()],
+            vec![
+                "missing edge-case test".to_string(),
+                "scope drift".to_string()
+            ],
             "exact findings must propagate through metadata"
         );
 
@@ -1607,8 +1610,8 @@ mod tests {
             Some("before"),
         );
         let roster = review_roster();
-        let bd = FakeBdClient::new(&request.issue)
-            .with_set_metadata_error("simulated bd write failure");
+        let bd =
+            FakeBdClient::new(&request.issue).with_set_metadata_error("simulated bd write failure");
         let exec = FakeExec::new(vec![
             Process::exit(0, "verify ok\n", ""),
             Process::exit(
@@ -1635,8 +1638,7 @@ mod tests {
         // bail before the release, so the claim stays held and the
         // next cycle re-enters the revise path. We expect `Err`
         // here, not a normal `VerifyOutcome`.
-        let error = outcome
-            .expect_err("metadata write failure must propagate as a hard error");
+        let error = outcome.expect_err("metadata write failure must propagate as a hard error");
         assert!(
             error.to_string().contains("simulated bd write failure"),
             "error must surface the bd failure cause, got {error}"
@@ -1646,7 +1648,11 @@ mod tests {
             events.is_empty(),
             "released Bead races ahead of durable retry context: {events:?}"
         );
-        assert_eq!(bd.close_count(), 0, "bead must not close on metadata failure");
+        assert_eq!(
+            bd.close_count(),
+            0,
+            "bead must not close on metadata failure"
+        );
     }
 
     #[test]

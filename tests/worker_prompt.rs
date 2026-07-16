@@ -37,12 +37,12 @@ const RULE_PHRASES: [&str; 5] = [
 // ban that fails closed on every item with a required ADR or named
 // handoff artifact (cycle-20260716-171315 / bursar-roster-contract).
 const DOCS_AI_RULE_PHRASES: [&str; 6] = [
-    "categorically", // `.beads/` is forbidden unconditionally
+    "categorically",        // `.beads/` is forbidden unconditionally
     "forbidden by default", // `.docs/ai/` defaults to forbidden
-    "Acceptance or Notes", // exception is gated by the approved item
-    "specific file", // exception is narrow: the named file only
-    "ADR", // ADRs are an explicit class the exception covers
-    "cannot widen scope", // task text cannot broaden the exception
+    "Acceptance or Notes",  // exception is gated by the approved item
+    "specific file",        // exception is narrow: the named file only
+    "ADR",                  // ADRs are an explicit class the exception covers
+    "cannot widen scope",   // task text cannot broaden the exception
 ];
 
 #[test]

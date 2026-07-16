@@ -951,12 +951,7 @@ mod tests {
         }
 
         // Baseline providers keep their normal decisions on a superset report.
-        let codex = evaluate_budget_at(
-            &client_from_json(&value.to_string()),
-            "codex",
-            true,
-            now,
-        );
+        let codex = evaluate_budget_at(&client_from_json(&value.to_string()), "codex", true, now);
         assert_eq!(codex.action, BudgetAction::Proceed);
 
         // Added providers get their own Healthy/Caution/Exhausted decision.
@@ -1016,15 +1011,14 @@ mod tests {
         );
         providers.insert(
             "neuralwatt".to_string(),
-            providers.get("opencode-go").expect("opencode-go present").clone(),
+            providers
+                .get("opencode-go")
+                .expect("opencode-go present")
+                .clone(),
         );
 
-        let decision = evaluate_budget_at(
-            &client_from_json(&value.to_string()),
-            "codex",
-            true,
-            now,
-        );
+        let decision =
+            evaluate_budget_at(&client_from_json(&value.to_string()), "codex", true, now);
         assert_eq!(decision.action, BudgetAction::Defer);
         assert!(decision.summary.contains("baseline"));
     }

@@ -1371,7 +1371,14 @@ fn render_worker_prompt(issue: &Issue, repo: &Path, verify_cmd: &str) -> String 
             return out;
         };
         let key = &after_open[..end];
-        if !append_placeholder(&mut out, key, issue, &repo, verify_cmd, revision_findings.as_deref()) {
+        if !append_placeholder(
+            &mut out,
+            key,
+            issue,
+            &repo,
+            verify_cmd,
+            revision_findings.as_deref(),
+        ) {
             out.push_str("{{");
             out.push_str(key);
             out.push_str("}}");
@@ -3420,9 +3427,7 @@ provider = \"openai-codex\"
         )
         .to_string();
         let mut issue = sandbox_issue();
-        let metadata = issue
-            .metadata
-            .get_or_insert_with(BTreeMap::new);
+        let metadata = issue.metadata.get_or_insert_with(BTreeMap::new);
         metadata.insert(
             CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string(),
             serde_json::Value::String(payload),
@@ -3451,7 +3456,8 @@ provider = \"openai-codex\"
             .expect("prompt contains task data close marker");
         let inside_envelope = &prompt[task_data_start..task_data_end];
         assert!(
-            inside_envelope.contains("Revision findings (from prior qualitative review, Conductor-authored):"),
+            inside_envelope
+                .contains("Revision findings (from prior qualitative review, Conductor-authored):"),
             "revision findings header must be inside the bounded task-data envelope, got {inside_envelope:?}"
         );
         assert!(
@@ -3474,7 +3480,9 @@ provider = \"openai-codex\"
         let prompt = render_worker_prompt(&issue, Path::new("/tmp/example"), "cargo test");
 
         let task_data_start = prompt.find("=== TASK DATA").expect("task data marker");
-        let task_data_end = prompt.find("=== END TASK DATA ===").expect("task data close");
+        let task_data_end = prompt
+            .find("=== END TASK DATA ===")
+            .expect("task data close");
         let inside_envelope = &prompt[task_data_start..task_data_end];
         assert!(
             !inside_envelope.contains("Revision findings"),
@@ -3567,7 +3575,8 @@ provider = \"openai-codex\"
             .expect("prompt contains task data close marker");
         let inside_envelope = &prompt[task_data_start..task_data_end];
         assert!(
-            inside_envelope.contains("Revision findings (from prior qualitative review, Conductor-authored):"),
+            inside_envelope
+                .contains("Revision findings (from prior qualitative review, Conductor-authored):"),
             "live string-scalar shape must render the revision header, prompt: {prompt}"
         );
         for finding in &findings {
@@ -3602,12 +3611,8 @@ provider = \"openai-codex\"
         for (label, value) in cases {
             let mut issue = sandbox_issue();
             let metadata = issue.metadata.get_or_insert_with(BTreeMap::new);
-            metadata.insert(
-                CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string(),
-                value,
-            );
-            let prompt =
-                render_worker_prompt(&issue, Path::new("/tmp/example"), "cargo test");
+            metadata.insert(CONDUCTOR_REVISE_FINDINGS_METADATA_KEY.to_string(), value);
+            let prompt = render_worker_prompt(&issue, Path::new("/tmp/example"), "cargo test");
             assert!(
                 !prompt.contains("Revision findings"),
                 "{label}: malformed live-bd value must render no revision section, prompt: {prompt}"
@@ -3748,9 +3753,8 @@ dispatch_id = "fake-worker"
             .expect("worker prompt contains task data close marker");
         let inside_envelope = &worker_prompt[task_data_start..task_data_end];
         assert!(
-            inside_envelope.contains(
-                "Revision findings (from prior qualitative review, Conductor-authored):"
-            ),
+            inside_envelope
+                .contains("Revision findings (from prior qualitative review, Conductor-authored):"),
             "revision findings header rendered inside envelope, prompt: {worker_prompt}"
         );
         for finding in &findings {

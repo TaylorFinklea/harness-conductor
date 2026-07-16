@@ -354,9 +354,8 @@ mod tests {
         append(&path, &minimal_row("sandbox-1")).expect("first append");
         append(&path, &minimal_row("sandbox-2")).expect("second append");
 
-        assert_eq!(
-            path.with_extension("json.tmp").exists(),
-            false,
+        assert!(
+            !path.with_extension("json.tmp").exists(),
             "temp file must be renamed away after a successful append"
         );
 
