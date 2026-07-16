@@ -1748,6 +1748,19 @@ mod tests {
         assert_eq!(cfg.roster[1].name, "opus-4.8");
         assert_eq!(cfg.roster[1].ceiling, Ceiling::Xl);
         assert_eq!(cfg.roster[1].efficiency, Efficiency::Heavy);
+        assert_eq!(
+            cfg.roster[2].fallback,
+            [
+                "ollama-minimax-m3",
+                "nw-glm-5.2-short",
+                "nw-glm-5.2",
+                "gpt-5.6-luna-senior"
+            ]
+        );
+        assert_eq!(
+            cfg.roster[3].fallback,
+            ["nw-glm-5.2-short", "nw-glm-5.2", "gpt-5.6-luna-senior"]
+        );
         // ollama-cloud lane
         assert_eq!(cfg.roster[5].name, "ollama-glm-5.2");
         assert_eq!(cfg.roster[5].tier, Tier::Senior);
@@ -1757,6 +1770,7 @@ mod tests {
         assert_eq!(cfg.roster[5].dispatch_id, "ollama-cloud/glm-5.2");
         assert_eq!(cfg.roster[5].provider, "ollama-cloud");
         assert_eq!(cfg.roster[5].cost, Cost::Paid);
+        assert_eq!(cfg.roster[5].fallback, ["gpt-5.6-luna-senior"]);
         assert_eq!(cfg.roster[6].name, "ollama-kimi-k2.6");
         assert_eq!(cfg.roster[6].tier, Tier::Senior);
         assert_eq!(cfg.roster[6].ceiling, Ceiling::M);
@@ -1765,6 +1779,7 @@ mod tests {
         assert_eq!(cfg.roster[6].dispatch_id, "ollama-cloud/kimi-k2.6");
         assert_eq!(cfg.roster[6].provider, "ollama-cloud");
         assert_eq!(cfg.roster[6].cost, Cost::Paid);
+        assert_eq!(cfg.roster[6].fallback, ["gpt-5.6-luna-senior"]);
         assert_eq!(cfg.roster[7].name, "ollama-minimax-m3");
         assert_eq!(cfg.roster[7].tier, Tier::Senior);
         assert_eq!(cfg.roster[7].ceiling, Ceiling::M);
@@ -1773,6 +1788,7 @@ mod tests {
         assert_eq!(cfg.roster[7].dispatch_id, "ollama-cloud/minimax-m3");
         assert_eq!(cfg.roster[7].provider, "ollama-cloud");
         assert_eq!(cfg.roster[7].cost, Cost::Paid);
+        assert_eq!(cfg.roster[7].fallback, ["gpt-5.6-luna-senior"]);
         assert_eq!(cfg.roster[8].name, "glm-5.1");
         assert_eq!(cfg.roster[8].tier, Tier::Junior);
         assert_eq!(cfg.roster[8].ceiling, Ceiling::S);
@@ -1780,7 +1796,7 @@ mod tests {
         assert_eq!(cfg.roster[8].dispatch_id, "opencode-go/glm-5.1");
         assert_eq!(cfg.roster[8].provider, "opencode-go");
         assert_eq!(cfg.roster[8].cost, Cost::Free);
-        assert!(cfg.roster[8].fallback.is_empty());
+        assert_eq!(cfg.roster[8].fallback, ["gpt-5.6-luna-junior"]);
         assert_eq!(cfg.roster[9].name, "mimo-v2.5");
         assert_eq!(cfg.roster[9].dispatch_id, "opencode-go/mimo-v2.5");
         assert_eq!(cfg.roster[9].cost, Cost::Free);
@@ -1870,7 +1886,8 @@ mod tests {
             vec![
                 "ollama-glm-5.2".to_string(),
                 "nw-glm-5.2-short".to_string(),
-                "nw-glm-5.2".to_string()
+                "nw-glm-5.2".to_string(),
+                "gpt-5.6-luna-senior".to_string()
             ]
         );
         // Cost-axis repo policy. A repo ABSENT from this table defaults to
