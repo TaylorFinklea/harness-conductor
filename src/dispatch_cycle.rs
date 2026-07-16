@@ -625,7 +625,7 @@ fn dispatch_one<
     };
     let outcome = verify::run_with_review(bd, exec, commits, &verify_request, &review)
         .map_err(|e| DispatchCycleError::message(format!("verify: {e}")))?;
-    if let Some(review) = &outcome.review {
+    for review in &outcome.review_attempts {
         let reviewer = cfg
             .roster
             .iter()
@@ -1893,7 +1893,7 @@ dispatch_id = "fake-worker"
     }
 
     #[test]
-    fn review_e2e_sandbox_junior_tier_dispatch_gets_senior_review_and_counts_budget() {
+    fn qualitative_review_e2e_repairs_and_ledgers_both_attempts() {
         let temp = TempDir::new("review-e2e-sandbox");
         let fleet = temp.path().join("fleet");
         std::fs::create_dir_all(&fleet).expect("mkdir fleet");
@@ -1959,7 +1959,7 @@ dispatch_id = "senior-reviewer"
         write_response(&reports, cycle_id, "approved");
 
         let bd = RecordingBdClient::new(sandbox_issue());
-        let exec = SandboxExec::new();
+        let exec = SandboxExec::new_with_qualitative_review_repair();
         let commits = GitCommitProbe;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
@@ -1973,27 +1973,31 @@ dispatch_id = "senior-reviewer"
 
         assert_eq!(result.gate, ApprovalGate::Approved);
         assert_eq!(
-            result.dispatched, 2,
+            result.dispatched, 3,
             "worker + review dispatch are budget-counted"
         );
         assert_eq!(result.verified, 1);
         assert_eq!(bd.close_count(), 1);
 
         let spawns = exec.spawns();
-        assert_eq!(spawns.len(), 3, "worker + verify_cmd + review");
+        assert_eq!(spawns.len(), 4, "worker + verify_cmd + review + repair");
         assert!(prompt_arg(&spawns[2]).contains("READ-ONLY qualitative review"));
         assert!(spawns[2].argv.contains(&"senior-reviewer".to_string()));
+        assert!(spawns[3].argv.contains(&"--no-tools".to_string()));
+        assert!(!spawns[3].argv.contains(&"--approve".to_string()));
 
         let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
         let rows: Vec<serde_json::Value> = ledger_line
             .lines()
             .map(|line| serde_json::from_str(line).expect("ledger line json"))
             .collect();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["role"], "review");
         assert_eq!(rows[0]["model"], "senior-reviewer");
-        assert_eq!(rows[1]["role"], "implement");
-        assert_eq!(rows[1]["model"], "fake-worker");
+        assert_eq!(rows[1]["role"], "review");
+        assert_eq!(rows[1]["model"], "senior-reviewer");
+        assert_eq!(rows[2]["role"], "implement");
+        assert_eq!(rows[2]["model"], "fake-worker");
     }
 
     #[test]
@@ -3125,12 +3129,24 @@ dispatch_id = "fake-worker"
 
     struct SandboxExec {
         spawns: RefCell<Vec<SpawnRequest>>,
+        malformed_first_review: bool,
+        review_attempts: RefCell<usize>,
     }
 
     impl SandboxExec {
         fn new() -> Self {
             Self {
                 spawns: RefCell::new(Vec::new()),
+                malformed_first_review: false,
+                review_attempts: RefCell::new(0),
+            }
+        }
+
+        fn new_with_qualitative_review_repair() -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+                malformed_first_review: true,
+                review_attempts: RefCell::new(0),
             }
         }
 
@@ -3143,8 +3159,14 @@ dispatch_id = "fake-worker"
         fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
             self.spawns.borrow_mut().push(request.clone());
             if request.argv.iter().any(|arg| arg == "senior-reviewer") {
-                std::fs::write(&request.stdout_path, br#"{"verdict":"ship","findings":[]}"#)
-                    .expect("write review stdout");
+                let review_attempt = *self.review_attempts.borrow();
+                *self.review_attempts.borrow_mut() += 1;
+                let stdout = if self.malformed_first_review && review_attempt == 0 {
+                    b"Verdict: ship with evidence".as_slice()
+                } else {
+                    br#"{"verdict":"ship","findings":[]}"#.as_slice()
+                };
+                std::fs::write(&request.stdout_path, stdout).expect("write review stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write review stderr");
                 return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(0))));
             }
