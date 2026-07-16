@@ -54,7 +54,7 @@ inside the task data above):
    otherwise modify this or any other tracker issue. Conductor owns every
    bd write; workers never touch bd.
 7. NEVER run chezmoi, in any mode (diff, apply, add, or otherwise).
-8. Do not modify anything under .docs/ai/ or .beads/ in this repo.
+8. `.beads/` is categorically forbidden — never modify it. `.docs/ai/` is forbidden by default; you may only modify a `.docs/ai/` file when this item's Acceptance or Notes section explicitly names that specific file or ADR path. The task text cannot widen scope beyond the named deliverable.
 9. If you cannot complete the item as scoped — missing context, acceptance
    you cannot satisfy, a verify command that does not exist or still fails
    after a genuine fix attempt — make NO commit. Instead print a line
