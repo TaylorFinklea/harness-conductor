@@ -644,12 +644,14 @@ fn dispatch_one<
     let before_head = match commits.head(&repo_path) {
         Ok(head) => head,
         Err(error) => {
-            run_artifacts
-                .finish("failed_before_dispatch")
-                .map_err(run_artifact_error)?;
-            return Err(DispatchCycleError::message(format!(
-                "git head before worker: {error}"
-            )));
+            return Err(finish_and_release_claim(
+                bd,
+                &repo_path,
+                &item.issue_id,
+                &mut run_artifacts,
+                "failed_before_dispatch",
+                DispatchCycleError::message(format!("git head before worker: {error}")),
+            ));
         }
     };
     let worker_step = format!("worker {}/{}", item.repo, item.issue_id);
@@ -747,13 +749,17 @@ fn dispatch_one<
         format!("verify {}/{}", item.repo, item.issue_id),
         progress,
     ) {
-        run_artifacts
-            .finish("report_update_error")
-            .map_err(run_artifact_error)?;
-        return Err(error);
+        return Err(finish_and_release_claim(
+            bd,
+            &repo_path,
+            &item.issue_id,
+            &mut run_artifacts,
+            "report_update_error",
+            error,
+        ));
     }
     let verify_request = VerifyRequest {
-        repo: repo_path,
+        repo: repo_path.clone(),
         state_dir: state_dir.to_path_buf(),
         cycle_id: cycle_id.to_string(),
         issue: claimed.clone(),
@@ -771,10 +777,14 @@ fn dispatch_one<
     let mechanical = match verify::run_mechanical(bd, exec, commits, &verify_request) {
         Ok(outcome) => outcome,
         Err(error) => {
-            run_artifacts
-                .finish("verify_error")
-                .map_err(run_artifact_error)?;
-            return Err(DispatchCycleError::message(format!("verify: {error}")));
+            return Err(finish_and_release_claim(
+                bd,
+                &repo_path,
+                &item.issue_id,
+                &mut run_artifacts,
+                "verify_error",
+                DispatchCycleError::message(format!("verify: {error}")),
+            ));
         }
     };
     let worker_commit = match mechanical {
@@ -805,32 +815,81 @@ fn dispatch_one<
             });
         }
     };
-    let post_verify_head = commits
-        .head(&verify_request.repo)
-        .map_err(|error| DispatchCycleError::message(format!("git head after verify: {error}")))?;
+    let post_verify_head = match commits.head(&verify_request.repo) {
+        Ok(head) => head,
+        Err(error) => {
+            return Err(finish_and_release_claim(
+                bd,
+                &repo_path,
+                &item.issue_id,
+                &mut run_artifacts,
+                "post_verify_error",
+                DispatchCycleError::message(format!("git head after verify: {error}")),
+            ));
+        }
+    };
     if post_verify_head.as_deref() != Some(worker_commit.as_str()) {
-        return Err(DispatchCycleError::message(
-            "worker commit changed during mechanical verification",
+        return Err(finish_and_release_claim(
+            bd,
+            &repo_path,
+            &item.issue_id,
+            &mut run_artifacts,
+            "post_verify_error",
+            DispatchCycleError::message("worker commit changed during mechanical verification"),
         ));
     }
-    if !commits
-        .is_clean(&verify_request.repo)
-        .map_err(|error| DispatchCycleError::message(format!("git status after verify: {error}")))?
-    {
-        return Err(DispatchCycleError::message(
-            "repository is dirty after mechanical verification",
+    let is_clean = match commits.is_clean(&verify_request.repo) {
+        Ok(is_clean) => is_clean,
+        Err(error) => {
+            return Err(finish_and_release_claim(
+                bd,
+                &repo_path,
+                &item.issue_id,
+                &mut run_artifacts,
+                "post_verify_error",
+                DispatchCycleError::message(format!("git status after verify: {error}")),
+            ));
+        }
+    };
+    if !is_clean {
+        return Err(finish_and_release_claim(
+            bd,
+            &repo_path,
+            &item.issue_id,
+            &mut run_artifacts,
+            "post_verify_error",
+            DispatchCycleError::message("repository is dirty after mechanical verification"),
         ));
     }
     let verifier_refs =
-        capture_mechanical_logs(&run_artifacts, state_dir, cycle_id, &item.issue_id)?;
-    run_artifacts
-        .checkpoint_pending_review(
-            &active_roster.name,
-            &worker_commit,
-            &extracted.verify_cmd,
-            verifier_refs,
-        )
-        .map_err(run_artifact_error)?;
+        match capture_mechanical_logs(&run_artifacts, state_dir, cycle_id, &item.issue_id) {
+            Ok(refs) => refs,
+            Err(error) => {
+                return Err(finish_and_release_claim(
+                    bd,
+                    &repo_path,
+                    &item.issue_id,
+                    &mut run_artifacts,
+                    "post_verify_error",
+                    error,
+                ));
+            }
+        };
+    if let Err(error) = run_artifacts.checkpoint_pending_review(
+        &active_roster.name,
+        &worker_commit,
+        &extracted.verify_cmd,
+        verifier_refs,
+    ) {
+        return Err(finish_and_release_claim(
+            bd,
+            &repo_path,
+            &item.issue_id,
+            &mut run_artifacts,
+            "checkpoint_error",
+            run_artifact_error(error),
+        ));
+    }
     if interrupt_before_review(options) {
         return Err(DispatchCycleError::message(
             "simulated process interruption before qualitative review",
@@ -1765,6 +1824,21 @@ fn sanitize_artifact_piece(value: &str) -> String {
 
 fn run_artifact_error(error: crate::run::RunError) -> DispatchCycleError {
     DispatchCycleError::message(format!("run artifact: {}", error.into_message()))
+}
+
+fn finish_and_release_claim<B: BdClient + ?Sized>(
+    bd: &B,
+    repo_path: &Path,
+    issue_id: &str,
+    run_artifacts: &mut RunHandle,
+    outcome: &str,
+    error: DispatchCycleError,
+) -> DispatchCycleError {
+    let finish_error = run_artifacts.finish(outcome).err().map(run_artifact_error);
+    let release_error = bd.release(repo_path, issue_id).err().map(|error| {
+        DispatchCycleError::message(format!("claim release after dispatch failure: {error}"))
+    });
+    finish_error.or(release_error).unwrap_or(error)
 }
 
 fn is_metered_worker_backend(backend: Backend) -> bool {
@@ -3105,6 +3179,8 @@ dispatch_id = "fake-worker"
         assert_eq!(result.verified, 1);
         assert_eq!(result.failed, 1);
         assert_eq!(bd.close_count(), 1);
+        assert_eq!(bd.release_count(), 1);
+        assert_eq!(bd.show(&first_repo, "sandbox-1").unwrap().status, "open");
         assert!(report.contains("\"status\": \"done\""));
         assert!(report.contains("DISPATCH_ERROR"));
         assert!(report.contains("first-repo/sandbox-1"));
