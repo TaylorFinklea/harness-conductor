@@ -565,9 +565,12 @@ fn parse_lease_pid(contents: &str) -> Option<u32> {
 /// crate forbids `unsafe`, so a direct `kill(2)` syscall is not an option).
 /// A failed probe (the `kill` binary itself missing, e.g.) is treated as
 /// "cannot prove death" and returns `true` — reclaim only ever fires on a
-/// confirmed-dead holder, never on an inconclusive probe.
+/// confirmed-dead holder, never on an inconclusive probe. Shared with
+/// `dispatch_cycle`'s stale-claim reclaim so both recovery paths authenticate
+/// a dead owner the same, single way rather than each growing its own
+/// weaker liveness check.
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     match Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
@@ -582,7 +585,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
+pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
 
@@ -1263,6 +1266,7 @@ mod tests {
                     cycle_id: "cycle-1".to_string(),
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("b".repeat(40)),
+                    owner_pid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -1659,6 +1663,7 @@ mod tests {
                     cycle_id: "cycle-legacy".to_string(),
                     authorization_sha256: "a".repeat(64),
                     before_head: before_head.map(str::to_string),
+                    owner_pid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -1699,6 +1704,7 @@ mod tests {
                     cycle_id: "cycle-legacy".to_string(),
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("d".repeat(40)),
+                    owner_pid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -1748,6 +1754,7 @@ mod tests {
                     cycle_id: "cycle-running".to_string(),
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("c".repeat(40)),
+                    owner_pid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,

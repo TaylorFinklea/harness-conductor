@@ -151,6 +151,15 @@ pub(crate) struct WorkState {
     /// not as a match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) before_head: Option<String>,
+    /// pid of the `conductor` process that created this run, recorded once
+    /// at creation and never mutated — the same OS process drives worker
+    /// dispatch, mechanical verification, and qualitative review for a run's
+    /// entire lifetime, so this single value authenticates ownership across
+    /// all of those stages. Absent on manifests written before this field
+    /// existed; recovery logic must treat that absence as weaker evidence,
+    /// not as proof of death (mirrors `before_head`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -421,6 +430,12 @@ impl RunHandle {
 
     pub(crate) fn manifest(&self) -> &RunManifest {
         &self.manifest
+    }
+
+    /// The pid recorded at creation for this run's owning `conductor`
+    /// process, if any (see [`WorkState::owner_pid`]).
+    pub(crate) fn owner_pid(&self) -> Option<u32> {
+        self.work().and_then(|work| work.owner_pid)
     }
 
     pub(crate) fn work(&self) -> Option<&WorkState> {
@@ -757,6 +772,65 @@ pub(crate) fn find_implementing_work_run(
     bead: &str,
 ) -> Result<Option<String>> {
     find_work_run_at_stage(state_dir, cycle_id, repo, bead, WorkStage::Implementing)
+}
+
+/// Finds the single work run — at any stage, finished or not — for an exact
+/// approved cycle/repository/Bead identity. Under correct operation at most
+/// one such run can exist at a time: a fresh run can only be claimed after
+/// its predecessor's bd claim was released, and this module never releases a
+/// claim before durably finishing the run that held it. `dispatch --resume`
+/// uses this as the single, unambiguous target for a stale-claim reclaim
+/// decision — including the crash-recovery case where a prior reclaim
+/// finished the run but crashed before releasing the bd claim — so it never
+/// has to guess which of several runs is current. Finding more than one is
+/// an invariant violation and fails closed rather than picking one.
+pub(crate) fn find_work_run_for_target(
+    state_dir: &Path,
+    cycle_id: &str,
+    repo: &str,
+    bead: &str,
+) -> Result<Option<String>> {
+    let root = runs_dir(state_dir);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RunError::new(format!(
+                "failed to read runs dir {}: {error}",
+                root.display()
+            )));
+        }
+    };
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            RunError::new(format!("failed to read run directory entry: {error}"))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| RunError::new(format!("failed to stat run entry: {error}")))?
+            .is_dir()
+        {
+            continue;
+        }
+        let manifest = read_manifest(&entry.path().join("manifest.json"))?;
+        let Some(work) = manifest.work.as_ref() else {
+            continue;
+        };
+        if manifest.job == RunJob::Work
+            && work.cycle_id == cycle_id
+            && manifest.target.repo == repo
+            && manifest.target.bead.as_deref() == Some(bead)
+        {
+            matches.push(manifest.run_id);
+        }
+    }
+    if matches.len() > 1 {
+        return Err(RunError::new(format!(
+            "multiple work runs found for {cycle_id} {repo}/{bead}"
+        )));
+    }
+    Ok(matches.pop())
 }
 
 fn find_work_run_at_stage(
@@ -1511,6 +1585,7 @@ mod tests {
             cycle_id: "cycle-20260717-015903".to_string(),
             authorization_sha256: "b".repeat(64),
             before_head: Some("d".repeat(40)),
+            owner_pid: None,
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -1810,6 +1885,7 @@ mod tests {
                 cycle_id: cycle_id.to_string(),
                 authorization_sha256: "b".repeat(64),
                 before_head: None,
+                owner_pid: None,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,

@@ -25,8 +25,8 @@ use crate::plan::{
 };
 use crate::quarantine;
 use crate::run::{
-    EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier, WorkStage,
-    WorkState,
+    EventInput, EventKind, NewRun, RunHandle, RunJob, RunLifecycle, RunLimits, RunTarget,
+    RunVerifier, WorkStage, WorkState,
 };
 use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
@@ -575,6 +575,7 @@ fn dispatch_one<
         let reclaimed = if options.resume {
             reclaim_stale_claim(
                 bd,
+                commits,
                 state_dir,
                 cycle_id,
                 &repo_path,
@@ -1725,6 +1726,7 @@ fn create_work_run(
                 cycle_id: cycle_id.to_string(),
                 authorization_sha256: item.authorization_sha256.clone(),
                 before_head: before_head.map(str::to_string),
+                owner_pid: Some(std::process::id()),
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -2097,24 +2099,49 @@ fn finish_and_release_claim<B: BdClient + ?Sized>(
     finish_error.or(release_error).unwrap_or(error)
 }
 
-/// A work run's heartbeat must go quiet for this long before its bd claim is
-/// considered abandoned rather than merely slow. Production heartbeat ticks
-/// happen every [`DEFAULT_HEARTBEAT_INTERVAL`] (5s) for as long as the
-/// worker's owning `conductor` process is alive, so a much longer silence is
-/// strong evidence that process died (e.g. `kill -9`) without releasing its
-/// claim.
+/// A work run's heartbeat must go quiet for at least this long before its bd
+/// claim is even considered for reclaim. This is a minimum-quiescence grace
+/// window, not the primary safety signal — proof of death is
+/// [`quarantine::process_alive`] on the run's recorded [`WorkState::owner_pid`],
+/// which stays accurate through worker execution, mechanical verification,
+/// and qualitative review regardless of how long any single stage takes
+/// (heartbeat ticks only happen during worker execution).
 const STALE_CLAIM_THRESHOLD: ChronoDuration = ChronoDuration::seconds(60);
 
-/// Reclaims a bd claim stranded by a `conductor` process that died
-/// mid-worker: a claimed-but-not-open issue with no matching pending-review
-/// run (that path is handled separately by [`resume_pending_review`]) is only
-/// recoverable when its Implementing-stage work run's heartbeat has gone
-/// silent past [`STALE_CLAIM_THRESHOLD`]. Only ever consulted when the
-/// operator explicitly passes `dispatch --resume`, never on a plain dispatch
-/// — so a legitimately in-flight worker is never torn out from under a
-/// concurrent, healthy invocation.
-fn reclaim_stale_claim<B: BdClient + ?Sized>(
+/// Reclaims a bd claim stranded by a `conductor` process that died: a
+/// claimed-but-not-open issue with no matching pending-review run (that path
+/// is handled separately by [`resume_pending_review`]) is only recoverable
+/// when every one of the following holds:
+///
+/// - the issue is exactly `in_progress` and assigned to `conductor` (never a
+///   closed or otherwise foreign claim);
+/// - the target's one work run (see [`find_work_run_for_target`]) has gone
+///   heartbeat-silent past [`STALE_CLAIM_THRESHOLD`] *and* its recorded
+///   owner pid is provably dead — a live owner (mid-worker, mid mechanical
+///   verify, mid orchestra review, or merely paused) is never reclaimed no
+///   matter how stale its heartbeat looks;
+/// - the repository HEAD still equals the run's `before_head` exactly and
+///   the tree is clean — any committed, dirty, missing-head, or foreign
+///   state fails closed instead of silently adopting unreviewed work.
+///
+/// The whole decision runs under a repo-scoped [`quarantine::RepoLease`] so
+/// two concurrent `--resume` invocations can never race the same reap.
+/// Finishing the run happens before releasing the bd claim (mirroring
+/// [`finish_and_release_claim`]) so a crash between the two never leaves
+/// more than one unfinished work run for the same target: a later resume
+/// finds the already-finished run via [`find_work_run_for_target`] and
+/// safely retries only the release.
+///
+/// Only ever consulted when the operator explicitly passes `dispatch
+/// --resume`, never on a plain dispatch — so a legitimately in-flight
+/// worker is never torn out from under a concurrent, healthy invocation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reclaim decision needs the full identity+state context to authenticate ownership"
+)]
+fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
     bd: &B,
+    commits: &C,
     state_dir: &Path,
     cycle_id: &str,
     repo_path: &Path,
@@ -2122,34 +2149,109 @@ fn reclaim_stale_claim<B: BdClient + ?Sized>(
     issue_id: &str,
     current: &Issue,
 ) -> std::result::Result<Option<Issue>, DispatchCycleError> {
-    if current.assignee.as_deref() != Some("conductor") {
+    if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
         return Ok(None);
     }
+    // Serializes concurrent `--resume` attempts against this repo: a second
+    // invocation racing the same reap sees the lease held by our (still
+    // live) pid and fails closed rather than double-finishing the run.
+    let Ok(lease) = quarantine::RepoLease::acquire(state_dir, canonical_repo, issue_id) else {
+        return Ok(None);
+    };
+
     let Some(run_id) =
-        crate::run::find_implementing_work_run(state_dir, cycle_id, canonical_repo, issue_id)
+        crate::run::find_work_run_for_target(state_dir, cycle_id, canonical_repo, issue_id)
             .map_err(run_artifact_error)?
     else {
         return Ok(None);
     };
     let mut run_artifacts = RunHandle::open(state_dir, &run_id).map_err(run_artifact_error)?;
+
+    if run_artifacts.manifest().lifecycle == RunLifecycle::Finished {
+        // A prior reclaim already finished this run but crashed before its
+        // bd release completed. `find_work_run_for_target` proves this is
+        // the only run for this target, so nothing has superseded it —
+        // retrying just the release is safe without re-deriving liveness.
+        let reopened = bd.release(repo_path, issue_id).map_err(|error| {
+            DispatchCycleError::message(format!("stale-claim reclaim release retry: {error}"))
+        })?;
+        let _ = bd.comment(
+            repo_path,
+            issue_id,
+            &format!(
+                "conductor: {cycle_id} {issue_id} dispatch --resume completed a stale-claim \
+                 release left over from a crash after run {run_id} finished but before its bd \
+                 claim was released"
+            ),
+        );
+        drop(lease);
+        return Ok(Some(reopened));
+    }
+    let Some(work) = run_artifacts.work().cloned() else {
+        return Ok(None);
+    };
+    if work.stage != WorkStage::Implementing {
+        // PendingReview is handled by `resume_pending_review` before this
+        // function is ever reached; anything else is unexpected, so refuse
+        // rather than guess.
+        return Ok(None);
+    }
+
     let last_seen = run_artifacts.last_seen().map_err(run_artifact_error)?;
     if Utc::now().signed_duration_since(last_seen) < STALE_CLAIM_THRESHOLD {
         return Ok(None);
     }
-    let reopened = bd.release(repo_path, issue_id).map_err(|error| {
-        DispatchCycleError::message(format!("stale-claim reclaim release: {error}"))
-    })?;
+    let Some(owner_pid) = work.owner_pid else {
+        // No recorded owner (predates this field): cannot prove death, so
+        // this is weaker evidence, not a match — refuse automatic reclaim.
+        return Ok(None);
+    };
+    if quarantine::process_alive(owner_pid) {
+        return Ok(None);
+    }
+
+    let Some(expected_head) = work.before_head.as_deref() else {
+        // No recorded before_head (predates that field): same "weaker
+        // evidence, not a match" rule `authenticate_legacy_adoption` already
+        // applies to legacy dirty-tree adoption.
+        return Ok(None);
+    };
+    let current_head = commits
+        .head(repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("resume git head: {error}")))?;
+    let is_clean = commits
+        .is_clean(repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("resume git status: {error}")))?;
+    if current_head.as_deref() != Some(expected_head) || !is_clean {
+        let _ = bd.comment(
+            repo_path,
+            issue_id,
+            &format!(
+                "conductor: {cycle_id} {issue_id} dispatch --resume found a dead owner (pid \
+                 {owner_pid}) but the repository has moved past run {run_id}'s before_head \
+                 ({expected_head}) or is dirty; refusing to adopt unreviewed state, manual \
+                 recovery required"
+            ),
+        );
+        return Ok(None);
+    }
+
     run_artifacts
         .finish("stale_claim_reaped")
         .map_err(run_artifact_error)?;
+    let reopened = bd.release(repo_path, issue_id).map_err(|error| {
+        DispatchCycleError::message(format!("stale-claim reclaim release: {error}"))
+    })?;
     let _ = bd.comment(
         repo_path,
         issue_id,
         &format!(
-            "conductor: {cycle_id} {issue_id} dispatch --resume reclaimed a stale claim \
-             (no heartbeat since {last_seen}); issue reopened for a fresh attempt"
+            "conductor: {cycle_id} {issue_id} dispatch --resume reclaimed a stale claim from \
+             confirmed-dead pid {owner_pid} (no heartbeat since {last_seen}); issue reopened for \
+             a fresh attempt"
         ),
     );
+    drop(lease);
     Ok(Some(reopened))
 }
 
@@ -4077,7 +4179,12 @@ dispatch_id = "senior-reviewer"
     /// mirrors what `create_work_run` writes before the first worker attempt,
     /// standing in for a run stranded by a `conductor` process that died
     /// mid-worker before ever reaching the pending-review checkpoint.
-    fn implementing_run_request(cycle_id: &str, canonical_repo: String) -> NewRun {
+    fn implementing_run_request(
+        cycle_id: &str,
+        canonical_repo: String,
+        before_head: Option<&str>,
+        owner_pid: Option<u32>,
+    ) -> NewRun {
         NewRun {
             target: RunTarget {
                 repo: canonical_repo,
@@ -4096,7 +4203,8 @@ dispatch_id = "senior-reviewer"
             work: Some(WorkState {
                 cycle_id: cycle_id.to_string(),
                 authorization_sha256: "a".repeat(64),
-                before_head: None,
+                before_head: before_head.map(str::to_string),
+                owner_pid,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -4104,6 +4212,22 @@ dispatch_id = "senior-reviewer"
             }),
             approval: Some(serde_json::json!({"schema": "test/approval@1"})),
         }
+    }
+
+    /// Spawns and immediately reaps a short-lived process, returning its pid
+    /// — a pid that is provably no longer running, for tests that simulate a
+    /// `conductor` process killed mid-run (mirrors the same recipe already
+    /// used by `quarantine::repo_lease_reclaims_a_stale_holder_whose_process_is_confirmed_dead`).
+    fn spawn_dead_pid() -> u32 {
+        let mut dead = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = dead.id();
+        dead.wait().expect("reap short-lived process");
+        pid
     }
 
     #[test]
@@ -4124,11 +4248,22 @@ dispatch_id = "senior-reviewer"
         // `kill -9 mid-worker`: the run never advances past `Implementing`
         // and its heartbeat (here, the manifest's own `created_at`/
         // `updated_at`, since no worker attempt ever ticked one) is well
-        // past `STALE_CLAIM_THRESHOLD`.
+        // past `STALE_CLAIM_THRESHOLD`. The repo hasn't moved since, and the
+        // recorded owner pid is provably dead, so this is the one case that
+        // must reclaim.
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
         RunHandle::create_at(
             &fixture.state,
             RunJob::Work,
-            implementing_run_request(&fixture.cycle_id, canonical_repo),
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+            ),
             Utc::now() - ChronoDuration::seconds(120),
         )
         .expect("simulate a run stranded mid-worker by a killed conductor process");
@@ -4175,7 +4310,7 @@ dispatch_id = "senior-reviewer"
         RunHandle::create_at(
             &fixture.state,
             RunJob::Work,
-            implementing_run_request(&fixture.cycle_id, canonical_repo),
+            implementing_run_request(&fixture.cycle_id, canonical_repo, None, None),
             Utc::now(),
         )
         .expect("simulate a run whose heartbeat is still fresh");
@@ -4192,6 +4327,367 @@ dispatch_id = "senior-reviewer"
         );
         assert_eq!(fixture.bd.release_count(), 0);
         assert_eq!(exec.worker_spawns(), 0);
+    }
+
+    #[test]
+    fn resume_reclaims_using_an_explicit_stale_heartbeat_file_with_a_dead_owner() {
+        let fixture = ResumeFixture::new("stale-heartbeat-file");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        // Created "now" (a fresh manifest `updated_at`) but with an explicit
+        // heartbeat file written well in the past — proves the heartbeat
+        // *file* itself (ticked during worker execution), not just the
+        // manifest fallback, is what gates staleness.
+        let run_artifacts = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+            ),
+            Utc::now(),
+        )
+        .expect("simulate a run with at least one prior heartbeat tick");
+        std::fs::write(
+            run_artifacts.dir().join("heartbeat"),
+            (Utc::now() - ChronoDuration::seconds(120)).to_rfc3339(),
+        )
+        .expect("write a stale heartbeat file directly");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume reclaims via the explicit stale heartbeat file");
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(resumed.verified, 1);
+    }
+
+    #[test]
+    fn resume_refuses_a_stale_heartbeat_when_the_owner_pid_is_still_alive() {
+        let fixture = ResumeFixture::new("live-owner-stale-heartbeat");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate an active dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        // A long mechanical verifier or orchestra review can run well past
+        // `STALE_CLAIM_THRESHOLD` without a single heartbeat tick (those
+        // only ever happen during worker execution) even though the owning
+        // `conductor` process — this very test process — is still alive.
+        RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(std::process::id()),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run mid heartbeat-silent verification with a live owner");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error when the owner is still alive");
+        assert_eq!(
+            resumed.dispatched, 0,
+            "a live owner must never be reclaimed no matter how stale its heartbeat looks"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+    }
+
+    #[test]
+    fn resume_never_reopens_a_closed_bead_even_with_a_stale_implementing_run() {
+        let fixture = ResumeFixture::new("closed-bead");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        fixture
+            .bd
+            .close(
+                &fixture.repo,
+                "sandbox-1",
+                "closed by a human before resume ran",
+            )
+            .expect("simulate the bead being closed out-of-band");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a stale Implementing run left over from before the close");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error on a closed bead");
+        assert_eq!(resumed.dispatched, 0, "a closed bead must never reopen");
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+        assert_eq!(
+            fixture
+                .bd
+                .show(&fixture.repo, "sandbox-1")
+                .expect("show")
+                .status,
+            "closed"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_when_the_repository_has_moved_past_before_head_even_if_clean() {
+        let fixture = ResumeFixture::new("moved-head");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run stranded before its own commit landed");
+
+        // The crashed worker's own commit lands (or a wholly unrelated one
+        // does) after the stranding but before resume runs, leaving a
+        // perfectly clean tree that has simply moved past `before_head`.
+        std::fs::write(fixture.repo.join("unreviewed.txt"), b"unreviewed\n").expect("write file");
+        git(&fixture.repo, &["add", "unreviewed.txt"]);
+        git(
+            &fixture.repo,
+            &["commit", "-m", "unreviewed commit made after crash"],
+        );
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error on a moved HEAD");
+        assert_eq!(
+            resumed.dispatched, 0,
+            "an unreviewed commit must never be silently adopted as the new base"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+    }
+
+    #[test]
+    fn resume_refuses_a_dirty_tree_even_with_a_dead_owner() {
+        let fixture = ResumeFixture::new("dirty-tree");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run stranded with an uncommitted leftover");
+        std::fs::write(fixture.repo.join("scratch.tmp"), b"dirty\n").expect("write file");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error on a dirty tree");
+        assert_eq!(
+            resumed.dispatched, 0,
+            "a dirty tree must never be silently adopted, even with a confirmed-dead owner"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+    }
+
+    #[test]
+    fn resume_refuses_when_another_resume_already_holds_the_repo_lease() {
+        let fixture = ResumeFixture::new("concurrent-resume");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo.clone(),
+                Some(&before_head),
+                Some(dead_pid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a stale Implementing run a concurrent resume is also evaluating");
+
+        // Simulates a concurrent `dispatch --resume` invocation already
+        // mid-reap for this exact repo: it holds the repo-scoped lease under
+        // its own (very much alive) pid.
+        let _held =
+            quarantine::RepoLease::acquire(&fixture.state, &canonical_repo, "concurrent-resume-a")
+                .expect("simulate a concurrent resume attempt holding the repo lease");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("a lease conflict must fail closed, not error the whole cycle");
+        assert_eq!(resumed.dispatched, 0);
+        assert_eq!(
+            fixture.bd.release_count(),
+            0,
+            "the losing side of a concurrent resume must never touch the claim"
+        );
+        assert_eq!(exec.worker_spawns(), 0);
+    }
+
+    #[test]
+    fn resume_retries_only_the_release_when_a_prior_reclaim_finished_but_did_not_release() {
+        let fixture = ResumeFixture::new("release-wedge");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        let mut run_artifacts = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run a prior reclaim attempt already decided to reap");
+        // Simulates a crash between finishing the run and releasing its bd
+        // claim: the run is durably `Finished`, but the bead is still
+        // claimed — `find_work_run_for_target` proves it is the only run for
+        // this target, so retrying just the release is safe.
+        run_artifacts
+            .finish("stale_claim_reaped")
+            .expect("finish the run as a prior reclaim attempt would have");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume completes the stranded release and redispatches fresh");
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(resumed.verified, 1);
+        assert_eq!(fixture.bd.close_count(), 1);
     }
 
     #[test]
@@ -4632,6 +5128,7 @@ provider = "codex"
                     cycle_id: "cycle-legacy-original".to_string(),
                     authorization_sha256: "a".repeat(64),
                     before_head: None,
+                    owner_pid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -4896,6 +5393,7 @@ dispatch_id = "fake-worker"
                     cycle_id: "cycle-legacy-original".to_string(),
                     authorization_sha256: "a".repeat(64),
                     before_head: None,
+                    owner_pid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
