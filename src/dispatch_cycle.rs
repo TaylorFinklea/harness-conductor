@@ -45,15 +45,17 @@ pub(crate) enum ApprovalGate {
 pub(crate) struct DispatchCycleOptions {
     item_timeout: Duration,
     heartbeat_interval: Duration,
+    resume: bool,
     #[cfg(test)]
     interrupt_before_review: bool,
 }
 
 impl DispatchCycleOptions {
-    pub(crate) fn from_config(cfg: &Config) -> Self {
+    pub(crate) fn from_config(cfg: &Config, resume: bool) -> Self {
         Self {
             item_timeout: Duration::from_secs(u64::from(cfg.budgets.item_wall_clock_mins) * 60),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            resume,
             #[cfg(test)]
             interrupt_before_review: false,
         }
@@ -64,6 +66,7 @@ impl DispatchCycleOptions {
         Self {
             item_timeout: Duration::from_secs(30),
             heartbeat_interval,
+            resume: false,
             interrupt_before_review: false,
         }
     }
@@ -71,6 +74,12 @@ impl DispatchCycleOptions {
     #[cfg(test)]
     pub(crate) const fn interrupt_before_review(mut self) -> Self {
         self.interrupt_before_review = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn resume(mut self) -> Self {
+        self.resume = true;
         self
     }
 }
@@ -527,7 +536,7 @@ fn dispatch_one<
             DispatchCycleError::message(format!("plan references unknown model {}", item.model))
         })?;
 
-    let current = match bd.show(&repo_path, &item.issue_id) {
+    let mut current = match bd.show(&repo_path, &item.issue_id) {
         Ok(issue) => issue,
         Err(error) => {
             record_replan_required(report_path, item, &format!("bd show failed: {error}"))?;
@@ -563,11 +572,28 @@ fn dispatch_one<
         );
     }
     if current.status != "open" {
-        record_replan_required(report_path, item, "issue is no longer open")?;
-        return Ok(DispatchOneResult {
-            decision: None,
-            dispatches: 0,
-        });
+        let reclaimed = if options.resume {
+            reclaim_stale_claim(
+                bd,
+                state_dir,
+                cycle_id,
+                &repo_path,
+                &canonical_repo,
+                &item.issue_id,
+                &current,
+            )?
+        } else {
+            None
+        };
+        if let Some(reopened) = reclaimed {
+            current = reopened;
+        } else {
+            record_replan_required(report_path, item, "issue is no longer open")?;
+            return Ok(DispatchOneResult {
+                decision: None,
+                dispatches: 0,
+            });
+        }
     }
     let ready = match bd.ready(&repo_path) {
         Ok(issues) => issues,
@@ -1437,6 +1463,9 @@ where
             options.item_timeout,
             options.heartbeat_interval,
             |_elapsed| {
+                run_artifacts
+                    .touch_heartbeat()
+                    .map_err(|error| dispatch::DispatchError::new(error.into_message()))?;
                 let bounded = duration_millis_u64(cycle_start.elapsed());
                 let live_update = LiveUpdate::new(timestamp())
                     .with_step(worker_step.to_string())
@@ -2066,6 +2095,62 @@ fn finish_and_release_claim<B: BdClient + ?Sized>(
         DispatchCycleError::message(format!("claim release after dispatch failure: {error}"))
     });
     finish_error.or(release_error).unwrap_or(error)
+}
+
+/// A work run's heartbeat must go quiet for this long before its bd claim is
+/// considered abandoned rather than merely slow. Production heartbeat ticks
+/// happen every [`DEFAULT_HEARTBEAT_INTERVAL`] (5s) for as long as the
+/// worker's owning `conductor` process is alive, so a much longer silence is
+/// strong evidence that process died (e.g. `kill -9`) without releasing its
+/// claim.
+const STALE_CLAIM_THRESHOLD: ChronoDuration = ChronoDuration::seconds(60);
+
+/// Reclaims a bd claim stranded by a `conductor` process that died
+/// mid-worker: a claimed-but-not-open issue with no matching pending-review
+/// run (that path is handled separately by [`resume_pending_review`]) is only
+/// recoverable when its Implementing-stage work run's heartbeat has gone
+/// silent past [`STALE_CLAIM_THRESHOLD`]. Only ever consulted when the
+/// operator explicitly passes `dispatch --resume`, never on a plain dispatch
+/// — so a legitimately in-flight worker is never torn out from under a
+/// concurrent, healthy invocation.
+fn reclaim_stale_claim<B: BdClient + ?Sized>(
+    bd: &B,
+    state_dir: &Path,
+    cycle_id: &str,
+    repo_path: &Path,
+    canonical_repo: &str,
+    issue_id: &str,
+    current: &Issue,
+) -> std::result::Result<Option<Issue>, DispatchCycleError> {
+    if current.assignee.as_deref() != Some("conductor") {
+        return Ok(None);
+    }
+    let Some(run_id) =
+        crate::run::find_implementing_work_run(state_dir, cycle_id, canonical_repo, issue_id)
+            .map_err(run_artifact_error)?
+    else {
+        return Ok(None);
+    };
+    let mut run_artifacts = RunHandle::open(state_dir, &run_id).map_err(run_artifact_error)?;
+    let last_seen = run_artifacts.last_seen().map_err(run_artifact_error)?;
+    if Utc::now().signed_duration_since(last_seen) < STALE_CLAIM_THRESHOLD {
+        return Ok(None);
+    }
+    let reopened = bd.release(repo_path, issue_id).map_err(|error| {
+        DispatchCycleError::message(format!("stale-claim reclaim release: {error}"))
+    })?;
+    run_artifacts
+        .finish("stale_claim_reaped")
+        .map_err(run_artifact_error)?;
+    let _ = bd.comment(
+        repo_path,
+        issue_id,
+        &format!(
+            "conductor: {cycle_id} {issue_id} dispatch --resume reclaimed a stale claim \
+             (no heartbeat since {last_seen}); issue reopened for a fresh attempt"
+        ),
+    );
+    Ok(Some(reopened))
 }
 
 fn is_metered_worker_backend(backend: Backend) -> bool {
@@ -3986,6 +4071,127 @@ dispatch_id = "senior-reviewer"
         assert_eq!(result.failed, 1);
         assert_eq!(exec.review_spawns(), 0);
         assert_eq!(fixture.bd.close_count(), 0);
+    }
+
+    /// A `conductor/run@1` Work run pinned at the `Implementing` checkpoint —
+    /// mirrors what `create_work_run` writes before the first worker attempt,
+    /// standing in for a run stranded by a `conductor` process that died
+    /// mid-worker before ever reaching the pending-review checkpoint.
+    fn implementing_run_request(cycle_id: &str, canonical_repo: String) -> NewRun {
+        NewRun {
+            target: RunTarget {
+                repo: canonical_repo,
+                bead: Some("sandbox-1".to_string()),
+            },
+            approved_profiles: vec!["fake-worker".to_string()],
+            bursar_roster_artifact: None,
+            limits: RunLimits {
+                item_wall_clock_mins: Some(1),
+                max_attempts: Some(1),
+            },
+            verifier: RunVerifier {
+                mechanical: Some("test -f worker.txt".to_string()),
+                qualitative: Some("tiered-qualitative-review:min_tier_gap=1".to_string()),
+            },
+            work: Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "a".repeat(64),
+                before_head: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+            }),
+            approval: Some(serde_json::json!({"schema": "test/approval@1"})),
+        }
+    }
+
+    #[test]
+    fn resume_reclaims_a_stale_implementing_claim_and_retries_fresh() {
+        let fixture = ResumeFixture::new("stale-claim");
+        let exec = PendingReviewExec::ship_immediately();
+
+        let claimed = fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        assert_eq!(claimed.status, "in_progress");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        // `kill -9 mid-worker`: the run never advances past `Implementing`
+        // and its heartbeat (here, the manifest's own `created_at`/
+        // `updated_at`, since no worker attempt ever ticked one) is well
+        // past `STALE_CLAIM_THRESHOLD`.
+        RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(&fixture.cycle_id, canonical_repo),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run stranded mid-worker by a killed conductor process");
+
+        let plain = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("plain dispatch does not error on a stranded claim");
+        assert_eq!(
+            plain.dispatched, 0,
+            "a plain dispatch must never reclaim a claim on its own"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume reclaims the stale claim and redispatches");
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(resumed.verified, 1);
+        assert_eq!(fixture.bd.close_count(), 1);
+    }
+
+    #[test]
+    fn resume_leaves_a_fresh_implementing_claim_untouched() {
+        let fixture = ResumeFixture::new("fresh-claim");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate an active dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(&fixture.cycle_id, canonical_repo),
+            Utc::now(),
+        )
+        .expect("simulate a run whose heartbeat is still fresh");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error when a claim is still fresh");
+        assert_eq!(
+            resumed.dispatched, 0,
+            "a fresh (non-stale) claim must never be reclaimed, even under --resume"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
     }
 
     #[test]

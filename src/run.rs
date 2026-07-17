@@ -646,6 +646,29 @@ impl RunHandle {
         )
     }
 
+    /// Touches this run's heartbeat file, recording that the `conductor`
+    /// process driving it is still alive. Read back by
+    /// [`find_implementing_work_run`] staleness checks so a `dispatch
+    /// --resume` invocation can tell an actively-running worker from one
+    /// whose owning process died (e.g. `kill -9`) without releasing its bd
+    /// claim.
+    pub(crate) fn touch_heartbeat(&self) -> Result<()> {
+        atomic_replace(
+            &heartbeat_path(&self.dir),
+            Utc::now().to_rfc3339().as_bytes(),
+        )
+    }
+
+    /// Returns this run's last observed sign of life: its heartbeat file if
+    /// one has been recorded, otherwise the manifest's `updated_at` (the
+    /// process may have died before its first heartbeat tick).
+    pub(crate) fn last_seen(&self) -> Result<DateTime<Utc>> {
+        if let Some(heartbeat) = read_heartbeat(&self.dir)? {
+            return Ok(heartbeat);
+        }
+        parse_rfc3339(&self.manifest.updated_at, "run updated_at")
+    }
+
     fn write_approval(&self, approval: &serde_json::Value) -> Result<ArtifactRef> {
         let mut bytes = serde_json::to_vec_pretty(approval)
             .map_err(|error| RunError::new(format!("failed to serialize approval: {error}")))?;
@@ -666,6 +689,28 @@ impl RunHandle {
 /// Returns `<state_dir>/runs`.
 pub(crate) fn runs_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("runs")
+}
+
+fn heartbeat_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("heartbeat")
+}
+
+/// Reads a run's heartbeat file, if one has been recorded.
+pub(crate) fn read_heartbeat(run_dir: &Path) -> Result<Option<DateTime<Utc>>> {
+    match std::fs::read_to_string(heartbeat_path(run_dir)) {
+        Ok(contents) => Ok(Some(parse_rfc3339(contents.trim(), "heartbeat")?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RunError::new(format!(
+            "failed to read heartbeat {}: {error}",
+            heartbeat_path(run_dir).display()
+        ))),
+    }
+}
+
+fn parse_rfc3339(value: &str, label: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|error| RunError::new(format!("malformed {label} timestamp {value:?}: {error}")))
 }
 
 /// Reads and validates `manifest.json`, rejecting an unknown schema before
@@ -699,6 +744,28 @@ pub(crate) fn find_pending_work_run(
     repo: &str,
     bead: &str,
 ) -> Result<Option<String>> {
+    find_work_run_at_stage(state_dir, cycle_id, repo, bead, WorkStage::PendingReview)
+}
+
+/// Finds the one unfinished work run still mid-implementation for an exact
+/// approved cycle/repository/Bead identity — a stale-claim reclaim candidate
+/// for `dispatch --resume` when its heartbeat has gone quiet.
+pub(crate) fn find_implementing_work_run(
+    state_dir: &Path,
+    cycle_id: &str,
+    repo: &str,
+    bead: &str,
+) -> Result<Option<String>> {
+    find_work_run_at_stage(state_dir, cycle_id, repo, bead, WorkStage::Implementing)
+}
+
+fn find_work_run_at_stage(
+    state_dir: &Path,
+    cycle_id: &str,
+    repo: &str,
+    bead: &str,
+    stage: WorkStage,
+) -> Result<Option<String>> {
     let root = runs_dir(state_dir);
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -728,7 +795,7 @@ pub(crate) fn find_pending_work_run(
         };
         if manifest.job == RunJob::Work
             && manifest.lifecycle != RunLifecycle::Finished
-            && work.stage == WorkStage::PendingReview
+            && work.stage == stage
             && work.cycle_id == cycle_id
             && manifest.target.repo == repo
             && manifest.target.bead.as_deref() == Some(bead)
@@ -738,7 +805,7 @@ pub(crate) fn find_pending_work_run(
     }
     if matches.len() > 1 {
         return Err(RunError::new(format!(
-            "multiple pending-review runs found for {cycle_id} {repo}/{bead}"
+            "multiple {stage:?} runs found for {cycle_id} {repo}/{bead}"
         )));
     }
     Ok(matches.pop())
@@ -1697,6 +1764,88 @@ mod tests {
         assert_ne!(id_one, id_two);
         assert!(runs_dir(temp.path()).join(id_one).is_dir());
         assert!(runs_dir(temp.path()).join(id_two).is_dir());
+    }
+
+    #[test]
+    fn run_event_touch_heartbeat_is_read_back_and_wins_over_manifest_updated_at() {
+        let temp = TempDir::new("heartbeat");
+        let handle =
+            RunHandle::create_at(temp.path(), RunJob::Work, new_run_request(), fixed_now())
+                .expect("create run");
+
+        assert_eq!(
+            read_heartbeat(handle.dir()).expect("no heartbeat yet"),
+            None
+        );
+        assert_eq!(
+            handle.last_seen().expect("falls back to manifest"),
+            fixed_now()
+        );
+
+        // touch_heartbeat always stamps Utc::now(); overwrite the file
+        // directly afterward so the assertion below is exact rather than
+        // merely "close to now".
+        handle
+            .touch_heartbeat()
+            .expect("touch heartbeat writes a timestamp");
+        let touched_at: DateTime<Utc> = "2026-07-17T00:00:00Z".parse().expect("fixed heartbeat");
+        std::fs::write(handle.dir().join("heartbeat"), touched_at.to_rfc3339())
+            .expect("pin heartbeat");
+
+        assert_eq!(
+            read_heartbeat(handle.dir()).expect("heartbeat reads back"),
+            Some(touched_at)
+        );
+        assert_eq!(handle.last_seen().expect("heartbeat wins"), touched_at);
+    }
+
+    #[test]
+    fn run_event_find_implementing_work_run_ignores_finished_runs() {
+        let temp = TempDir::new("find-implementing");
+        let cycle_id = "cycle-resume-20260717";
+        let make_request = |bead: &str| {
+            let mut request = new_run_request();
+            request.target.bead = Some(bead.to_string());
+            request.work = Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "b".repeat(64),
+                before_head: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+            });
+            request
+        };
+
+        let implementing = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            make_request("impl-bead"),
+            fixed_now(),
+        )
+        .expect("create implementing run");
+
+        let mut finished = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            make_request("finished-bead"),
+            fixed_now(),
+        )
+        .expect("create finished run");
+        finished.finish("stale_claim_reaped").expect("finish run");
+
+        assert_eq!(
+            find_implementing_work_run(temp.path(), cycle_id, "/repo/conductor", "impl-bead")
+                .expect("lookup implementing"),
+            Some(implementing.run_id().to_string())
+        );
+        assert_eq!(
+            find_implementing_work_run(temp.path(), cycle_id, "/repo/conductor", "finished-bead")
+                .expect("lookup finished bead"),
+            None,
+            "a finished implementing-stage run must never be reclaimable"
+        );
     }
 
     fn event_values(path: &Path) -> Vec<serde_json::Value> {

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::config;
 
-const USAGE: &str = "usage: conductor [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
+const USAGE: &str = "usage: conductor [--version] [adversarial-review plan --artifact <path> --reviewers <N> [--question <text>] [--models <a,b,...>] [--config <path>]] [adversarial-review dispatch <review-id> [--config <path>]] [config check [--config <path>]] [roster drift [--config <path>]] [route explain --repo <path> --tier-floor <lead|senior|junior> --complexity <S|M|L|XL> [--intent <cheap-work|outside-perspective>] [--json] [--config <path>]] [scan [--json] [--config <path>]] [status] [cycle --dry-run [--repo <name|path>]... [--only <repo>:<issue-id>]... [--config <path>]] [dispatch <cycle-id> [--resume] [--config <path>]] [arena run --repo <repo|path> --bead <id> [--profiles a,b|all] [--parallel N] [--no-apply] [--config <path>]]";
 
 const DEFAULT_ADVERSARIAL_QUESTION: &str =
     "What are the highest-risk flaws in this artifact, and what must change before proceeding?";
@@ -1434,10 +1434,11 @@ fn run_cycle(it: &mut std::vec::IntoIter<String>) -> ExitCode {
 
 fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     let Some(cycle_id) = it.next() else {
-        eprintln!("usage: conductor dispatch <cycle-id> [--config <path>]");
+        eprintln!("usage: conductor dispatch <cycle-id> [--resume] [--config <path>]");
         return ExitCode::from(2);
     };
     let mut config_path = PathBuf::from("conductor.toml");
+    let mut resume = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--config" => {
@@ -1446,6 +1447,9 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 config_path = PathBuf::from(p);
+            }
+            "--resume" => {
+                resume = true;
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -1467,7 +1471,7 @@ fn run_dispatch(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     let exec = crate::dispatch::CommandExec;
     let commits = crate::dispatch::GitCommitProbe;
     let live = crate::dispatch_cycle::DeckLiveSink;
-    let options = crate::dispatch_cycle::DispatchCycleOptions::from_config(&cfg);
+    let options = crate::dispatch_cycle::DispatchCycleOptions::from_config(&cfg, resume);
     match crate::dispatch_cycle::run_dispatch_cycle(
         &cfg,
         &bd,
@@ -1532,6 +1536,12 @@ fn print_help() {
     println!("  adversarial-review dispatch exits 0 only for complete validated synthesis.");
     println!("  arena run applies the winning patch by default; pass --no-apply to opt out.");
     println!("  cycle --dry-run still writes a report file even though it makes no bd writes.");
+    println!(
+        "  dispatch --resume reclaims a bd claim stranded by a crashed conductor process (e.g."
+    );
+    println!(
+        "    kill -9 mid-worker) once its run's heartbeat has gone stale, then retries the item."
+    );
 }
 
 #[cfg(test)]
