@@ -472,22 +472,28 @@ impl Exec for CommandExec {
                 request.stderr_path.display()
             ))
         })?;
-        let child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .current_dir(&request.cwd)
             .stdin(match request.stdin {
                 StdinMode::Null => Stdio::null(),
             })
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .map_err(|e| {
-                DispatchError::new(format!(
-                    "failed to spawn `{}` in {}: {e}",
-                    request.argv.join(" "),
-                    request.cwd.display()
-                ))
-            })?;
+            .stderr(Stdio::from(stderr));
+        // Make the worker the leader of its own process group so a timeout
+        // can terminate every descendant it spawned, not just the direct
+        // child — otherwise a grandchild process can keep writing to the
+        // repository after Conductor has already declared the tree state
+        // and moved on to quarantine capture or a clean check.
+        set_own_process_group(&mut command);
+        let child = command.spawn().map_err(|e| {
+            DispatchError::new(format!(
+                "failed to spawn `{}` in {}: {e}",
+                request.argv.join(" "),
+                request.cwd.display()
+            ))
+        })?;
         Ok(Box::new(CommandChild { child }))
     }
 }
@@ -516,13 +522,19 @@ impl ChildProcess for CommandChild {
     }
 
     fn terminate(&mut self) -> Result<()> {
-        send_sigterm(self.child.id())
+        send_signal_to_group(self.child.id(), "-TERM")
     }
 
     fn kill(&mut self) -> Result<()> {
-        self.child
+        let result = self
+            .child
             .kill()
-            .map_err(|e| DispatchError::new(format!("failed to kill child: {e}")))
+            .map_err(|e| DispatchError::new(format!("failed to kill child: {e}")));
+        // Best-effort: the direct child is authoritative for this call's
+        // result (matches prior behavior exactly), but any descendants that
+        // outlived it in the same process group must die too.
+        let _ = send_signal_to_group(self.child.id(), "-KILL");
+        result
     }
 
     fn wait(&mut self) -> Result<ProcessStatus> {
@@ -533,21 +545,39 @@ impl ChildProcess for CommandChild {
     }
 }
 
+/// Spawns the child as the leader of its own process group (`setpgid(0, 0)`
+/// under the hood) so `-pid` addresses the whole group, not just this one
+/// process. A safe, stable API — no `unsafe` `pre_exec` needed.
 #[cfg(unix)]
-fn send_sigterm(pid: u32) -> Result<()> {
+fn set_own_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn set_own_process_group(_command: &mut Command) {}
+
+/// Sends `signal` (e.g. `"-TERM"`, `"-KILL"`) to the process *group* led by
+/// `pid` — a negative pid in POSIX `kill(2)` targets the whole group — so
+/// every descendant the worker spawned is reached, not just the direct
+/// child. Requires the child to have been spawned via
+/// [`set_own_process_group`]; harmless (targets an empty/nonexistent group)
+/// otherwise.
+#[cfg(unix)]
+fn send_signal_to_group(pid: u32, signal: &str) -> Result<()> {
     let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
+        .arg(signal)
+        .arg(format!("-{pid}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|e| DispatchError::new(format!("failed to spawn kill -TERM {pid}: {e}")))?;
+        .map_err(|e| DispatchError::new(format!("failed to spawn kill {signal} -{pid}: {e}")))?;
     if status.success() {
         Ok(())
     } else {
         Err(DispatchError::new(format!(
-            "kill -TERM {pid} failed with status {}",
+            "kill {signal} -{pid} failed with status {}",
             status
                 .code()
                 .map_or_else(|| "signal".to_string(), |code| code.to_string())
@@ -556,9 +586,9 @@ fn send_sigterm(pid: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn send_sigterm(_pid: u32) -> Result<()> {
+fn send_signal_to_group(_pid: u32, _signal: &str) -> Result<()> {
     Err(DispatchError::new(
-        "SIGTERM timeout handling is only implemented on Unix",
+        "process-group signal handling is only implemented on Unix",
     ))
 }
 
@@ -1120,6 +1150,85 @@ mod tests {
 
         fn is_clean(&self, _repo: &Path) -> Result<bool> {
             Ok(true)
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_exec_kill_terminates_descendant_processes_in_the_group() {
+        // A worker CLI can fork children of its own (subshells, tool
+        // invocations); if the timeout path only kills the direct child, a
+        // grandchild can outlive it and keep writing to the repository
+        // after Conductor has already declared the tree state. Spawning the
+        // worker as the leader of its own process group and signaling
+        // `-pid` on timeout must reach every descendant, not just the one
+        // process std::process::Child knows about directly.
+        let temp = TempDir::new("process-group-kill");
+        let marker = temp.path().join("grandchild.pid");
+        let request = SpawnRequest {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > {}; wait", marker.display()),
+            ],
+            cwd: temp.path().to_path_buf(),
+            stdin: StdinMode::Null,
+            stdout_path: temp.path().join("out.log"),
+            stderr_path: temp.path().join("err.log"),
+        };
+
+        let exec = CommandExec;
+        let mut child = exec.spawn(&request).expect("spawn worker shell");
+        let grandchild_pid = wait_for_pid_marker(&marker);
+        assert!(
+            process_alive(grandchild_pid),
+            "precondition: grandchild must actually be running before we try to kill it"
+        );
+
+        child.kill().expect("kill direct child");
+        let _ = child.wait();
+
+        assert!(
+            !process_alive(grandchild_pid),
+            "grandchild process must not survive killing the process group"
+        );
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_marker(marker: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(marker) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "grandchild never wrote its pid");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Polls briefly since signal delivery/reaping is not synchronous with
+    /// the `kill` call returning.
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn kill -0 probe");
+            if !status.success() {
+                return false;
+            }
+            if Instant::now() >= deadline {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }

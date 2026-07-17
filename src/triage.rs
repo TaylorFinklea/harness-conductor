@@ -558,6 +558,7 @@ mod tests {
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
             cycle_wall_clock_mins: 90,
+            authorized_legacy_run_ids: Vec::new(),
         }
     }
 

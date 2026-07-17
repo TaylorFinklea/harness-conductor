@@ -608,11 +608,17 @@ fn dispatch_one<
     } else {
         match quarantine::most_recent_failed_run(state_dir, &canonical_repo, &item.issue_id) {
             Ok(Some(run)) => {
+                let operator_authorized_run_id = cfg
+                    .budgets
+                    .authorized_legacy_run_ids
+                    .iter()
+                    .find(|candidate| candidate.as_str() == run.run_id)
+                    .map(String::as_str);
                 match quarantine::authenticate_legacy_adoption(
                     commits,
-                    &quarantine::GitRepoRecovery,
                     &repo_path,
                     &run,
+                    operator_authorized_run_id,
                 ) {
                     Ok(head) => Some(head),
                     Err(error) => {
@@ -722,8 +728,10 @@ fn dispatch_one<
     };
 
     if legacy_adopt_head.is_some() {
-        match quarantine::quarantine_dirty_attempt(
+        match quarantine::quarantine_dirty_attempt_with_lease(
             &repo_path,
+            &canonical_repo,
+            state_dir,
             commits,
             &quarantine::GitRepoRecovery,
             &run_artifacts,
@@ -1308,6 +1316,11 @@ where
     let mut attempts = 0_u64;
     let mut deferred = Vec::new();
     let mut cautious_providers = BTreeSet::new();
+    // Carries the most recent non-empty quarantine capture forward to every
+    // later attempt's prompt (path + hash only, never patch content) so a
+    // fallback or legacy retry worker knows prior partial work exists as a
+    // run artifact, even though its own working tree always starts clean.
+    let mut prior_capture: Option<quarantine::QuarantineCapture> = None;
     for (idx, roster) in chain.iter().enumerate() {
         if let Some(rejection) =
             triage::candidate_rejection(roster, &fields.routing, repo_cost_policy)
@@ -1385,7 +1398,7 @@ where
             backend: roster.backend,
             dispatch_id: roster.dispatch_id.clone(),
             reasoning_effort: roster.reasoning_effort,
-            prompt: prompt.to_string(),
+            prompt: attempt_prompt_with_capture_note(prompt, prior_capture.as_ref()),
         };
         let result = dispatch::run_with_heartbeat(
             exec,
@@ -1441,8 +1454,11 @@ where
                 "{attempts:03}-{}-quarantine",
                 sanitize_artifact_piece(&roster.name)
             );
-            match quarantine::quarantine_dirty_attempt(
+            let canonical_repo = run_artifacts.manifest().target.repo.clone();
+            match quarantine::quarantine_dirty_attempt_with_lease(
                 repo_path,
+                &canonical_repo,
+                state_dir,
                 commits,
                 &quarantine::GitRepoRecovery,
                 run_artifacts,
@@ -1454,6 +1470,9 @@ where
                         artifact_refs.push(artifact);
                     }
                     outcome_label = format!("{outcome_label}; {}", capture.summary());
+                    if !capture.is_noop() {
+                        prior_capture = Some(capture);
+                    }
                 }
                 Err(error) => {
                     run_artifacts
@@ -1972,6 +1991,28 @@ fn sanitize_artifact_piece(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Appends a bounded, path-and-hash-only note to `prompt` when an earlier
+/// attempt in this same worker chain left a quarantined patch behind, so a
+/// fallback or legacy-retry worker knows that evidence exists as a run
+/// artifact even though its own working tree always starts clean. Never
+/// includes patch content — only what `capture.summary()`-style metadata
+/// already exposes in run events.
+fn attempt_prompt_with_capture_note(
+    prompt: &str,
+    prior_capture: Option<&quarantine::QuarantineCapture>,
+) -> String {
+    let Some(artifact) = prior_capture.and_then(|capture| capture.artifact.as_ref()) else {
+        return prompt.to_string();
+    };
+    format!(
+        "{prompt}\n\n---\nNote: an earlier attempt in this run left uncommitted changes. They \
+         were captured and the working tree was restored to a clean state before this attempt \
+         started. The captured patch is available as a run artifact at `{}` (sha256 `{}`) for \
+         context if useful — you are starting from a clean tree and are not required to use it.",
+        artifact.path, artifact.sha256,
+    )
 }
 
 fn run_artifact_error(error: crate::run::RunError) -> DispatchCycleError {
@@ -4167,6 +4208,10 @@ dispatch_id = "fake-worker"
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end fallback fixture keeps its config and artifact-reuse assertions inline"
+    )]
     fn fallback_attempt_starts_clean_after_quarantining_a_retryable_worker_failure() {
         let temp = TempDir::new("fallback-dirty-sandbox");
         let fleet = temp.path().join("fleet");
@@ -4266,6 +4311,43 @@ provider = "codex"
         assert!(events_text.contains("quarantined 2 path(s)"));
         assert!(!events_text.contains("primary partial"));
         assert!(!events_text.contains("stray"));
+
+        // The primary attempt's quarantined artifact path must be handed to
+        // the fallback worker's own prompt (bounded metadata only — never
+        // patch content), not merely archived and forgotten. Recover the
+        // exact artifact path from the manifest so this assertion doesn't
+        // hardcode a filename that only the implementation knows.
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run_dir.join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        let artifact_path = manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .filter_map(|artifact| artifact["path"].as_str())
+            .find(|path| {
+                std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("patch"))
+            })
+            .expect("captured quarantine patch artifact path");
+        let spawns = exec.spawns();
+        let fallback_spawn = spawns
+            .iter()
+            .find(|request| request.argv.iter().any(|arg| arg == "fallback-worker"))
+            .expect("fallback worker was spawned");
+        assert!(
+            fallback_spawn
+                .argv
+                .iter()
+                .any(|arg| arg.contains(artifact_path)),
+            "fallback worker's prompt must reference the primary attempt's captured artifact"
+        );
+        assert!(
+            !fallback_spawn.argv.iter().any(|arg| arg.contains("primary partial")),
+            "the prompt note must carry the artifact reference, never raw patch content"
+        );
     }
 
     #[test]
@@ -4284,38 +4366,6 @@ provider = "codex"
             .to_str()
             .expect("utf8 repo")
             .to_string();
-
-        let cfg = config::parse_str(&format!(
-            r#"[scan]
-root = "{}"
-
-[budgets]
-max_dispatches_per_cycle = 8
-max_active_per_repo = 1
-max_external_dispatches = 8
-use_bursar = false
-item_wall_clock_mins = 1
-cycle_wall_clock_mins = 1
-
-[verify]
-judge = "opencode-go/qwen3.7-max"
-always_orchestra = false
-
-[review]
-enabled = false
-min_tier_gap = 1
-
-[[roster]]
-name = "fake-worker"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "fake-worker"
-"#,
-            fleet.display()
-        ))
-        .expect("config parses");
 
         let state = temp.path().join("state");
         let reports = temp.path().join("reports");
@@ -4355,6 +4405,45 @@ dispatch_id = "fake-worker"
         let stranded_run_id = stranded_run.run_id().to_string();
         stranded_run.finish("failed").expect("finish stranded run");
         drop(stranded_run);
+
+        // The stranded run predates `before_head` capture, so automatic
+        // adoption has no HEAD proof to authenticate against. An operator
+        // who has manually reviewed this exact incident names its run_id
+        // here — a deliberate, per-run acknowledgment, not a blanket policy
+        // switch — matching how the real bursar-467 incident was recovered.
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+authorized_legacy_run_ids = ["{}"]
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+"#,
+            fleet.display(),
+            stranded_run_id
+        ))
+        .expect("config parses");
 
         std::fs::write(repo.join("README.md"), b"sandbox\nstranded partial edit\n")
             .expect("dirty tracked file");
@@ -4444,6 +4533,149 @@ dispatch_id = "fake-worker"
         assert!(!manifest_text.contains("stranded partial edit"));
         assert!(!events_text.contains("stranded partial edit"));
         assert!(!events_text.contains("stray from stranded run"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end unauthorized-legacy-adoption fixture keeps its config and manual run manifest inline"
+    )]
+    fn dispatch_refuses_before_head_less_legacy_run_without_operator_authorization() {
+        // Same bursar-467-shaped stranded run as the adoption test above,
+        // but this time nobody has authorized it in
+        // `budgets.authorized_legacy_run_ids`. Prior evidence existing is
+        // not enough on its own — without a before_head to prove which
+        // commit the failed attempt started from, and without an operator
+        // naming this exact run_id, adoption must refuse and leave the
+        // tree exactly as it was.
+        let temp = TempDir::new("legacy-unauthorized-sandbox");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let canonical_repo = std::fs::canonicalize(&repo)
+            .expect("canonicalize repo")
+            .to_str()
+            .expect("utf8 repo")
+            .to_string();
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+
+        let stranded_created_at = Utc::now();
+        let mut stranded_run = RunHandle::create_at(
+            &state,
+            RunJob::Work,
+            NewRun {
+                target: RunTarget {
+                    repo: canonical_repo.clone(),
+                    bead: Some("sandbox-1".to_string()),
+                },
+                approved_profiles: vec!["fake-worker".to_string()],
+                bursar_roster_artifact: None,
+                limits: RunLimits::default(),
+                verifier: RunVerifier::default(),
+                work: Some(WorkState {
+                    cycle_id: "cycle-legacy-original".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: None,
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    stage: WorkStage::Implementing,
+                }),
+                approval: None,
+            },
+            stranded_created_at,
+        )
+        .expect("create stranded legacy run");
+        stranded_run.finish("failed").expect("finish stranded run");
+        drop(stranded_run);
+
+        std::fs::write(repo.join("README.md"), b"sandbox\nstranded partial edit\n")
+            .expect("dirty tracked file");
+        std::fs::write(repo.join("stranded-leftover.tmp"), b"stray from stranded run\n")
+            .expect("dirty untracked file");
+        let dirty_before = git(&repo, &["status", "--porcelain"]);
+        assert!(!dirty_before.is_empty());
+
+        let cycle_id = "cycle-legacy-retry";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = SandboxExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &commits,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("unauthorized legacy adoption is isolated to the item, not a hard cycle error");
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.verified, 0);
+        assert_eq!(bd.claim_count(), 0, "bead must never be claimed");
+        assert_eq!(git(&repo, &["status", "--porcelain"]), dirty_before);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).expect("read readme"),
+            "sandbox\nstranded partial edit\n"
+        );
+        assert!(repo.join("stranded-leftover.tmp").exists());
     }
 
     #[test]

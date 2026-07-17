@@ -329,6 +329,13 @@ pub(crate) struct Budgets {
     pub(crate) unknown_429_cooldown_mins: u32,
     pub(crate) item_wall_clock_mins: u32,
     pub(crate) cycle_wall_clock_mins: u32,
+    /// `run_id`s an operator has explicitly reviewed and approved for
+    /// one-time legacy dirty-repo adoption when the stranded run predates
+    /// `before_head` capture and therefore carries no durable proof of which
+    /// commit it started from. Empty by default: without a name on this
+    /// list, a before_head-less legacy run is never auto-adopted, only
+    /// flagged for manual recovery.
+    pub(crate) authorized_legacy_run_ids: Vec<String>,
 }
 
 impl Default for Budgets {
@@ -341,6 +348,7 @@ impl Default for Budgets {
             unknown_429_cooldown_mins: 15,
             item_wall_clock_mins: 45,
             cycle_wall_clock_mins: 90,
+            authorized_legacy_run_ids: Vec::new(),
         }
     }
 }
@@ -1106,6 +1114,10 @@ fn parse_budgets(node: Option<&Node>) -> Result<Budgets> {
             }
             "cycle_wall_clock_mins" => {
                 b.cycle_wall_clock_mins = expect_u32("budgets.cycle_wall_clock_mins", val)?;
+            }
+            "authorized_legacy_run_ids" => {
+                b.authorized_legacy_run_ids =
+                    expect_str_arr("budgets.authorized_legacy_run_ids", val)?;
             }
             other => return Err(ConfigError::new(format!("unknown budgets key: {other}"))),
         }
