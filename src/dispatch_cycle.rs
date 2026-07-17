@@ -1556,7 +1556,10 @@ struct RetryableFailure {
 fn retryable_failure_reason(
     result: &dispatch::DispatchResult,
 ) -> std::result::Result<Option<RetryableFailure>, DispatchCycleError> {
-    if !matches!(result.status, dispatch::DispatchStatus::Failed(_)) {
+    if !matches!(
+        result.status,
+        dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::ExitNonZero { .. })
+    ) {
         return Ok(None);
     }
     let stderr = std::fs::read_to_string(&result.stderr_path).map_err(|e| {
@@ -1580,46 +1583,84 @@ fn classify_retryable_failure(stderr: &str, now: DateTime<Utc>) -> Option<Retrya
 }
 
 fn classify_runtime_limit(stderr: &str) -> Option<RuntimeLimitReason> {
-    let stderr = stderr.to_ascii_lowercase();
-    if contains_contextual_429(&stderr) || stderr.contains("too many requests") {
-        Some(RuntimeLimitReason::Http429)
-    } else if stderr.contains("quota") {
-        Some(RuntimeLimitReason::QuotaExceeded)
-    } else if stderr.contains("rate_limit") || stderr.contains("rate limit") {
-        Some(RuntimeLimitReason::RateLimit)
-    } else {
-        None
-    }
+    stderr.lines().find_map(|line| {
+        if !is_trusted_provider_error_line(line) {
+            return None;
+        }
+        let line = line.to_ascii_lowercase();
+        if contains_contextual_429(&line) || line.contains("too many requests") {
+            Some(RuntimeLimitReason::Http429)
+        } else if line.contains("quota") {
+            Some(RuntimeLimitReason::QuotaExceeded)
+        } else if line.contains("rate_limit") || line.contains("rate limit") {
+            Some(RuntimeLimitReason::RateLimit)
+        } else {
+            None
+        }
+    })
 }
 
 fn extract_provider_reset(stderr: &str, now: DateTime<Utc>) -> Option<String> {
-    let lower = stderr.to_ascii_lowercase();
-    for marker in [
-        "\"reset_at\":\"",
-        "\"reset_at\": \"",
-        "reset_at=",
-        "reset_at: ",
-        "x-ratelimit-reset: ",
-    ] {
-        let Some(index) = lower.find(marker) else {
+    for line in stderr.lines() {
+        if !is_trusted_provider_error_line(line) {
             continue;
-        };
-        let value = stderr[index + marker.len()..]
-            .split(|character: char| {
-                character.is_whitespace()
-                    || matches!(character, '\"' | '\'' | ',' | '}' | ']' | ';')
-            })
-            .next()
-            .unwrap_or_default();
-        let Ok(reset) = DateTime::parse_from_rfc3339(value) else {
-            continue;
-        };
-        let reset = reset.with_timezone(&Utc);
-        if reset > now {
-            return Some(reset.to_rfc3339());
+        }
+        let lower = line.to_ascii_lowercase();
+        for marker in [
+            "\"reset_at\":\"",
+            "\"reset_at\": \"",
+            "reset_at=",
+            "reset_at: ",
+            "x-ratelimit-reset: ",
+        ] {
+            let Some(index) = lower.find(marker) else {
+                continue;
+            };
+            let value = line[index + marker.len()..]
+                .split(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, '\"' | '\'' | ',' | '}' | ']' | ';')
+                })
+                .next()
+                .unwrap_or_default();
+            let Ok(reset) = DateTime::parse_from_rfc3339(value) else {
+                continue;
+            };
+            let reset = reset.with_timezone(&Utc);
+            if reset > now && reset <= now + ChronoDuration::days(31) {
+                return Some(reset.to_rfc3339());
+            }
         }
     }
     None
+}
+
+fn is_trusted_provider_error_line(line: &str) -> bool {
+    let line = line.trim_start().to_ascii_lowercase();
+    [
+        "api ",
+        "api:",
+        "error ",
+        "error:",
+        "http ",
+        "http/",
+        "https ",
+        "https/",
+        "provider ",
+        "provider:",
+        "quota ",
+        "rate limit",
+        "rate_limit",
+        "response ",
+        "response:",
+        "status ",
+        "status:",
+        "too many requests",
+        "429 ",
+        "429{",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
 }
 
 fn runtime_observation(
@@ -2849,6 +2890,50 @@ dispatch_id = "fallback-worker"
         assert!(is_retryable_worker_stderr("provider returned rate limit"));
         assert!(!is_retryable_worker_stderr("panicked at src/foo.rs:429:10"));
         assert!(!is_retryable_worker_stderr("syntax error in worker prompt"));
+    }
+
+    #[test]
+    fn retryable_worker_stderr_classifier_rejects_repository_lookalikes() {
+        assert!(!is_retryable_worker_stderr(
+            "test runtime_quota_fixture ... ok\n"
+        ));
+        assert!(!is_retryable_worker_stderr(
+            "+ assert!(output.contains(\"quota exceeded\"));\n"
+        ));
+        assert!(!is_retryable_worker_stderr(
+            "cargo test output: HTTP 429 is covered by this test\n"
+        ));
+
+        let now = DateTime::parse_from_rfc3339("2026-07-13T10:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let failure = classify_retryable_failure(
+            "HTTP 429 quota exceeded reset_at=2100-01-01T00:00:00Z",
+            now,
+        )
+        .expect("genuine runtime limit");
+        assert_eq!(failure.reason, RuntimeLimitReason::Http429);
+        assert_eq!(failure.provider_reset, None);
+    }
+
+    #[test]
+    fn retryable_worker_failure_ignores_lookalikes_from_non_process_failures() {
+        let temp = TempDir::new("retryable-lookalike");
+        let stderr_path = temp.path().join("worker.err");
+        std::fs::write(
+            &stderr_path,
+            "+ assert!(output.contains(\"runtime quota exceeded\"));\n",
+        )
+        .expect("write stderr");
+        let result = dispatch::DispatchResult {
+            status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::NoNewCommit),
+            stdout_path: temp.path().join("worker.out"),
+            stderr_path,
+            stdout_bytes: 1,
+            stderr_bytes: 57,
+        };
+
+        assert_eq!(retryable_failure_reason(&result).expect("classify"), None);
     }
 
     #[test]
