@@ -273,7 +273,10 @@ impl RosterSnapshot {
             if provider.eligible
                 && (!provider.enabled
                     || provider.state != "healthy"
-                    || provider.availability != Availability::Healthy)
+                    || !matches!(
+                        provider.availability,
+                        Availability::Healthy | Availability::Caution
+                    ))
             {
                 return Err(BursarError::json(
                     "eligible bursar roster provider is disabled or unavailable",
@@ -1242,6 +1245,59 @@ mod tests {
         }
     }
 
+    fn provider_roster_snapshot_fixture(
+        provider_enabled: bool,
+        provider_state: &str,
+        availability: &str,
+    ) -> (std::path::PathBuf, String) {
+        let path = std::env::temp_dir().join(format!(
+            "conductor-bursar-roster-{provider_enabled}-{provider_state}-{availability}.toml"
+        ));
+        std::fs::write(&path, "fixture roster\n").expect("write fixture roster");
+        let bytes = std::fs::read(&path).expect("read fixture roster");
+        let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
+        let json = format!(
+            r#"{{
+  "schema": "bursar/roster@1",
+  "generated_at": "2026-07-17T12:00:00Z",
+  "artifact": {{"path": "{}", "sha256": "{}"}},
+  "providers": [{{
+    "provider_id": "anthropic",
+    "availability_key": "anthropic",
+    "enabled": {provider_enabled},
+    "state": "{provider_state}",
+    "availability": "{availability}",
+    "checked_at": "2026-07-17T12:00:00Z",
+    "data_as_of": "2026-07-17T11:59:00Z",
+    "expires_at": "2026-07-17T14:00:00Z",
+    "reason": "bounded manual allow",
+    "eligible": true,
+    "ineligibility_reason": null
+  }}],
+  "profiles": [{{
+    "profile_id": "anthropic--claude-code--claude-opus-4-8--none",
+    "provider_id": "anthropic",
+    "model": "claude-opus-4-8",
+    "harness": "claude-code",
+    "dispatch_id": "claude-opus-4-8",
+    "reasoning_effort": null,
+    "tier": "lead",
+    "ceiling": "XL",
+    "efficiency": "heavy",
+    "cost": 1.0,
+    "data_policy": "standard",
+    "enabled": true,
+    "state": "healthy",
+    "eligible": true,
+    "ineligibility_reason": null
+  }}]
+}}"#,
+            path.display(),
+            sha256
+        );
+        (path, json)
+    }
+
     #[test]
     fn roster_snapshot_preserves_profile_dispatch_identity() {
         let path = std::env::temp_dir().join("conductor-bursar-roster-snapshot.toml");
@@ -1304,6 +1360,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn roster_snapshot_accepts_eligible_caution_provider() {
+        let (path, json) = provider_roster_snapshot_fixture(true, "healthy", "caution");
+
+        let snapshot = parse_roster_snapshot(json.as_bytes())
+            .expect("eligible caution provider should be accepted");
+        assert!(snapshot.providers[0].eligible);
+        assert_eq!(snapshot.providers[0].availability, Availability::Caution);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn roster_snapshot_rejects_inconsistent_eligible_provider_states() {
+        for (enabled, state, availability) in [
+            (false, "healthy", "healthy"),
+            (true, "exhausted", "exhausted"),
+            (true, "unknown", "unknown"),
+            (true, "stale", "healthy"),
+            (true, "manually-disabled", "healthy"),
+        ] {
+            let (path, json) = provider_roster_snapshot_fixture(enabled, state, availability);
+            let error = parse_roster_snapshot(json.as_bytes())
+                .expect_err("inconsistent eligible provider must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "eligible bursar roster provider is disabled or unavailable"
+            );
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
