@@ -145,6 +145,12 @@ pub(crate) struct MechanicalVerification {
 pub(crate) struct WorkState {
     pub(crate) cycle_id: String,
     pub(crate) authorization_sha256: String,
+    /// HEAD recorded immediately before the first worker attempt. Absent on
+    /// manifests written before this field existed; recovery logic that
+    /// depends on an exact match must treat that absence as weaker evidence,
+    /// not as a match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) before_head: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -255,7 +261,10 @@ impl RunHandle {
         Self::create_at(state_dir, job, request, Utc::now())
     }
 
-    fn create_at(
+    /// Same as [`Self::create`] with an explicit clock, so callers that need
+    /// deterministic `created_at` ordering (e.g. legacy-run recovery tests)
+    /// do not have to depend on real wall-clock spacing between calls.
+    pub(crate) fn create_at(
         state_dir: &Path,
         job: RunJob,
         request: NewRun,
@@ -897,6 +906,9 @@ fn validate_work_manifest(path: &Path, manifest: &RunManifest) -> Result<()> {
     if let Some(commit) = work.worker_commit.as_deref() {
         validate_commit_id(commit)?;
     }
+    if let Some(head) = work.before_head.as_deref() {
+        validate_commit_id(head)?;
+    }
     if let Some(mechanical) = work.mechanical.as_ref() {
         if mechanical.command.trim().is_empty() {
             return Err(RunError::new("mechanical verification has empty command"));
@@ -1431,6 +1443,7 @@ mod tests {
         request.work = Some(WorkState {
             cycle_id: "cycle-20260717-015903".to_string(),
             authorization_sha256: "b".repeat(64),
+            before_head: Some("d".repeat(40)),
             worker_profile: None,
             worker_commit: None,
             mechanical: None,

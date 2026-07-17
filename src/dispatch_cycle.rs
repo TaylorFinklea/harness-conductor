@@ -23,6 +23,7 @@ use crate::plan::{
     ApprovalScope, ApprovalScopeKind, CyclePlan, ProviderRouteRecord, ScopeSelector,
     item_authorization_hash,
 };
+use crate::quarantine;
 use crate::run::{
     EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier, WorkStage,
     WorkState,
@@ -593,6 +594,67 @@ fn dispatch_one<
         });
     }
 
+    // Preflight: a repository must be proven clean before a worker is ever
+    // dispatched into it. A dirty tree here can only mean one authenticated
+    // thing — a prior Conductor run's uncommitted leftovers stranded by a
+    // failure that predates quarantine capture — or it is unauthenticated
+    // foreign state that must never be touched. Either way this check runs
+    // before the claim, so an unrecoverable dirty repo never gets claimed.
+    let repo_clean = commits
+        .is_clean(&repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("preflight git status: {error}")))?;
+    let legacy_adopt_head = if repo_clean {
+        None
+    } else {
+        match quarantine::most_recent_failed_run(state_dir, &canonical_repo, &item.issue_id) {
+            Ok(Some(run)) => {
+                match quarantine::authenticate_legacy_adoption(
+                    commits,
+                    &quarantine::GitRepoRecovery,
+                    &repo_path,
+                    &run,
+                ) {
+                    Ok(head) => Some(head),
+                    Err(error) => {
+                        record_replan_required(
+                            report_path,
+                            item,
+                            &format!(
+                                "repository is dirty but recovery could not be authenticated: {error}"
+                            ),
+                        )?;
+                        return Ok(DispatchOneResult {
+                            decision: None,
+                            dispatches: 0,
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                record_replan_required(
+                    report_path,
+                    item,
+                    "repository is dirty and no prior Conductor run evidence exists for this target",
+                )?;
+                return Ok(DispatchOneResult {
+                    decision: None,
+                    dispatches: 0,
+                });
+            }
+            Err(error) => {
+                record_replan_required(
+                    report_path,
+                    item,
+                    &format!("repository is dirty and could not be authenticated for recovery: {error}"),
+                )?;
+                return Ok(DispatchOneResult {
+                    decision: None,
+                    dispatches: 0,
+                });
+            }
+        }
+    };
+
     patch_live(
         live,
         report_path,
@@ -620,6 +682,24 @@ fn dispatch_one<
         }
     };
 
+    let before_head = match &legacy_adopt_head {
+        Some(head) => Some(head.clone()),
+        None => match commits.head(&repo_path) {
+            Ok(head) => head,
+            Err(error) => {
+                bd.release(&repo_path, &item.issue_id)
+                    .map_err(|release_error| {
+                        DispatchCycleError::message(format!(
+                            "git head before worker and claim release failed: {release_error}"
+                        ))
+                    })?;
+                return Err(DispatchCycleError::message(format!(
+                    "git head before worker: {error}"
+                )));
+            }
+        },
+    };
+
     let mut run_artifacts = match create_work_run(
         cfg,
         state_dir,
@@ -627,6 +707,7 @@ fn dispatch_one<
         item,
         &canonical_repo,
         &extracted.verify_cmd,
+        before_head.as_deref(),
     ) {
         Ok(run) => run,
         Err(error) => {
@@ -640,20 +721,43 @@ fn dispatch_one<
         }
     };
 
-    let prompt = render_worker_prompt(&claimed, &repo_path, &extracted.verify_cmd);
-    let before_head = match commits.head(&repo_path) {
-        Ok(head) => head,
-        Err(error) => {
-            return Err(finish_and_release_claim(
-                bd,
-                &repo_path,
-                &item.issue_id,
-                &mut run_artifacts,
-                "failed_before_dispatch",
-                DispatchCycleError::message(format!("git head before worker: {error}")),
-            ));
+    if legacy_adopt_head.is_some() {
+        match quarantine::quarantine_dirty_attempt(
+            &repo_path,
+            commits,
+            &quarantine::GitRepoRecovery,
+            &run_artifacts,
+            before_head.as_deref(),
+            "adopted-legacy",
+        ) {
+            Ok(capture) if !capture.is_noop() => {
+                let _ = bd.comment(
+                    &repo_path,
+                    &item.issue_id,
+                    &format!(
+                        "conductor: {cycle_id} {} adopted a stranded dirty repository from a prior failed run: {}",
+                        item.issue_id,
+                        capture.summary()
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(finish_and_release_claim(
+                    bd,
+                    &repo_path,
+                    &item.issue_id,
+                    &mut run_artifacts,
+                    "legacy_adopt_error",
+                    DispatchCycleError::message(format!(
+                        "legacy dirty repository recovery failed: {error}"
+                    )),
+                ));
+            }
         }
-    };
+    }
+
+    let prompt = render_worker_prompt(&claimed, &repo_path, &extracted.verify_cmd);
     let worker_step = format!("worker {}/{}", item.repo, item.issue_id);
     let worker_outcome = run_worker_chain(
         cfg,
@@ -676,6 +780,7 @@ fn dispatch_one<
         progress,
         bursar,
         &mut run_artifacts,
+        before_head.as_deref(),
     );
     let worker_outcome = match worker_outcome {
         Ok(outcome) => outcome,
@@ -1185,6 +1290,7 @@ fn run_worker_chain<E, C, L, U>(
     progress: Option<f64>,
     bursar_client: &U,
     run_artifacts: &mut RunHandle,
+    before_head: Option<&str>,
 ) -> std::result::Result<WorkerChainOutcome, DispatchCycleError>
 where
     E: Exec + ?Sized,
@@ -1322,15 +1428,59 @@ where
                 return Err(DispatchCycleError::message(error.to_string()));
             }
         };
-        let artifact_refs =
+        let mut artifact_refs =
             capture_dispatch_result(run_artifacts, attempts, &roster.name, &result)?;
+        let mut outcome_label = dispatch_status_label(&result.status);
+        // Any non-success attempt may have left tracked or untracked
+        // changes behind without an accepted commit. Quarantine those now,
+        // before deciding whether to fail over to the next roster entry or
+        // stop here, so every subsequent attempt — fallback or terminal —
+        // always starts from the exact clean state the chain began with.
+        if !matches!(result.status, dispatch::DispatchStatus::Success) {
+            let quarantine_label = format!(
+                "{attempts:03}-{}-quarantine",
+                sanitize_artifact_piece(&roster.name)
+            );
+            match quarantine::quarantine_dirty_attempt(
+                repo_path,
+                commits,
+                &quarantine::GitRepoRecovery,
+                run_artifacts,
+                before_head,
+                &quarantine_label,
+            ) {
+                Ok(capture) => {
+                    if let Some(artifact) = capture.artifact.clone() {
+                        artifact_refs.push(artifact);
+                    }
+                    outcome_label = format!("{outcome_label}; {}", capture.summary());
+                }
+                Err(error) => {
+                    run_artifacts
+                        .append_event(
+                            EventKind::AttemptFinished,
+                            EventInput {
+                                profile_id: Some(roster.name.clone()),
+                                artifact_refs,
+                                outcome: Some(format!(
+                                    "{outcome_label}; quarantine failed: {error}"
+                                )),
+                            },
+                        )
+                        .map_err(run_artifact_error)?;
+                    return Err(DispatchCycleError::message(format!(
+                        "quarantine after failed attempt: {error}"
+                    )));
+                }
+            }
+        }
         run_artifacts
             .append_event(
                 EventKind::AttemptFinished,
                 EventInput {
                     profile_id: Some(roster.name.clone()),
                     artifact_refs,
-                    outcome: Some(dispatch_status_label(&result.status)),
+                    outcome: Some(outcome_label),
                 },
             )
             .map_err(run_artifact_error)?;
@@ -1452,6 +1602,7 @@ fn create_work_run(
     item: &PlannedItem,
     canonical_repo: &str,
     verify_cmd: &str,
+    before_head: Option<&str>,
 ) -> std::result::Result<RunHandle, DispatchCycleError> {
     let route = item.approved_route.as_ref().ok_or_else(|| {
         DispatchCycleError::message("approved provider envelope is missing at run creation")
@@ -1496,6 +1647,7 @@ fn create_work_run(
             work: Some(WorkState {
                 cycle_id: cycle_id.to_string(),
                 authorization_sha256: item.authorization_sha256.clone(),
+                before_head: before_head.map(str::to_string),
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -3161,9 +3313,7 @@ dispatch_id = "fake-worker"
             &cfg,
             &bd,
             &exec,
-            &DirtyAfterVerifyCommitProbe {
-                dirty_repo: first_repo.clone(),
-            },
+            &DirtyAfterVerifyCommitProbe::new(first_repo.clone()),
             &reports,
             &state,
             &ledger,
@@ -3907,6 +4057,506 @@ provider = "codex"
         );
         assert_eq!(rows[3]["model"], "fallback-worker");
         assert_eq!(rows[3]["verify_passed"], true);
+    }
+
+    #[test]
+    fn worker_failure_without_commit_quarantines_dirty_tree_and_restores_clean_repo() {
+        let temp = TempDir::new("worker-failure-quarantine");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+        let cycle_id = "cycle-worker-failure";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = DirtyFailureExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &commits,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("worker failure is isolated to the item");
+
+        assert_eq!(result.failed, 1);
+        assert_eq!(
+            exec.spawns().len(),
+            1,
+            "no fallback available, one attempt only"
+        );
+        assert_eq!(bd.release_count(), 1);
+        assert_eq!(bd.show(&repo, "sandbox-1").unwrap().status, "open");
+
+        let status = git(&repo, &["status", "--porcelain"]);
+        assert!(status.is_empty(), "repo must be restored clean, found: {status}");
+
+        let run_dir = single_contract_run(&state);
+        let events_text = std::fs::read_to_string(run_dir.join("events.jsonl")).expect("events");
+        assert!(events_text.contains("quarantined 2 path(s)"));
+        assert!(!events_text.contains("untracked leftovers"));
+        assert!(!events_text.contains("partial edit"));
+
+        let artifacts_dir = run_dir.join("artifacts");
+        let patch_files: Vec<_> = std::fs::read_dir(&artifacts_dir)
+            .expect("artifacts dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("patch")))
+            .collect();
+        assert_eq!(patch_files.len(), 1, "exactly one quarantined patch artifact");
+        let patch_text = std::fs::read_to_string(patch_files[0].path()).expect("read patch");
+        assert!(patch_text.contains("untracked leftovers") || patch_text.contains("scratch.tmp"));
+    }
+
+    #[test]
+    fn fallback_attempt_starts_clean_after_quarantining_a_retryable_worker_failure() {
+        let temp = TempDir::new("fallback-dirty-sandbox");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = true
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "primary-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "primary-worker"
+provider = "opencode-go"
+fallback = ["fallback-worker"]
+
+[[roster]]
+name = "fallback-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fallback-worker"
+provider = "codex"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-fallback-dirty";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "primary-worker",
+            &["primary-worker", "fallback-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bursar = FakeBursarClient::with_provider_availabilities(&[
+            ("opencode-go", Availability::Healthy),
+            ("codex", Availability::Healthy),
+        ]);
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = DirtyFallbackExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let result = run_dispatch_cycle(
+            &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+            &bursar,
+        )
+        .expect("fallback dispatch succeeds despite primary leaving a dirty tree");
+
+        assert_eq!(result.dispatched, 2, "primary attempt + fallback attempt");
+        assert_eq!(result.verified, 1);
+        assert_eq!(bd.close_count(), 1);
+
+        // DirtyFallbackExec's fallback-worker branch already asserts the
+        // repo is clean before it runs; this re-confirms the final state.
+        assert!(!repo.join("primary-leftover.tmp").exists());
+        let readme = std::fs::read_to_string(repo.join("README.md")).expect("read readme");
+        assert!(!readme.contains("primary partial"));
+        assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+
+        let run_dir = single_contract_run(&state);
+        let events_text = std::fs::read_to_string(run_dir.join("events.jsonl")).expect("events");
+        assert!(events_text.contains("quarantined 2 path(s)"));
+        assert!(!events_text.contains("primary partial"));
+        assert!(!events_text.contains("stray"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end legacy-adoption fixture keeps its config and manual run manifest inline"
+    )]
+    fn resume_after_legacy_dirty_repo_adopts_quarantined_patch_and_retries_clean() {
+        let temp = TempDir::new("legacy-adopt-sandbox");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+        let canonical_repo = std::fs::canonicalize(&repo)
+            .expect("canonicalize repo")
+            .to_str()
+            .expect("utf8 repo")
+            .to_string();
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+
+        // A prior Conductor run stranded uncommitted worker output on this
+        // exact repo/bead before quarantine capture existed for it — the
+        // bursar-467-shaped incident: a Finished, failed run manifest with
+        // no recorded `before_head`, and the tree still dirty from it.
+        let stranded_created_at = Utc::now();
+        let mut stranded_run = RunHandle::create_at(
+            &state,
+            RunJob::Work,
+            NewRun {
+                target: RunTarget {
+                    repo: canonical_repo.clone(),
+                    bead: Some("sandbox-1".to_string()),
+                },
+                approved_profiles: vec!["fake-worker".to_string()],
+                bursar_roster_artifact: None,
+                limits: RunLimits::default(),
+                verifier: RunVerifier::default(),
+                work: Some(WorkState {
+                    cycle_id: "cycle-legacy-original".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: None,
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    stage: WorkStage::Implementing,
+                }),
+                approval: None,
+            },
+            stranded_created_at,
+        )
+        .expect("create stranded legacy run");
+        let stranded_run_id = stranded_run.run_id().to_string();
+        stranded_run.finish("failed").expect("finish stranded run");
+        drop(stranded_run);
+
+        std::fs::write(repo.join("README.md"), b"sandbox\nstranded partial edit\n")
+            .expect("dirty tracked file");
+        std::fs::write(repo.join("stranded-leftover.tmp"), b"stray from stranded run\n")
+            .expect("dirty untracked file");
+        assert!(!git(&repo, &["status", "--porcelain"]).is_empty());
+
+        let cycle_id = "cycle-legacy-retry";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = SandboxExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &commits,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("retry adopts the stranded dirty repo and dispatches cleanly");
+
+        assert_eq!(result.dispatched, 1);
+        assert_eq!(result.verified, 1);
+        assert_eq!(bd.close_count(), 1);
+        assert!(
+            bd.events.borrow().iter().any(|event| matches!(
+                event,
+                BdEvent::Comment { text, .. }
+                    if text.contains("adopted a stranded dirty repository")
+            )),
+            "adoption must be recorded as durable, bounded evidence"
+        );
+        assert!(!repo.join("stranded-leftover.tmp").exists());
+        let readme = std::fs::read_to_string(repo.join("README.md")).expect("read readme");
+        assert!(!readme.contains("stranded partial edit"));
+        assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+
+        let new_run_dir = std::fs::read_dir(crate::run::runs_dir(&state))
+            .expect("runs dir")
+            .map(|entry| entry.expect("run entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name != stranded_run_id)
+            })
+            .expect("new run directory exists");
+        // Legacy adoption records its evidence as a captured artifact plus a
+        // bounded bd comment (already asserted above), not a run event —
+        // the manifest/event log must still carry no raw patch content.
+        let artifacts_dir = new_run_dir.join("artifacts");
+        let patch_files: Vec<_> = std::fs::read_dir(&artifacts_dir)
+            .expect("artifacts dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("patch")))
+            .collect();
+        assert_eq!(patch_files.len(), 1, "exactly one adopted patch artifact");
+        let patch_text = std::fs::read_to_string(patch_files[0].path()).expect("read patch");
+        assert!(
+            patch_text.contains("stranded partial edit")
+                || patch_text.contains("stranded-leftover.tmp")
+        );
+        let manifest_text =
+            std::fs::read_to_string(new_run_dir.join("manifest.json")).expect("manifest");
+        let events_text =
+            std::fs::read_to_string(new_run_dir.join("events.jsonl")).expect("events");
+        assert!(!manifest_text.contains("stranded partial edit"));
+        assert!(!events_text.contains("stranded partial edit"));
+        assert!(!events_text.contains("stray from stranded run"));
+    }
+
+    #[test]
+    fn dispatch_refuses_dirty_repository_without_matching_run_evidence_and_leaves_files_untouched()
+     {
+        let temp = TempDir::new("foreign-dirty-sandbox");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        // Foreign, unauthenticated dirt with no Conductor run evidence at
+        // all — must never be touched.
+        std::fs::write(repo.join("README.md"), b"sandbox\nforeign edit\n")
+            .expect("foreign tracked edit");
+        std::fs::write(repo.join("foreign.tmp"), b"someone else's work\n")
+            .expect("foreign untracked file");
+        let dirty_before = git(&repo, &["status", "--porcelain"]);
+        assert!(!dirty_before.is_empty());
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+        let cycle_id = "cycle-foreign-dirty";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = DirtyFailureExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &commits,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("unauthenticated dirty repo is isolated to the item, not a hard cycle error");
+
+        assert_eq!(result.dispatched, 0);
+        assert_eq!(result.verified, 0);
+        assert_eq!(
+            result.failed, 0,
+            "unresolved item is replanned, not counted as failed"
+        );
+        assert_eq!(exec.spawns().len(), 0, "worker must never be dispatched");
+        assert_eq!(
+            bd.claim_count(),
+            0,
+            "bead must never be claimed over unauthenticated dirt"
+        );
+
+        // Completely untouched: identical dirty status before and after.
+        assert_eq!(git(&repo, &["status", "--porcelain"]), dirty_before);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).expect("read readme"),
+            "sandbox\nforeign edit\n"
+        );
+        assert!(repo.join("foreign.tmp").is_file());
+
+        let report = report_json_string(&reports, cycle_id);
+        assert!(report.contains("repository is dirty"));
     }
 
     #[test]
@@ -5227,6 +5877,17 @@ dispatch_id = "fake-worker"
 
     struct DirtyAfterVerifyCommitProbe {
         dirty_repo: PathBuf,
+        initial_head: Option<String>,
+    }
+
+    impl DirtyAfterVerifyCommitProbe {
+        fn new(dirty_repo: PathBuf) -> Self {
+            let initial_head = GitCommitProbe.head(&dirty_repo).expect("initial head");
+            Self {
+                dirty_repo,
+                initial_head,
+            }
+        }
     }
 
     impl CommitProbe for DirtyAfterVerifyCommitProbe {
@@ -5235,7 +5896,11 @@ dispatch_id = "fake-worker"
         }
 
         fn is_clean(&self, repo: &Path) -> crate::dispatch::Result<bool> {
-            if repo == self.dirty_repo {
+            // Only simulate dirt once the worker's commit has actually
+            // landed (i.e. mechanical verification is in progress), so a
+            // preflight clean check ahead of dispatch sees the real,
+            // genuinely clean sandbox repo.
+            if repo == self.dirty_repo && GitCommitProbe.head(repo)? != self.initial_head {
                 Ok(false)
             } else {
                 GitCommitProbe.is_clean(repo)
@@ -5689,6 +6354,116 @@ dispatch_id = "fake-worker"
             }
             panic!("unexpected spawn argv: {:?}", request.argv)
         }
+    }
+
+    /// A worker that edits a tracked file and creates an untracked file,
+    /// then exits nonzero without committing — and has no fallback to try.
+    struct DirtyFailureExec {
+        spawns: RefCell<Vec<SpawnRequest>>,
+    }
+
+    impl DirtyFailureExec {
+        fn new() -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn spawns(&self) -> Vec<SpawnRequest> {
+            self.spawns.borrow().clone()
+        }
+    }
+
+    impl Exec for DirtyFailureExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            self.spawns.borrow_mut().push(request.clone());
+            if request.argv.first().map(String::as_str) == Some("pi") {
+                std::fs::write(&request.stdout_path, b"worker attempted\n")
+                    .expect("write worker stdout");
+                std::fs::write(&request.stderr_path, b"boom: unrecoverable worker crash\n")
+                    .expect("write worker stderr");
+                std::fs::write(request.cwd.join("README.md"), b"sandbox\npartial edit\n")
+                    .expect("edit tracked file");
+                std::fs::write(request.cwd.join("scratch.tmp"), b"untracked leftovers\n")
+                    .expect("write untracked file");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    /// Like `FallbackExec`, but the primary attempt also leaves tracked and
+    /// untracked dirt behind before its retryable capacity failure — proves
+    /// the fallback attempt starts from a clean repository rather than
+    /// contaminated leftovers.
+    struct DirtyFallbackExec {
+        spawns: RefCell<Vec<SpawnRequest>>,
+    }
+
+    impl DirtyFallbackExec {
+        fn new() -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn spawns(&self) -> Vec<SpawnRequest> {
+            self.spawns.borrow().clone()
+        }
+    }
+
+    impl Exec for DirtyFallbackExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            self.spawns.borrow_mut().push(request.clone());
+            if request.argv.iter().any(|arg| arg == "primary-worker") {
+                std::fs::write(&request.stdout_path, b"").expect("write primary stdout");
+                std::fs::write(&request.stderr_path, b"HTTP 429 quota exceeded\n")
+                    .expect("write primary stderr");
+                std::fs::write(request.cwd.join("README.md"), b"sandbox\nprimary partial\n")
+                    .expect("edit tracked file");
+                std::fs::write(request.cwd.join("primary-leftover.tmp"), b"stray\n")
+                    .expect("write untracked file");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
+            }
+            if request.argv.iter().any(|arg| arg == "fallback-worker") {
+                let status = git_status_porcelain(&request.cwd);
+                assert!(
+                    status.is_empty(),
+                    "fallback attempt must start from a clean repo, found: {status}"
+                );
+                std::fs::write(&request.stdout_path, b"fallback worker ran\n")
+                    .expect("write fallback stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
+                std::fs::write(request.cwd.join("worker.txt"), b"done\n")
+                    .expect("write worker file");
+                run(&request.cwd, "git", &["add", "worker.txt"]);
+                run(
+                    &request.cwd,
+                    "git",
+                    &["commit", "-m", "worker: fallback complete sandbox bead"],
+                );
+                return Ok(Box::new(FakeChild::delayed_success()));
+            }
+            if request.argv.first().map(String::as_str) == Some("sh") {
+                let output = Command::new(&request.argv[0])
+                    .args(&request.argv[1..])
+                    .current_dir(&request.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("spawn verify shell");
+                std::fs::write(&request.stdout_path, &output.stdout).expect("write verify stdout");
+                std::fs::write(&request.stderr_path, &output.stderr).expect("write verify stderr");
+                let code = output.status.code().unwrap_or(1);
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(code))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    fn git_status_porcelain(repo: &Path) -> String {
+        git(repo, &["status", "--porcelain"])
     }
 
     struct FakeChild {

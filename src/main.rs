@@ -13,6 +13,7 @@ mod dispatch_cycle;
 mod fields;
 mod ledger;
 mod plan;
+mod quarantine;
 mod ratchet;
 mod roster_drift;
 mod route;
