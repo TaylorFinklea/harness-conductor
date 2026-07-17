@@ -135,6 +135,7 @@ struct PlannedItem {
 
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "top-level dispatch seam keeps injected dependencies explicit"
 )]
 pub(crate) fn run_dispatch_cycle<
@@ -216,7 +217,7 @@ pub(crate) fn run_dispatch_cycle<
     let mut failed = 0_u64;
 
     for item in &items {
-        let attempt = dispatch_one(
+        let attempt = match dispatch_one(
             cfg,
             bd,
             exec,
@@ -231,7 +232,14 @@ pub(crate) fn run_dispatch_cycle<
             item,
             None,
             bursar,
-        )?;
+        ) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                failed += 1;
+                record_dispatch_failure(&report_path, item, &error)?;
+                continue;
+            }
+        };
         dispatched += attempt.dispatches;
         match attempt.decision {
             Some(VerifyDecision::Passed) => verified += 1,
@@ -246,7 +254,7 @@ pub(crate) fn run_dispatch_cycle<
         live,
         &report_path,
         cycle_start,
-        format!("complete {cycle_id}: verified {verified}/{dispatched}"),
+        format!("complete {cycle_id}: verified {verified}/{dispatched}, failed {failed}"),
         Some(1.0),
     )?;
     patch_status_if_present(&report_path, ReportStatus::Done)?;
@@ -434,6 +442,26 @@ fn record_replan_required(
         ),
     )
     .map_err(|error| DispatchCycleError::message(format!("report approval scope skip: {error}")))
+}
+
+fn record_dispatch_failure(
+    report_path: &Path,
+    item: &PlannedItem,
+    error: &DispatchCycleError,
+) -> std::result::Result<(), DispatchCycleError> {
+    if !report_path.exists() {
+        return Ok(());
+    }
+    deck::append_callout(
+        report_path,
+        CalloutLevel::Err,
+        "DISPATCH_ERROR",
+        &format!(
+            "dispatch failed: {}/{}\n- disposition: failed\n- reason: {error}",
+            item.repo, item.issue_id
+        ),
+    )
+    .map_err(|error| DispatchCycleError::message(format!("report dispatch failure: {error}")))
 }
 
 struct DispatchOneResult {
@@ -2991,6 +3019,101 @@ dispatch_id = "fake-worker"
     }
 
     #[test]
+    fn dispatch_continues_after_post_verify_failure_and_finishes_report() {
+        let temp = TempDir::new("partial-dispatch");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let first_repo = fleet.join("first-repo");
+        let second_repo = fleet.join("second-repo");
+        init_sandbox_repo_without_bd(&first_repo);
+        init_sandbox_repo_without_bd(&second_repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 4
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let mut first_issue = sandbox_issue();
+        first_issue.id = "sandbox-1".to_string();
+        let mut second_issue = sandbox_issue();
+        second_issue.id = "sandbox-2".to_string();
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+        let cycle_id = "cycle-partial-dispatch";
+        write_plan_with_items(
+            &state,
+            cycle_id,
+            &[
+                (&first_repo, "first-repo", &first_issue, "fake-worker"),
+                (&second_repo, "second-repo", &second_issue, "fake-worker"),
+            ],
+            &cfg.roster,
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new_with_issues([first_issue, second_issue]);
+        let exec = SandboxExec::new();
+        let live = RecordingLiveSink::new(true);
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &DirtyAfterVerifyCommitProbe {
+                dirty_repo: first_repo.clone(),
+            },
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &live,
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("one item failure is isolated from the approved plan");
+
+        let report = report_json_string(&reports, cycle_id);
+        assert_eq!(result.dispatched, 1);
+        assert_eq!(result.verified, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(bd.close_count(), 1);
+        assert!(report.contains("\"status\": \"done\""));
+        assert!(report.contains("DISPATCH_ERROR"));
+        assert!(report.contains("first-repo/sandbox-1"));
+        assert!(report.contains("repository is dirty after mechanical verification"));
+        assert!(report.contains("second-repo/sandbox-2"));
+        assert!(report.contains("verified 1/1, failed 1"));
+    }
+
+    #[test]
     fn qualitative_review_e2e_repairs_and_ledgers_both_attempts() {
         let temp = TempDir::new("review-e2e-sandbox");
         let fleet = temp.path().join("fleet");
@@ -3386,10 +3509,10 @@ dispatch_id = "senior-reviewer"
         let exec = PendingReviewExec::ship_immediately();
         let interrupted =
             DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
-        let error = fixture
+        let interrupted_result = fixture
             .dispatch(&exec, &interrupted)
-            .expect_err("test interruption stops before review");
-        assert!(error.to_string().contains("process interruption"));
+            .expect("test interruption is isolated to the item");
+        assert_eq!(interrupted_result.failed, 1);
         assert_eq!(fixture.bd.release_count(), 0);
         assert_eq!(exec.worker_spawns(), 1);
         assert_eq!(exec.review_spawns(), 0);
@@ -3459,7 +3582,7 @@ dispatch_id = "senior-reviewer"
             DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
         fixture
             .dispatch(&exec, &interrupted)
-            .expect_err("interrupt before review");
+            .expect("interrupt before review is isolated to the item");
         std::fs::write(fixture.repo.join("changed.txt"), b"changed\n").expect("write change");
         run(&fixture.repo, "git", &["add", "changed.txt"]);
         run(
@@ -3468,13 +3591,13 @@ dispatch_id = "senior-reviewer"
             &["commit", "-m", "test: change pending head"],
         );
 
-        let error = fixture
+        let result = fixture
             .dispatch(
                 &exec,
                 &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
             )
-            .expect_err("changed head fails closed");
-        assert!(error.to_string().contains("worker commit changed"));
+            .expect("changed head failure is isolated to the item");
+        assert_eq!(result.failed, 1);
         assert_eq!(exec.review_spawns(), 0);
         assert_eq!(fixture.bd.close_count(), 0);
     }
@@ -3487,16 +3610,16 @@ dispatch_id = "senior-reviewer"
             DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
         fixture
             .dispatch(&exec, &interrupted)
-            .expect_err("interrupt before review");
+            .expect("interrupt before review is isolated to the item");
         std::fs::write(fixture.repo.join("dirty.txt"), b"dirty\n").expect("write dirty file");
 
-        let error = fixture
+        let result = fixture
             .dispatch(
                 &exec,
                 &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
             )
-            .expect_err("dirty tree fails closed");
-        assert!(error.to_string().contains("repository is dirty"));
+            .expect("dirty tree failure is isolated to the item");
+        assert_eq!(result.failed, 1);
         assert_eq!(exec.review_spawns(), 0);
         assert_eq!(fixture.bd.close_count(), 0);
     }
@@ -3510,23 +3633,20 @@ dispatch_id = "senior-reviewer"
                 DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
             fixture
                 .dispatch(&exec, &interrupted)
-                .expect_err("interrupt before review");
+                .expect("interrupt before review is isolated to the item");
             if mutate == "verify" {
                 fixture.bd.set_verify_cmd("cargo test changed");
             } else {
                 fixture.bd.set_title("changed after approval");
             }
 
-            let error = fixture
+            let result = fixture
                 .dispatch(
                     &exec,
                     &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
                 )
-                .expect_err("stale resume input fails closed");
-            assert!(
-                error.to_string().contains("approval is stale"),
-                "{label}: {error}"
-            );
+                .expect("stale resume input failure is isolated to the item");
+            assert_eq!(result.failed, 1, "{label}");
             assert_eq!(exec.review_spawns(), 0, "{label}");
             assert_eq!(fixture.bd.close_count(), 0, "{label}");
         }
@@ -3540,7 +3660,7 @@ dispatch_id = "senior-reviewer"
             DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
         fixture
             .dispatch(&exec, &interrupted)
-            .expect_err("interrupt before review");
+            .expect("interrupt before review is isolated to the item");
         let run_dir = fixture.pending_run_dir();
         let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
             .expect("manifest before tamper");
@@ -3551,13 +3671,13 @@ dispatch_id = "senior-reviewer"
             .expect("verifier artifact");
         std::fs::write(run_dir.join(artifact.path), b"tampered\n").expect("tamper artifact");
 
-        let error = fixture
+        let result = fixture
             .dispatch(
                 &exec,
                 &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
             )
-            .expect_err("artifact tamper fails closed");
-        assert!(error.to_string().contains("artifact hash mismatch"));
+            .expect("artifact tamper failure is isolated to the item");
+        assert_eq!(result.failed, 1);
         assert_eq!(exec.review_spawns(), 0);
         assert_eq!(fixture.bd.close_count(), 0);
     }
@@ -4591,6 +4711,75 @@ dispatch_id = "fake-worker"
         plan.save(state).expect("save plan");
     }
 
+    fn write_plan_with_items(
+        state: &Path,
+        cycle_id: &str,
+        items: &[(&Path, &str, &Issue, &str)],
+        roster: &[RosterEntry],
+    ) {
+        let mut proposals = Vec::with_capacity(items.len());
+        let mut provider_routes = Vec::with_capacity(items.len());
+        let mut item_authorizations = Vec::with_capacity(items.len());
+        let mut selectors = Vec::with_capacity(items.len());
+        let mut repo_paths = Vec::with_capacity(items.len());
+        for (repo_path, repo, issue, model) in items {
+            let canonical_repo = std::fs::canonicalize(repo_path)
+                .expect("canonical test repository")
+                .to_str()
+                .expect("UTF-8 test repository")
+                .to_string();
+            let Triage::Triaged(routing) = fields::extract(issue) else {
+                panic!("test issue is triaged");
+            };
+            let approved_models = vec![(*model).to_string()];
+            let approved_model_refs = [*model];
+            let authorization =
+                item_authorization_hash(&canonical_repo, issue, &routing, model, &approved_models)
+                    .expect("test item authorization");
+            proposals.push(ProposalEntry {
+                repo: (*repo).to_string(),
+                issue_id: issue.id.clone(),
+                model: (*model).to_string(),
+            });
+            provider_routes.push(provider_route_fixture(
+                repo,
+                &issue.id,
+                model,
+                &approved_model_refs,
+                roster,
+            ));
+            item_authorizations.push(ItemAuthorizationRecord {
+                repo: (*repo).to_string(),
+                issue_id: issue.id.clone(),
+                sha256: authorization,
+            });
+            selectors.push(ScopeSelector::ExactItem {
+                repo: canonical_repo.clone(),
+                issue_id: issue.id.clone(),
+            });
+            repo_paths.push(canonical_repo);
+        }
+        let plan = CyclePlan {
+            cycle_id: cycle_id.to_string(),
+            created_at: "2026-07-02T01:02:03Z".to_string(),
+            dispatches: Vec::new(),
+            proposals,
+            flags: Vec::new(),
+            skips: Vec::new(),
+            provider_routes,
+            bursar_roster_artifact: None,
+            approval_scope: ApprovalScope::new(
+                ApprovalScopeKind::ExactItemScope,
+                selectors,
+                repo_paths,
+                items.len(),
+            )
+            .expect("explicit test approval scope"),
+            item_authorizations,
+        };
+        plan.save(state).expect("save plan");
+    }
+
     fn provider_route_fixture(
         repo: &str,
         issue_id: &str,
@@ -4955,6 +5144,24 @@ dispatch_id = "fake-worker"
         }
     }
 
+    struct DirtyAfterVerifyCommitProbe {
+        dirty_repo: PathBuf,
+    }
+
+    impl CommitProbe for DirtyAfterVerifyCommitProbe {
+        fn head(&self, repo: &Path) -> crate::dispatch::Result<Option<String>> {
+            GitCommitProbe.head(repo)
+        }
+
+        fn is_clean(&self, repo: &Path) -> crate::dispatch::Result<bool> {
+            if repo == self.dirty_repo {
+                Ok(false)
+            } else {
+                GitCommitProbe.is_clean(repo)
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum BdEvent {
         Claim { id: String },
@@ -4964,15 +5171,24 @@ dispatch_id = "fake-worker"
     }
 
     struct RecordingBdClient {
-        issue: RefCell<Issue>,
+        issues: RefCell<BTreeMap<String, Issue>>,
         events: RefCell<Vec<BdEvent>>,
         claim_title: RefCell<Option<String>>,
     }
 
     impl RecordingBdClient {
         fn new(issue: Issue) -> Self {
+            Self::new_with_issues([issue])
+        }
+
+        fn new_with_issues(issues: impl IntoIterator<Item = Issue>) -> Self {
             Self {
-                issue: RefCell::new(issue),
+                issues: RefCell::new(
+                    issues
+                        .into_iter()
+                        .map(|issue| (issue.id.clone(), issue))
+                        .collect(),
+                ),
                 events: RefCell::new(Vec::new()),
                 claim_title: RefCell::new(None),
             }
@@ -5008,12 +5224,20 @@ dispatch_id = "fake-worker"
         }
 
         fn set_title(&self, title: &str) {
-            self.issue.borrow_mut().title = title.to_string();
+            self.issues
+                .borrow_mut()
+                .values_mut()
+                .next()
+                .expect("recording issue")
+                .title = title.to_string();
         }
 
         fn set_verify_cmd(&self, command: &str) {
-            self.issue
+            self.issues
                 .borrow_mut()
+                .values_mut()
+                .next()
+                .expect("recording issue")
                 .metadata
                 .get_or_insert_with(BTreeMap::new)
                 .insert("verify_cmd".to_string(), json!(command));
@@ -5022,16 +5246,21 @@ dispatch_id = "fake-worker"
 
     impl BdClient for RecordingBdClient {
         fn ready(&self, _repo: &Path) -> crate::bd::Result<Vec<Issue>> {
-            let issue = self.issue.borrow().clone();
-            if issue.status == "open" {
-                Ok(vec![issue])
-            } else {
-                Ok(Vec::new())
-            }
+            Ok(self
+                .issues
+                .borrow()
+                .values()
+                .filter(|issue| issue.status == "open")
+                .cloned()
+                .collect())
         }
 
-        fn show(&self, _repo: &Path, _id: &str) -> crate::bd::Result<Issue> {
-            Ok(self.issue.borrow().clone())
+        fn show(&self, _repo: &Path, id: &str) -> crate::bd::Result<Issue> {
+            self.issues
+                .borrow()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| BdError::new(format!("unknown issue {id}")))
         }
 
         fn count(&self, _repo: &Path) -> crate::bd::Result<u64> {
@@ -5046,7 +5275,10 @@ dispatch_id = "fake-worker"
             self.events
                 .borrow_mut()
                 .push(BdEvent::Claim { id: id.to_string() });
-            let mut issue = self.issue.borrow_mut();
+            let mut issues = self.issues.borrow_mut();
+            let issue = issues
+                .get_mut(id)
+                .ok_or_else(|| BdError::new(format!("unknown issue {id}")))?;
             issue.status = "in_progress".to_string();
             issue.assignee = Some(actor.to_string());
             if let Some(title) = self.claim_title.borrow().as_ref() {
@@ -5059,7 +5291,10 @@ dispatch_id = "fake-worker"
             self.events
                 .borrow_mut()
                 .push(BdEvent::Release { id: id.to_string() });
-            let mut issue = self.issue.borrow_mut();
+            let mut issues = self.issues.borrow_mut();
+            let issue = issues
+                .get_mut(id)
+                .ok_or_else(|| BdError::new(format!("unknown issue {id}")))?;
             issue.status = "open".to_string();
             issue.assignee = None;
             Ok(issue.clone())
@@ -5070,7 +5305,10 @@ dispatch_id = "fake-worker"
                 id: id.to_string(),
                 reason: reason.to_string(),
             });
-            let mut issue = self.issue.borrow_mut();
+            let mut issues = self.issues.borrow_mut();
+            let issue = issues
+                .get_mut(id)
+                .ok_or_else(|| BdError::new(format!("unknown issue {id}")))?;
             issue.status = "closed".to_string();
             Ok(issue.clone())
         }
