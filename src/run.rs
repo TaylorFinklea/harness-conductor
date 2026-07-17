@@ -123,6 +123,37 @@ pub(crate) struct RunVerifier {
     pub(crate) qualitative: Option<String>,
 }
 
+/// Durable work-stage boundary for a mechanically verified commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkStage {
+    Implementing,
+    PendingReview,
+    Completed,
+}
+
+/// Immutable mechanical-verifier evidence pinned before qualitative review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MechanicalVerification {
+    pub(crate) command: String,
+    pub(crate) passed: bool,
+    pub(crate) artifact_refs: Vec<ArtifactRef>,
+}
+
+/// Work-only progress persisted inside the canonical run manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkState {
+    pub(crate) cycle_id: String,
+    pub(crate) authorization_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mechanical: Option<MechanicalVerification>,
+    pub(crate) stage: WorkStage,
+}
+
 /// `conductor/run@1` — the atomic, versioned run manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RunManifest {
@@ -137,6 +168,8 @@ pub(crate) struct RunManifest {
     pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
     pub(crate) limits: RunLimits,
     pub(crate) verifier: RunVerifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) work: Option<WorkState>,
     #[serde(default)]
     pub(crate) artifacts: Vec<ArtifactRef>,
     pub(crate) lifecycle: RunLifecycle,
@@ -171,6 +204,7 @@ pub(crate) struct NewRun {
     pub(crate) bursar_roster_artifact: Option<ArtifactRef>,
     pub(crate) limits: RunLimits,
     pub(crate) verifier: RunVerifier,
+    pub(crate) work: Option<WorkState>,
     pub(crate) approval: Option<serde_json::Value>,
 }
 
@@ -263,6 +297,7 @@ impl RunHandle {
             bursar_roster_artifact: request.bursar_roster_artifact,
             limits: request.limits,
             verifier: request.verifier,
+            work: request.work,
             artifacts: Vec::new(),
             lifecycle: RunLifecycle::Started,
             outcome: None,
@@ -362,6 +397,7 @@ impl RunHandle {
                 "manifest outcome does not match terminal event outcome",
             ));
         }
+        validate_work_events(&manifest, &events)?;
         let next_seq = last.seq + 1;
         Ok(Self {
             dir,
@@ -378,6 +414,10 @@ impl RunHandle {
         &self.manifest
     }
 
+    pub(crate) fn work(&self) -> Option<&WorkState> {
+        self.manifest.work.as_ref()
+    }
+
     pub(crate) fn manifest_path(&self) -> PathBuf {
         self.dir.join("manifest.json")
     }
@@ -388,6 +428,22 @@ impl RunHandle {
 
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub(crate) fn approval(&self) -> Result<serde_json::Value> {
+        let path = self.dir.join("approval.json");
+        let bytes = std::fs::read(&path).map_err(|error| {
+            RunError::new(format!(
+                "failed to read approval {}: {error}",
+                path.display()
+            ))
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            RunError::new(format!(
+                "failed to parse approval {}: {error}",
+                path.display()
+            ))
+        })
     }
 
     /// Copies an existing output into this run using create-new semantics and
@@ -413,6 +469,104 @@ impl RunHandle {
     /// `updated_at`, and (for `run_finished`) final `outcome`.
     pub(crate) fn append_event(&mut self, kind: EventKind, input: EventInput) -> Result<()> {
         self.append_event_at(kind, input, Utc::now())
+    }
+
+    /// Durably advances a work run to the pending-review boundary after its
+    /// exact commit and immutable verifier artifacts are known.
+    pub(crate) fn checkpoint_pending_review(
+        &mut self,
+        worker_profile: &str,
+        worker_commit: &str,
+        verifier_command: &str,
+        artifact_refs: Vec<ArtifactRef>,
+    ) -> Result<()> {
+        validate_commit_id(worker_commit)?;
+        if worker_profile.trim().is_empty() {
+            return Err(RunError::new("worker profile must not be empty"));
+        }
+        if self.manifest.verifier.mechanical.as_deref() != Some(verifier_command) {
+            return Err(RunError::new(
+                "mechanical verifier command does not match run manifest",
+            ));
+        }
+        if artifact_refs.is_empty() {
+            return Err(RunError::new(
+                "pending review requires mechanical verifier artifacts",
+            ));
+        }
+        let work = self
+            .manifest
+            .work
+            .as_mut()
+            .ok_or_else(|| RunError::new("pending review requires work state"))?;
+        if work.stage != WorkStage::Implementing
+            || work.worker_commit.is_some()
+            || work.mechanical.is_some()
+        {
+            return Err(RunError::new(
+                "work run is not at the implementing checkpoint",
+            ));
+        }
+        work.worker_profile = Some(worker_profile.to_string());
+        work.worker_commit = Some(worker_commit.to_string());
+        work.mechanical = Some(MechanicalVerification {
+            command: verifier_command.to_string(),
+            passed: true,
+            artifact_refs: artifact_refs.clone(),
+        });
+        work.stage = WorkStage::PendingReview;
+        for artifact in &artifact_refs {
+            if !self.manifest.artifacts.contains(artifact) {
+                self.manifest.artifacts.push(artifact.clone());
+            }
+        }
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()?;
+        self.append_event(
+            EventKind::VerifyFinished,
+            EventInput {
+                artifact_refs,
+                outcome: Some("passed".to_string()),
+                ..EventInput::default()
+            },
+        )
+    }
+
+    /// Repairs the event-journal half of a checkpoint if the process stopped
+    /// after the atomic manifest replace but before the event append.
+    pub(crate) fn ensure_pending_review_event(&mut self) -> Result<()> {
+        let Some(work) = self.manifest.work.as_ref() else {
+            return Err(RunError::new("pending review requires work state"));
+        };
+        if work.stage != WorkStage::PendingReview {
+            return Err(RunError::new("work run is not pending review"));
+        }
+        let mechanical = work
+            .mechanical
+            .as_ref()
+            .ok_or_else(|| RunError::new("pending review has no mechanical evidence"))?;
+        let events = read_events(&self.events_path())?;
+        let verify_events = events
+            .iter()
+            .filter(|event| event.kind == EventKind::VerifyFinished)
+            .collect::<Vec<_>>();
+        if verify_events.len() == 1 {
+            return Ok(());
+        }
+        if !verify_events.is_empty() {
+            return Err(RunError::new(
+                "pending-review event log has duplicate verifier events",
+            ));
+        }
+        let artifact_refs = mechanical.artifact_refs.clone();
+        self.append_event(
+            EventKind::VerifyFinished,
+            EventInput {
+                artifact_refs,
+                outcome: Some("passed".to_string()),
+                ..EventInput::default()
+            },
+        )
     }
 
     fn append_event_at(
@@ -470,6 +624,9 @@ impl RunHandle {
         outcome: impl Into<String>,
         artifact_refs: Vec<ArtifactRef>,
     ) -> Result<()> {
+        if let Some(work) = self.manifest.work.as_mut() {
+            work.stage = WorkStage::Completed;
+        }
         self.append_event(
             EventKind::RunFinished,
             EventInput {
@@ -521,7 +678,61 @@ pub(crate) fn read_manifest(path: &Path) -> Result<RunManifest> {
         validate_artifact_ref(artifact, "manifest artifact")?;
         validate_local_artifact(path, artifact)?;
     }
+    validate_work_manifest(path, &manifest)?;
     Ok(manifest)
+}
+
+/// Finds the one unfinished work run waiting for qualitative review for an
+/// exact approved cycle/repository/Bead identity.
+pub(crate) fn find_pending_work_run(
+    state_dir: &Path,
+    cycle_id: &str,
+    repo: &str,
+    bead: &str,
+) -> Result<Option<String>> {
+    let root = runs_dir(state_dir);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RunError::new(format!(
+                "failed to read runs dir {}: {error}",
+                root.display()
+            )));
+        }
+    };
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            RunError::new(format!("failed to read run directory entry: {error}"))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| RunError::new(format!("failed to stat run entry: {error}")))?
+            .is_dir()
+        {
+            continue;
+        }
+        let manifest = read_manifest(&entry.path().join("manifest.json"))?;
+        let Some(work) = manifest.work.as_ref() else {
+            continue;
+        };
+        if manifest.job == RunJob::Work
+            && manifest.lifecycle != RunLifecycle::Finished
+            && work.stage == WorkStage::PendingReview
+            && work.cycle_id == cycle_id
+            && manifest.target.repo == repo
+            && manifest.target.bead.as_deref() == Some(bead)
+        {
+            matches.push(manifest.run_id);
+        }
+    }
+    if matches.len() > 1 {
+        return Err(RunError::new(format!(
+            "multiple pending-review runs found for {cycle_id} {repo}/{bead}"
+        )));
+    }
+    Ok(matches.pop())
 }
 
 fn check_schema(value: &serde_json::Value, expected: &str, path: &Path) -> Result<()> {
@@ -655,6 +866,120 @@ fn validate_artifact_ref(artifact: &ArtifactRef, label: &str) -> Result<()> {
             "{label} has malformed sha256 {:?}",
             artifact.sha256
         )));
+    }
+    Ok(())
+}
+
+fn validate_commit_id(commit: &str) -> Result<()> {
+    if !matches!(commit.len(), 40 | 64)
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(RunError::new(format!(
+            "worker commit has malformed identity {commit:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_work_manifest(path: &Path, manifest: &RunManifest) -> Result<()> {
+    let Some(work) = manifest.work.as_ref() else {
+        return Ok(());
+    };
+    if manifest.job != RunJob::Work {
+        return Err(RunError::new("non-work run cannot carry work state"));
+    }
+    if work.cycle_id.trim().is_empty() {
+        return Err(RunError::new("work state has empty cycle id"));
+    }
+    validate_sha256(&work.authorization_sha256, "work authorization")?;
+    if let Some(commit) = work.worker_commit.as_deref() {
+        validate_commit_id(commit)?;
+    }
+    if let Some(mechanical) = work.mechanical.as_ref() {
+        if mechanical.command.trim().is_empty() {
+            return Err(RunError::new("mechanical verification has empty command"));
+        }
+        for artifact in &mechanical.artifact_refs {
+            validate_artifact_ref(artifact, "mechanical verifier artifact")?;
+            validate_local_artifact(path, artifact)?;
+            if !manifest.artifacts.contains(artifact) {
+                return Err(RunError::new(
+                    "mechanical verifier artifact is not pinned in manifest artifacts",
+                ));
+            }
+        }
+    }
+    if work.stage == WorkStage::PendingReview {
+        let profile = work.worker_profile.as_deref().unwrap_or_default();
+        let commit = work.worker_commit.as_deref().unwrap_or_default();
+        let mechanical = work.mechanical.as_ref().ok_or_else(|| {
+            RunError::new("pending-review work state is missing mechanical evidence")
+        })?;
+        if profile.is_empty() || commit.is_empty() || !mechanical.passed {
+            return Err(RunError::new(
+                "pending-review work state is missing a verified worker identity",
+            ));
+        }
+        if manifest.verifier.mechanical.as_deref() != Some(mechanical.command.as_str()) {
+            return Err(RunError::new(
+                "pending-review verifier command does not match manifest",
+            ));
+        }
+        if mechanical.artifact_refs.is_empty() {
+            return Err(RunError::new(
+                "pending-review work state has no verifier artifacts",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_work_events(manifest: &RunManifest, events: &[RunEvent]) -> Result<()> {
+    let Some(work) = manifest.work.as_ref() else {
+        return Ok(());
+    };
+    if work.stage != WorkStage::PendingReview {
+        return Ok(());
+    }
+    let mechanical = work
+        .mechanical
+        .as_ref()
+        .expect("pending-review manifest validation requires mechanical evidence");
+    let verify_events = events
+        .iter()
+        .filter(|event| event.kind == EventKind::VerifyFinished)
+        .collect::<Vec<_>>();
+    if verify_events.is_empty() {
+        return Ok(());
+    }
+    if verify_events.len() != 1 {
+        return Err(RunError::new(
+            "pending-review event log has duplicate verifier events",
+        ));
+    }
+    let verify = verify_events[0];
+    if verify.outcome.as_deref() != Some("passed") {
+        return Err(RunError::new(
+            "pending-review verifier event is not a passing result",
+        ));
+    }
+    if verify.artifact_refs != mechanical.artifact_refs {
+        return Err(RunError::new(
+            "pending-review verifier event evidence does not match manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(RunError::new(format!("{label} has malformed sha256")));
     }
     Ok(())
 }
@@ -857,6 +1182,7 @@ mod tests {
                 mechanical: Some("cargo test".to_string()),
                 qualitative: Some("lead-review".to_string()),
             },
+            work: None,
             approval: Some(serde_json::json!({
                 "schema": "test/approval@1",
                 "decision": "approved"
@@ -975,6 +1301,7 @@ mod tests {
             bursar_roster_artifact: None,
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
+            work: None,
             artifacts: Vec::new(),
             lifecycle: RunLifecycle::Started,
             outcome: None,
@@ -1095,6 +1422,65 @@ mod tests {
         // Corrupt the manifest after the fact and confirm reopen fails closed.
         std::fs::write(reopened.manifest_path(), br#"{"schema":"conductor/run@9"}"#).unwrap();
         assert!(RunHandle::open(temp.path(), &run_id).is_err());
+    }
+
+    #[test]
+    fn run_event_resume_repairs_interrupted_pending_review_checkpoint() {
+        let temp = TempDir::new("resume-pending-review-event");
+        let mut request = new_run_request();
+        request.work = Some(WorkState {
+            cycle_id: "cycle-20260717-015903".to_string(),
+            authorization_sha256: "b".repeat(64),
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+        });
+        let mut handle = RunHandle::create_at(temp.path(), RunJob::Work, request, fixed_now())
+            .expect("create work run");
+        let verifier_log = temp.path().join("verifier.log");
+        std::fs::write(&verifier_log, b"mechanical verification passed\n")
+            .expect("write verifier log");
+        let artifact = handle
+            .capture_artifact(&verifier_log, Path::new("artifacts/mechanical.log"))
+            .expect("capture verifier evidence");
+        handle
+            .checkpoint_pending_review(
+                "gpt-5.6-luna",
+                &"c".repeat(40),
+                "cargo test",
+                vec![artifact.clone()],
+            )
+            .expect("checkpoint pending review");
+
+        let events_path = handle.events_path();
+        let mut rows = event_values(&events_path);
+        assert_eq!(
+            rows.pop()
+                .and_then(|row| row["kind"].as_str().map(str::to_string)),
+            Some("verify_finished".to_string())
+        );
+        write_event_values(&events_path, &rows);
+        let run_id = handle.run_id().to_string();
+        drop(handle);
+
+        let mut reopened = RunHandle::open(temp.path(), &run_id)
+            .expect("manifest checkpoint survives missing event");
+        reopened
+            .ensure_pending_review_event()
+            .expect("repair verifier event");
+        reopened
+            .ensure_pending_review_event()
+            .expect("repair is idempotent");
+
+        let events = read_events(&events_path).expect("read repaired events");
+        let verify_events = events
+            .iter()
+            .filter(|event| event.kind == EventKind::VerifyFinished)
+            .collect::<Vec<_>>();
+        assert_eq!(verify_events.len(), 1);
+        assert_eq!(verify_events[0].outcome.as_deref(), Some("passed"));
+        assert_eq!(verify_events[0].artifact_refs, vec![artifact]);
     }
 
     #[test]

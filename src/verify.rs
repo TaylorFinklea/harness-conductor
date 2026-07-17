@@ -16,6 +16,8 @@ use crate::dispatch::{
 };
 
 const ORCHESTRA_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const REVIEW_KILL_GRACE: Duration = Duration::from_secs(3);
 
 /// Metadata key where Conductor stores the bounded revision findings from
 /// a qualitative-review revise result, so the next dispatch can render
@@ -98,11 +100,18 @@ pub(crate) struct VerifyOutcome {
     pub(crate) review_attempts: Vec<ReviewRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MechanicalOutcome {
+    Passed { worker_commit: String },
+    Failed(VerifyOutcome),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VerifyDecision {
     Passed,
     Failed,
     HardError,
+    PendingReview,
 }
 
 pub(crate) fn run<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Sized>(
@@ -164,8 +173,42 @@ fn run_with_optional_review_backoff<
     review: Option<&ReviewSettings>,
     retry_backoff: Duration,
 ) -> Result<VerifyOutcome> {
+    match run_mechanical_with_backoff(bd, exec, commits, request, retry_backoff)? {
+        MechanicalOutcome::Passed { .. } => {
+            review_or_pass(bd, exec, request, review, DEFAULT_REVIEW_TIMEOUT)
+        }
+        MechanicalOutcome::Failed(outcome) => Ok(outcome),
+    }
+}
+
+pub(crate) fn run_mechanical<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Sized>(
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    request: &VerifyRequest,
+) -> Result<MechanicalOutcome> {
+    run_mechanical_with_backoff(bd, exec, commits, request, ORCHESTRA_RETRY_BACKOFF)
+}
+
+pub(crate) fn run_review_stage<B: BdClient + ?Sized, E: Exec + ?Sized>(
+    bd: &B,
+    exec: &E,
+    request: &VerifyRequest,
+    review: &ReviewSettings,
+    timeout: Duration,
+) -> Result<VerifyOutcome> {
+    review_or_pass(bd, exec, request, Some(review), timeout)
+}
+
+fn run_mechanical_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: CommitProbe + ?Sized>(
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    request: &VerifyRequest,
+    retry_backoff: Duration,
+) -> Result<MechanicalOutcome> {
     if let Some(summary) = worker_failure_summary(&request.worker_status) {
-        return fail(bd, request, VerifyDecision::Failed, summary);
+        return fail(bd, request, VerifyDecision::Failed, summary).map(MechanicalOutcome::Failed);
     }
 
     let after_head = commits.head(&request.repo)?;
@@ -175,8 +218,10 @@ fn run_with_optional_review_backoff<
             request,
             VerifyDecision::Failed,
             "no new commit after worker".to_string(),
-        );
+        )
+        .map(MechanicalOutcome::Failed);
     }
+    let worker_commit = after_head.expect("new commit check requires after HEAD");
 
     let verify_run = run_spawn(exec, &verify_spawn(request)?)?;
     if !verify_run.status.success() {
@@ -188,21 +233,22 @@ fn run_with_optional_review_backoff<
                 "verify_cmd failed with {}",
                 status_summary(verify_run.status)
             ),
-        );
+        )
+        .map(MechanicalOutcome::Failed);
     }
 
     if should_run_orchestra(request) {
         match run_orchestra_with_retry(exec, request, retry_backoff)? {
-            OrchestraDecision::Passed => review_or_pass(bd, exec, request, review),
+            OrchestraDecision::Passed => Ok(MechanicalOutcome::Passed { worker_commit }),
             OrchestraDecision::Failed(summary) => {
-                fail(bd, request, VerifyDecision::Failed, summary)
+                fail(bd, request, VerifyDecision::Failed, summary).map(MechanicalOutcome::Failed)
             }
             OrchestraDecision::HardError(summary) => {
-                fail(bd, request, VerifyDecision::HardError, summary)
+                fail(bd, request, VerifyDecision::HardError, summary).map(MechanicalOutcome::Failed)
             }
         }
     } else {
-        review_or_pass(bd, exec, request, review)
+        Ok(MechanicalOutcome::Passed { worker_commit })
     }
 }
 
@@ -315,6 +361,7 @@ struct CommandRun {
     status: ProcessStatus,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    timed_out: bool,
 }
 
 fn run_spawn<E: Exec + ?Sized>(exec: &E, spawn: &SpawnRequest) -> Result<CommandRun> {
@@ -326,6 +373,38 @@ fn run_spawn<E: Exec + ?Sized>(exec: &E, spawn: &SpawnRequest) -> Result<Command
         status,
         stdout_path,
         stderr_path,
+        timed_out: false,
+    })
+}
+
+fn run_spawn_with_timeout<E: Exec + ?Sized>(
+    exec: &E,
+    spawn: &SpawnRequest,
+    timeout: Duration,
+) -> Result<CommandRun> {
+    let stdout_path = spawn.stdout_path.clone();
+    let stderr_path = spawn.stderr_path.clone();
+    let mut child = exec.spawn(spawn)?;
+    let Some(status) = child.wait_for(timeout)? else {
+        child.terminate()?;
+        let status = if let Some(status) = child.wait_for(REVIEW_KILL_GRACE)? {
+            status
+        } else {
+            child.kill()?;
+            child.wait()?
+        };
+        return Ok(CommandRun {
+            status,
+            stdout_path,
+            stderr_path,
+            timed_out: true,
+        });
+    };
+    Ok(CommandRun {
+        status,
+        stdout_path,
+        stderr_path,
+        timed_out: false,
     })
 }
 
@@ -439,7 +518,7 @@ enum ReviewDecision {
         findings: Vec<String>,
         attempts: Vec<ReviewRecord>,
     },
-    Failed {
+    InfrastructureFailure {
         dispatches: u64,
         record: Option<ReviewRecord>,
         attempts: Vec<ReviewRecord>,
@@ -466,12 +545,13 @@ fn review_or_pass<B: BdClient + ?Sized, E: Exec + ?Sized>(
     exec: &E,
     request: &VerifyRequest,
     review: Option<&ReviewSettings>,
+    timeout: Duration,
 ) -> Result<VerifyOutcome> {
     let Some(settings) = review else {
         return pass(bd, request);
     };
 
-    match run_review(exec, request, settings)? {
+    match run_review(exec, request, settings, timeout)? {
         ReviewDecision::NotNeeded => pass(bd, request),
         ReviewDecision::Ship { record, attempts } => {
             pass_with_review(bd, request, attempts.len() as u64, Some(record), attempts)
@@ -481,20 +561,19 @@ fn review_or_pass<B: BdClient + ?Sized, E: Exec + ?Sized>(
             findings,
             attempts,
         } => review_revise(bd, request, record, &findings, attempts),
-        ReviewDecision::Failed {
+        ReviewDecision::InfrastructureFailure {
             dispatches,
             record,
             attempts,
             summary,
-        } => fail_with_review(
-            bd,
-            request,
-            VerifyDecision::Failed,
+        } => Ok(VerifyOutcome {
+            decision: VerifyDecision::PendingReview,
+            verify_passed: false,
             summary,
-            dispatches,
-            record,
-            attempts,
-        ),
+            review_dispatches: dispatches,
+            review: record,
+            review_attempts: attempts,
+        }),
     }
 }
 
@@ -559,12 +638,13 @@ fn run_review<E: Exec + ?Sized>(
     exec: &E,
     request: &VerifyRequest,
     settings: &ReviewSettings,
+    timeout: Duration,
 ) -> Result<ReviewDecision> {
     let reviewer = match reviewer_for(settings) {
         ReviewerSelection::NotNeeded => return Ok(ReviewDecision::NotNeeded),
         ReviewerSelection::Reviewer(reviewer) => reviewer,
         ReviewerSelection::MissingReviewer(floor) => {
-            return Ok(ReviewDecision::Failed {
+            return Ok(ReviewDecision::InfrastructureFailure {
                 dispatches: 0,
                 record: None,
                 attempts: Vec::new(),
@@ -575,14 +655,23 @@ fn run_review<E: Exec + ?Sized>(
         }
     };
     let prompt = review_prompt(request, settings, reviewer);
-    let run = run_spawn(exec, &review_spawn(request, reviewer, &prompt)?)?;
+    let run = run_spawn_with_timeout(exec, &review_spawn(request, reviewer, &prompt)?, timeout)?;
+    if run.timed_out {
+        let summary = "qualitative review timed out".to_string();
+        return Ok(ReviewDecision::InfrastructureFailure {
+            dispatches: 1,
+            record: Some(review_record(reviewer, false, &summary)),
+            attempts: vec![review_record(reviewer, false, &summary)],
+            summary,
+        });
+    }
     if !run.status.success() {
         let summary = format!(
             "qualitative review failed with {}: {}",
             status_summary(run.status),
             summarize_file(&run.stderr_path)
         );
-        return Ok(ReviewDecision::Failed {
+        return Ok(ReviewDecision::InfrastructureFailure {
             dispatches: 1,
             record: Some(review_record(reviewer, false, &summary)),
             attempts: vec![review_record(reviewer, false, &summary)],
@@ -606,10 +695,21 @@ fn run_review<E: Exec + ?Sized>(
                 &format!("qualitative review initial attempt: {summary}"),
             );
             let repair_prompt = review_repair_prompt(&prompt, &run.stdout_path);
-            let repair_run = run_spawn(
+            let repair_run = run_spawn_with_timeout(
                 exec,
                 &review_repair_spawn(request, reviewer, &repair_prompt)?,
+                timeout,
             )?;
+            if repair_run.timed_out {
+                let repair_summary = "qualitative review repair timed out".to_string();
+                let repair_record = review_record(reviewer, false, &repair_summary);
+                return Ok(ReviewDecision::InfrastructureFailure {
+                    dispatches: 2,
+                    record: Some(repair_record.clone()),
+                    attempts: vec![initial_record, repair_record],
+                    summary: repair_summary,
+                });
+            }
             if !repair_run.status.success() {
                 let repair_summary = format!(
                     "qualitative review repair failed with {}: {}",
@@ -617,7 +717,7 @@ fn run_review<E: Exec + ?Sized>(
                     summarize_file(&repair_run.stderr_path)
                 );
                 let repair_record = review_record(reviewer, false, &repair_summary);
-                return Ok(ReviewDecision::Failed {
+                return Ok(ReviewDecision::InfrastructureFailure {
                     dispatches: 2,
                     record: Some(repair_record),
                     attempts: vec![
@@ -640,7 +740,7 @@ fn run_review<E: Exec + ?Sized>(
                     let repair_summary =
                         format!("qualitative review repair attempt: {repair_summary}");
                     let repair_record = review_record(reviewer, false, &repair_summary);
-                    return Ok(ReviewDecision::Failed {
+                    return Ok(ReviewDecision::InfrastructureFailure {
                         dispatches: 2,
                         record: Some(repair_record),
                         attempts: vec![
@@ -1416,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn qualitative_review_repair_failure_is_bounded_and_fails_closed() {
+    fn qualitative_review_repair_failure_is_bounded_and_remains_pending() {
         let temp = TempDir::new("qualitative-review-repair-failure");
         let request = request(
             temp.path(),
@@ -1447,15 +1547,14 @@ mod tests {
             run_with_review_backoff(&bd, &exec, &commits, &request, &settings, Duration::ZERO)
                 .expect("invalid repair is a normal verify failure");
 
-        assert_eq!(outcome.decision, VerifyDecision::Failed);
+        assert_eq!(outcome.decision, VerifyDecision::PendingReview);
         assert_eq!(outcome.review_dispatches, 2);
         assert_eq!(outcome.review_attempts.len(), 2);
         assert_eq!(exec.spawns().len(), 3, "no third repair call");
         assert_eq!(bd.close_count(), 0);
-        assert_release_then_comment_contains(
-            &bd.events(),
-            &request.repo,
-            "qualitative review repair attempt",
+        assert!(
+            bd.events().is_empty(),
+            "review infrastructure failure must keep the claim for resume"
         );
     }
 
@@ -2125,6 +2224,10 @@ mod tests {
     impl CommitProbe for FakeCommits {
         fn head(&self, _repo: &Path) -> crate::dispatch::Result<Option<String>> {
             Ok(self.heads.borrow_mut().remove(0))
+        }
+
+        fn is_clean(&self, _repo: &Path) -> crate::dispatch::Result<bool> {
+            Ok(true)
         }
     }
 

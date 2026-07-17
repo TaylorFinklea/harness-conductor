@@ -24,7 +24,8 @@ use crate::plan::{
     item_authorization_hash,
 };
 use crate::run::{
-    EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier,
+    EventInput, EventKind, NewRun, RunHandle, RunJob, RunLimits, RunTarget, RunVerifier, WorkStage,
+    WorkState,
 };
 use crate::triage::{self, CandidateRejection};
 use crate::verify::{self, ReviewSettings, VerifyDecision, VerifyRequest};
@@ -43,6 +44,8 @@ pub(crate) enum ApprovalGate {
 pub(crate) struct DispatchCycleOptions {
     item_timeout: Duration,
     heartbeat_interval: Duration,
+    #[cfg(test)]
+    interrupt_before_review: bool,
 }
 
 impl DispatchCycleOptions {
@@ -50,6 +53,8 @@ impl DispatchCycleOptions {
         Self {
             item_timeout: Duration::from_secs(u64::from(cfg.budgets.item_wall_clock_mins) * 60),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            #[cfg(test)]
+            interrupt_before_review: false,
         }
     }
 
@@ -58,7 +63,14 @@ impl DispatchCycleOptions {
         Self {
             item_timeout: Duration::from_secs(30),
             heartbeat_interval,
+            interrupt_before_review: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn interrupt_before_review(mut self) -> Self {
+        self.interrupt_before_review = true;
+        self
     }
 }
 
@@ -223,7 +235,9 @@ pub(crate) fn run_dispatch_cycle<
         dispatched += attempt.dispatches;
         match attempt.decision {
             Some(VerifyDecision::Passed) => verified += 1,
-            Some(VerifyDecision::Failed | VerifyDecision::HardError) => failed += 1,
+            Some(
+                VerifyDecision::Failed | VerifyDecision::HardError | VerifyDecision::PendingReview,
+            ) => failed += 1,
             None => {}
         }
     }
@@ -494,6 +508,31 @@ fn dispatch_one<
             });
         }
     };
+    let pending_run =
+        crate::run::find_pending_work_run(state_dir, cycle_id, &canonical_repo, &item.issue_id)
+            .map_err(run_artifact_error)?;
+    if let Some(run_id) = pending_run {
+        return resume_pending_review(
+            cfg,
+            bd,
+            exec,
+            commits,
+            state_dir,
+            ledger_path,
+            cycle_id,
+            options,
+            live,
+            report_path,
+            cycle_start,
+            item,
+            progress,
+            roster,
+            &repo_path,
+            &canonical_repo,
+            &current,
+            &run_id,
+        );
+    }
     if current.status != "open" {
         record_replan_required(report_path, item, "issue is no longer open")?;
         return Ok(DispatchOneResult {
@@ -701,7 +740,7 @@ fn dispatch_one<
         dispatched_model: active_roster.clone(),
         item_tier_floor: extracted.routing.tier_floor,
     };
-    let outcome = match verify::run_with_review(bd, exec, commits, &verify_request, &review) {
+    let mechanical = match verify::run_mechanical(bd, exec, commits, &verify_request) {
         Ok(outcome) => outcome,
         Err(error) => {
             run_artifacts
@@ -710,54 +749,327 @@ fn dispatch_one<
             return Err(DispatchCycleError::message(format!("verify: {error}")));
         }
     };
-    record_verify_events(
+    let worker_commit = match mechanical {
+        verify::MechanicalOutcome::Passed { worker_commit } => worker_commit,
+        verify::MechanicalOutcome::Failed(outcome) => {
+            record_incomplete_verification_events(
+                &mut run_artifacts,
+                state_dir,
+                cycle_id,
+                &item.issue_id,
+            )?;
+            run_artifacts
+                .finish(verify_decision_label(outcome.decision))
+                .map_err(run_artifact_error)?;
+            append_outcome_ledger(
+                cfg,
+                ledger_path,
+                &item.repo,
+                &claimed,
+                &extracted,
+                &active_roster,
+                cycle_id,
+                &outcome,
+            )?;
+            return Ok(DispatchOneResult {
+                decision: Some(outcome.decision),
+                dispatches: worker_attempt.attempts + outcome.review_dispatches,
+            });
+        }
+    };
+    let post_verify_head = commits
+        .head(&verify_request.repo)
+        .map_err(|error| DispatchCycleError::message(format!("git head after verify: {error}")))?;
+    if post_verify_head.as_deref() != Some(worker_commit.as_str()) {
+        return Err(DispatchCycleError::message(
+            "worker commit changed during mechanical verification",
+        ));
+    }
+    if !commits
+        .is_clean(&verify_request.repo)
+        .map_err(|error| DispatchCycleError::message(format!("git status after verify: {error}")))?
+    {
+        return Err(DispatchCycleError::message(
+            "repository is dirty after mechanical verification",
+        ));
+    }
+    let verifier_refs =
+        capture_mechanical_logs(&run_artifacts, state_dir, cycle_id, &item.issue_id)?;
+    run_artifacts
+        .checkpoint_pending_review(
+            &active_roster.name,
+            &worker_commit,
+            &extracted.verify_cmd,
+            verifier_refs,
+        )
+        .map_err(run_artifact_error)?;
+    if interrupt_before_review(options) {
+        return Err(DispatchCycleError::message(
+            "simulated process interruption before qualitative review",
+        ));
+    }
+    let outcome =
+        verify::run_review_stage(bd, exec, &verify_request, &review, options.item_timeout)
+            .map_err(|error| DispatchCycleError::message(format!("review: {error}")))?;
+    record_review_events(
         &mut run_artifacts,
         state_dir,
         cycle_id,
         &item.issue_id,
         &outcome,
     )?;
-    run_artifacts
-        .finish(verify_decision_label(outcome.decision))
-        .map_err(run_artifact_error)?;
-    for review in &outcome.review_attempts {
-        let reviewer = cfg
-            .roster
-            .iter()
-            .find(|entry| entry.name == review.model)
-            .ok_or_else(|| {
-                DispatchCycleError::message(format!(
-                    "review referenced unknown model {}",
-                    review.model
-                ))
-            })?;
-        append_ledger(
+    if outcome.decision != VerifyDecision::PendingReview {
+        run_artifacts
+            .finish(verify_decision_label(outcome.decision))
+            .map_err(run_artifact_error)?;
+    }
+    if outcome.decision == VerifyDecision::PendingReview {
+        append_review_ledger(
+            cfg,
             ledger_path,
-            reviewer,
             &item.repo,
             &claimed,
             &extracted,
-            "review",
-            review.verify_passed,
             cycle_id,
-            &review.summary,
+            &outcome,
+        )?;
+    } else {
+        append_outcome_ledger(
+            cfg,
+            ledger_path,
+            &item.repo,
+            &claimed,
+            &extracted,
+            &active_roster,
+            cycle_id,
+            &outcome,
         )?;
     }
-    append_ledger(
-        ledger_path,
-        &active_roster,
-        &item.repo,
-        &claimed,
-        &extracted,
-        "implement",
-        outcome.verify_passed,
-        cycle_id,
-        &outcome.summary,
-    )?;
     Ok(DispatchOneResult {
         decision: Some(outcome.decision),
         dispatches: worker_attempt.attempts + outcome.review_dispatches,
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "resume revalidates every persisted boundary before review"
+)]
+fn resume_pending_review<
+    B: BdClient + ?Sized,
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+    L: LiveSink + ?Sized,
+>(
+    cfg: &Config,
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    state_dir: &Path,
+    ledger_path: &Path,
+    cycle_id: &str,
+    options: &DispatchCycleOptions,
+    live: &L,
+    report_path: &Path,
+    cycle_start: Instant,
+    item: &PlannedItem,
+    progress: Option<f64>,
+    selected_roster: &RosterEntry,
+    repo_path: &Path,
+    canonical_repo: &str,
+    current: &Issue,
+    run_id: &str,
+) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
+    if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
+        return Err(DispatchCycleError::message(
+            "pending-review repository lease is no longer held by conductor",
+        ));
+    }
+    let extracted =
+        validate_item_authorization(cfg, item, selected_roster, canonical_repo, current).map_err(
+            |reason| {
+                DispatchCycleError::message(format!("pending-review approval is stale: {reason}"))
+            },
+        )?;
+    let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    let manifest = run_artifacts.manifest().clone();
+    let work = run_artifacts
+        .work()
+        .cloned()
+        .ok_or_else(|| DispatchCycleError::message("pending-review run has no work state"))?;
+    if work.stage != WorkStage::PendingReview
+        || work.cycle_id != cycle_id
+        || work.authorization_sha256 != item.authorization_sha256
+    {
+        return Err(DispatchCycleError::message(
+            "pending-review run does not match the approved cycle item",
+        ));
+    }
+    if manifest.verifier.mechanical.as_deref() != Some(extracted.verify_cmd.as_str()) {
+        return Err(DispatchCycleError::message(
+            "pending-review verifier command changed after mechanical verification",
+        ));
+    }
+    if manifest.verifier.qualitative != qualitative_verifier_label(cfg) {
+        return Err(DispatchCycleError::message(
+            "pending-review qualitative verifier configuration changed",
+        ));
+    }
+    validate_pending_approval(
+        &run_artifacts.approval().map_err(run_artifact_error)?,
+        item,
+        cycle_id,
+        canonical_repo,
+    )?;
+
+    let worker_commit = work
+        .worker_commit
+        .as_deref()
+        .ok_or_else(|| DispatchCycleError::message("pending-review run has no worker commit"))?;
+    let current_head = commits
+        .head(repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("resume git head: {error}")))?;
+    if current_head.as_deref() != Some(worker_commit) {
+        return Err(DispatchCycleError::message(format!(
+            "pending-review worker commit changed: expected {worker_commit}, found {}",
+            current_head.as_deref().unwrap_or("<none>")
+        )));
+    }
+    if !commits
+        .is_clean(repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("resume git status: {error}")))?
+    {
+        return Err(DispatchCycleError::message(
+            "pending-review repository is dirty",
+        ));
+    }
+
+    let worker_profile = work
+        .worker_profile
+        .as_deref()
+        .ok_or_else(|| DispatchCycleError::message("pending-review run has no worker profile"))?;
+    let approved_chain = fallback_chain(
+        &cfg.roster,
+        selected_roster,
+        item.approved_route.as_ref(),
+        cfg.budgets.use_bursar,
+    )?;
+    let active_roster = approved_chain
+        .into_iter()
+        .find(|entry| entry.name == worker_profile)
+        .ok_or_else(|| {
+            DispatchCycleError::message(
+                "pending-review worker profile is outside the approved provider envelope",
+            )
+        })?;
+
+    run_artifacts
+        .ensure_pending_review_event()
+        .map_err(run_artifact_error)?;
+
+    patch_live(
+        live,
+        report_path,
+        cycle_start,
+        format!("resume review {}/{}", item.repo, item.issue_id),
+        progress,
+    )?;
+    let verify_request = VerifyRequest {
+        repo: repo_path.to_path_buf(),
+        state_dir: state_dir.to_path_buf(),
+        cycle_id: cycle_id.to_string(),
+        issue: current.clone(),
+        verify_cmd: extracted.verify_cmd.clone(),
+        verify: cfg.verify.clone(),
+        worker_status: dispatch::DispatchStatus::Success,
+        before_head: None,
+    };
+    let review = ReviewSettings {
+        config: cfg.review.clone(),
+        roster: cfg.roster.clone(),
+        dispatched_model: active_roster.clone(),
+        item_tier_floor: extracted.routing.tier_floor,
+    };
+    let outcome =
+        verify::run_review_stage(bd, exec, &verify_request, &review, options.item_timeout)
+            .map_err(|error| DispatchCycleError::message(format!("resume review: {error}")))?;
+    record_review_events(
+        &mut run_artifacts,
+        state_dir,
+        cycle_id,
+        &item.issue_id,
+        &outcome,
+    )?;
+    if outcome.decision != VerifyDecision::PendingReview {
+        run_artifacts
+            .finish(verify_decision_label(outcome.decision))
+            .map_err(run_artifact_error)?;
+    }
+    if outcome.decision == VerifyDecision::PendingReview {
+        append_review_ledger(
+            cfg,
+            ledger_path,
+            &item.repo,
+            current,
+            &extracted,
+            cycle_id,
+            &outcome,
+        )?;
+    } else {
+        append_outcome_ledger(
+            cfg,
+            ledger_path,
+            &item.repo,
+            current,
+            &extracted,
+            &active_roster,
+            cycle_id,
+            &outcome,
+        )?;
+    }
+    Ok(DispatchOneResult {
+        decision: Some(outcome.decision),
+        dispatches: outcome.review_dispatches,
+    })
+}
+
+fn validate_pending_approval(
+    approval: &serde_json::Value,
+    item: &PlannedItem,
+    cycle_id: &str,
+    canonical_repo: &str,
+) -> std::result::Result<(), DispatchCycleError> {
+    let expected_scope = serde_json::to_value(&item.approval_scope).map_err(|error| {
+        DispatchCycleError::message(format!("serialize approval scope: {error}"))
+    })?;
+    let expected_route = serde_json::to_value(item.approved_route.as_ref()).map_err(|error| {
+        DispatchCycleError::message(format!("serialize approved provider route: {error}"))
+    })?;
+    let valid = approval.get("schema").and_then(serde_json::Value::as_str)
+        == Some("conductor/work-approval@1")
+        && approval.get("cycle_id").and_then(serde_json::Value::as_str) == Some(cycle_id)
+        && approval.get("decision").and_then(serde_json::Value::as_str) == Some("approved")
+        && approval.get("scope") == Some(&expected_scope)
+        && approval
+            .pointer("/item/repo")
+            .and_then(serde_json::Value::as_str)
+            == Some(canonical_repo)
+        && approval
+            .pointer("/item/issue_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(item.issue_id.as_str())
+        && approval
+            .pointer("/item/authorization_sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(item.authorization_sha256.as_str())
+        && approval.pointer("/item/provider_route") == Some(&expected_route);
+    if !valid {
+        return Err(DispatchCycleError::message(
+            "pending-review approval artifact is stale or mismatched",
+        ));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -1092,15 +1404,29 @@ fn create_work_run(
             },
             verifier: RunVerifier {
                 mechanical: Some(verify_cmd.to_string()),
-                qualitative: cfg
-                    .review
-                    .enabled
-                    .then(|| "tiered-qualitative-review".to_string()),
+                qualitative: qualitative_verifier_label(cfg),
             },
+            work: Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: item.authorization_sha256.clone(),
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+            }),
             approval: Some(approval),
         },
     )
     .map_err(run_artifact_error)
+}
+
+fn qualitative_verifier_label(cfg: &Config) -> Option<String> {
+    cfg.review.enabled.then(|| {
+        format!(
+            "tiered-qualitative-review:min_tier_gap={}",
+            cfg.review.min_tier_gap
+        )
+    })
 }
 
 fn capture_dispatch_result(
@@ -1126,12 +1452,32 @@ fn capture_dispatch_result(
     ])
 }
 
-fn record_verify_events(
+fn capture_mechanical_logs(
+    run_artifacts: &RunHandle,
+    state_dir: &Path,
+    cycle_id: &str,
+    bead_id: &str,
+) -> std::result::Result<Vec<crate::run::ArtifactRef>, DispatchCycleError> {
+    let refs = capture_named_logs_if_present(
+        run_artifacts,
+        &state_dir.join("logs").join(cycle_id),
+        bead_id,
+        "verify",
+        Path::new("artifacts/verify"),
+    )?;
+    if refs.is_empty() {
+        return Err(DispatchCycleError::message(
+            "mechanical verification passed without durable log evidence",
+        ));
+    }
+    Ok(refs)
+}
+
+fn record_incomplete_verification_events(
     run_artifacts: &mut RunHandle,
     state_dir: &Path,
     cycle_id: &str,
     bead_id: &str,
-    outcome: &verify::VerifyOutcome,
 ) -> std::result::Result<(), DispatchCycleError> {
     let log_dir = state_dir.join("logs").join(cycle_id);
     let verify_refs = capture_named_logs_if_present(
@@ -1157,37 +1503,57 @@ fn record_verify_events(
                 EventKind::VerifyFinished,
                 EventInput {
                     artifact_refs: verify_refs,
-                    outcome: Some(if outcome.verify_passed {
-                        "passed".to_string()
-                    } else {
-                        "failed".to_string()
-                    }),
+                    outcome: Some("failed".to_string()),
                     ..EventInput::default()
                 },
             )
             .map_err(run_artifact_error)?;
     }
 
+    run_artifacts
+        .append_event(
+            EventKind::CoverageGap,
+            EventInput {
+                outcome: Some("qualitative_review_not_run".to_string()),
+                ..EventInput::default()
+            },
+        )
+        .map_err(run_artifact_error)
+}
+
+fn record_review_events(
+    run_artifacts: &mut RunHandle,
+    state_dir: &Path,
+    cycle_id: &str,
+    bead_id: &str,
+    outcome: &verify::VerifyOutcome,
+) -> std::result::Result<(), DispatchCycleError> {
     if outcome.review_attempts.is_empty() {
         run_artifacts
             .append_event(
                 EventKind::CoverageGap,
                 EventInput {
-                    outcome: Some("qualitative_review_not_run".to_string()),
+                    outcome: Some("qualitative_review_not_required".to_string()),
                     ..EventInput::default()
                 },
             )
             .map_err(run_artifact_error)?;
         return Ok(());
     }
-
+    let prior_reviews = crate::run::read_events(&run_artifacts.events_path())
+        .map_err(run_artifact_error)?
+        .iter()
+        .filter(|event| event.kind == EventKind::ReviewFinished)
+        .count();
+    let log_dir = state_dir.join("logs").join(cycle_id);
     for (index, review) in outcome.review_attempts.iter().enumerate() {
         let suffix = if index == 0 {
             "review"
         } else {
             "review-repair"
         };
-        let destination = PathBuf::from(format!("artifacts/review-{:03}", index + 1));
+        let destination =
+            PathBuf::from(format!("artifacts/review-{:03}", prior_reviews + index + 1));
         let artifact_refs =
             capture_named_logs_if_present(run_artifacts, &log_dir, bead_id, suffix, &destination)?;
         run_artifacts
@@ -1202,6 +1568,81 @@ fn record_verify_events(
             .map_err(run_artifact_error)?;
     }
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ledger rows retain the exact work/review identities"
+)]
+fn append_outcome_ledger(
+    cfg: &Config,
+    ledger_path: &Path,
+    repo: &str,
+    issue: &Issue,
+    fields: &ExtractedFields,
+    worker: &RosterEntry,
+    cycle_id: &str,
+    outcome: &verify::VerifyOutcome,
+) -> std::result::Result<(), DispatchCycleError> {
+    append_review_ledger(cfg, ledger_path, repo, issue, fields, cycle_id, outcome)?;
+    append_ledger(
+        ledger_path,
+        worker,
+        repo,
+        issue,
+        fields,
+        "implement",
+        outcome.verify_passed,
+        cycle_id,
+        &outcome.summary,
+    )
+}
+
+fn append_review_ledger(
+    cfg: &Config,
+    ledger_path: &Path,
+    repo: &str,
+    issue: &Issue,
+    fields: &ExtractedFields,
+    cycle_id: &str,
+    outcome: &verify::VerifyOutcome,
+) -> std::result::Result<(), DispatchCycleError> {
+    for review in &outcome.review_attempts {
+        let reviewer = cfg
+            .roster
+            .iter()
+            .find(|entry| entry.name == review.model)
+            .ok_or_else(|| {
+                DispatchCycleError::message(format!(
+                    "review referenced unknown model {}",
+                    review.model
+                ))
+            })?;
+        append_ledger(
+            ledger_path,
+            reviewer,
+            repo,
+            issue,
+            fields,
+            "review",
+            review.verify_passed,
+            cycle_id,
+            &review.summary,
+        )?;
+    }
+    Ok(())
+}
+
+fn interrupt_before_review(options: &DispatchCycleOptions) -> bool {
+    #[cfg(test)]
+    {
+        options.interrupt_before_review
+    }
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        false
+    }
 }
 
 fn capture_named_logs_if_present(
@@ -1230,6 +1671,7 @@ fn verify_decision_label(decision: VerifyDecision) -> &'static str {
         VerifyDecision::Passed => "verified",
         VerifyDecision::Failed => "failed",
         VerifyDecision::HardError => "hard_error",
+        VerifyDecision::PendingReview => "pending_review",
     }
 }
 
@@ -2661,6 +3103,468 @@ dispatch_id = "senior-reviewer"
     #[test]
     #[expect(
         clippy::too_many_lines,
+        reason = "regression keeps both failed review and resumed close in one cycle fixture"
+    )]
+    fn resume_bursar_d6r_regression_reuses_verified_commit_after_review_schema_failure() {
+        let temp = TempDir::new("resume-bursar-d6r");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = true
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+
+[[roster]]
+name = "senior-reviewer"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "senior-reviewer"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger/model-bench.jsonl");
+        let cycle_id = "cycle-20260717-015903";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = PendingReviewExec::new();
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let live = RecordingLiveSink::new(true);
+        let bursar = FakeBursarClient::unavailable();
+
+        let first = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            &bursar,
+        )
+        .expect("schema failure leaves a resumable review");
+        assert_eq!(first.verified, 0);
+        assert_eq!(first.failed, 1);
+        assert_eq!(
+            bd.release_count(),
+            0,
+            "review infrastructure failure keeps the lease"
+        );
+        let pending_rows = std::fs::read_to_string(&ledger).expect("pending review ledger");
+        assert_eq!(pending_rows.lines().count(), 2);
+        assert!(pending_rows.lines().all(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("pending ledger row")
+                .get("role")
+                == Some(&serde_json::json!("review"))
+        }));
+
+        let second = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            &bursar,
+        )
+        .expect("pending review resumes against the verified commit");
+
+        assert_eq!(second.verified, 1);
+        assert_eq!(second.failed, 0);
+        assert_eq!(
+            exec.worker_spawns(),
+            1,
+            "resume must not ask for another commit"
+        );
+        assert_eq!(bd.close_count(), 1, "the original bead closes once");
+        let completed_rows = std::fs::read_to_string(&ledger).expect("completed review ledger");
+        let roles = completed_rows
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("completed ledger row")
+                    ["role"]
+                    .as_str()
+                    .expect("ledger role")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["review", "review", "review", "implement"]);
+
+        let repeated = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            &bursar,
+        )
+        .expect("repeating a completed resume is idempotent");
+        assert_eq!(repeated.dispatched, 0);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(bd.close_count(), 1, "repeated resume cannot close twice");
+        assert_eq!(
+            std::fs::read_to_string(&ledger)
+                .expect("idempotent ledger")
+                .lines()
+                .count(),
+            4,
+            "repeated resume cannot duplicate work or review ledger rows"
+        );
+    }
+
+    struct ResumeFixture {
+        _temp: TempDir,
+        cfg: Config,
+        repo: PathBuf,
+        state: PathBuf,
+        reports: PathBuf,
+        ledger: PathBuf,
+        cycle_id: String,
+        bd: RecordingBdClient,
+    }
+
+    impl ResumeFixture {
+        fn new(label: &str) -> Self {
+            let temp = TempDir::new(label);
+            let fleet = temp.path().join("fleet");
+            std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+            let repo = fleet.join("sandbox-repo");
+            init_sandbox_repo_without_bd(&repo);
+            let cfg = config::parse_str(&format!(
+                r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = false
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = true
+min_tier_gap = 1
+
+[[roster]]
+name = "fake-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fake-worker"
+
+[[roster]]
+name = "senior-reviewer"
+tier = "senior"
+ceiling = "M"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "senior-reviewer"
+"#,
+                fleet.display()
+            ))
+            .expect("config parses");
+            let state = temp.path().join("state");
+            let reports = temp.path().join("reports");
+            let ledger = temp.path().join("ledger/model-bench.jsonl");
+            let cycle_id = format!("cycle-resume-{label}");
+            write_plan_with_proposal(
+                &state,
+                &repo,
+                &cycle_id,
+                "sandbox-repo",
+                "sandbox-1",
+                "fake-worker",
+                &["fake-worker"],
+                &cfg.roster,
+                &sandbox_issue(),
+            );
+            write_report(&reports, &cycle_id);
+            write_response(&reports, &cycle_id, "approved");
+            Self {
+                _temp: temp,
+                cfg,
+                repo,
+                state,
+                reports,
+                ledger,
+                cycle_id,
+                bd: RecordingBdClient::new(sandbox_issue()),
+            }
+        }
+
+        fn dispatch<E: Exec + ?Sized>(
+            &self,
+            exec: &E,
+            options: &DispatchCycleOptions,
+        ) -> std::result::Result<DispatchCycleResult, DispatchCycleError> {
+            run_dispatch_cycle(
+                &self.cfg,
+                &self.bd,
+                exec,
+                &GitCommitProbe,
+                &self.reports,
+                &self.state,
+                &self.ledger,
+                &self.cycle_id,
+                options,
+                &RecordingLiveSink::new(true),
+                &FakeBursarClient::unavailable(),
+            )
+        }
+
+        fn pending_run_dir(&self) -> PathBuf {
+            single_contract_run(&self.state)
+        }
+    }
+
+    #[test]
+    fn resume_process_interruption_before_review_uses_persisted_verified_checkpoint() {
+        let fixture = ResumeFixture::new("interrupt-before-review");
+        let exec = PendingReviewExec::ship_immediately();
+        let interrupted =
+            DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
+        let error = fixture
+            .dispatch(&exec, &interrupted)
+            .expect_err("test interruption stops before review");
+        assert!(error.to_string().contains("process interruption"));
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(exec.review_spawns(), 0);
+
+        let run_dir = fixture.pending_run_dir();
+        let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
+            .expect("pending manifest validates");
+        let work = manifest.work.expect("work state");
+        assert_eq!(work.stage, WorkStage::PendingReview);
+        assert_eq!(
+            work.worker_commit.as_deref(),
+            Some(git(&fixture.repo, &["rev-parse", "HEAD"]).trim())
+        );
+        let mechanical = work.mechanical.expect("mechanical checkpoint");
+        assert!(mechanical.passed);
+        assert_eq!(mechanical.command, "test -f worker.txt");
+        assert!(!mechanical.artifact_refs.is_empty());
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("pending review resumes");
+        assert_eq!(resumed.verified, 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(fixture.bd.close_count(), 1);
+    }
+
+    #[test]
+    fn resume_reviewer_timeout_keeps_pending_state_then_retries_only_review() {
+        let fixture = ResumeFixture::new("review-timeout");
+        let exec = PendingReviewExec::timeout_then_ship();
+        let first = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("review timeout is a resumable outcome");
+        assert_eq!(first.failed, 1);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(exec.review_spawns(), 1);
+        let manifest = crate::run::read_manifest(&fixture.pending_run_dir().join("manifest.json"))
+            .expect("timeout leaves valid run");
+        assert_eq!(
+            manifest.work.expect("work state").stage,
+            WorkStage::PendingReview
+        );
+
+        let second = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("review retries after timeout");
+        assert_eq!(second.verified, 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(fixture.bd.close_count(), 1);
+    }
+
+    #[test]
+    fn resume_changed_head_fails_closed_without_review_or_close() {
+        let fixture = ResumeFixture::new("changed-head");
+        let exec = PendingReviewExec::ship_immediately();
+        let interrupted =
+            DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
+        fixture
+            .dispatch(&exec, &interrupted)
+            .expect_err("interrupt before review");
+        std::fs::write(fixture.repo.join("changed.txt"), b"changed\n").expect("write change");
+        run(&fixture.repo, "git", &["add", "changed.txt"]);
+        run(
+            &fixture.repo,
+            "git",
+            &["commit", "-m", "test: change pending head"],
+        );
+
+        let error = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect_err("changed head fails closed");
+        assert!(error.to_string().contains("worker commit changed"));
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+    }
+
+    #[test]
+    fn resume_dirty_tree_fails_closed_without_review_or_close() {
+        let fixture = ResumeFixture::new("dirty-tree");
+        let exec = PendingReviewExec::ship_immediately();
+        let interrupted =
+            DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
+        fixture
+            .dispatch(&exec, &interrupted)
+            .expect_err("interrupt before review");
+        std::fs::write(fixture.repo.join("dirty.txt"), b"dirty\n").expect("write dirty file");
+
+        let error = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect_err("dirty tree fails closed");
+        assert!(error.to_string().contains("repository is dirty"));
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+    }
+
+    #[test]
+    fn resume_mismatched_verifier_command_and_stale_approval_fail_closed() {
+        for (label, mutate) in [("verifier-command", "verify"), ("stale-approval", "title")] {
+            let fixture = ResumeFixture::new(label);
+            let exec = PendingReviewExec::ship_immediately();
+            let interrupted =
+                DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
+            fixture
+                .dispatch(&exec, &interrupted)
+                .expect_err("interrupt before review");
+            if mutate == "verify" {
+                fixture.bd.set_verify_cmd("cargo test changed");
+            } else {
+                fixture.bd.set_title("changed after approval");
+            }
+
+            let error = fixture
+                .dispatch(
+                    &exec,
+                    &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                )
+                .expect_err("stale resume input fails closed");
+            assert!(
+                error.to_string().contains("approval is stale"),
+                "{label}: {error}"
+            );
+            assert_eq!(exec.review_spawns(), 0, "{label}");
+            assert_eq!(fixture.bd.close_count(), 0, "{label}");
+        }
+    }
+
+    #[test]
+    fn resume_altered_verifier_artifact_fails_hash_validation() {
+        let fixture = ResumeFixture::new("altered-artifact");
+        let exec = PendingReviewExec::ship_immediately();
+        let interrupted =
+            DispatchCycleOptions::for_tests(Duration::from_millis(1)).interrupt_before_review();
+        fixture
+            .dispatch(&exec, &interrupted)
+            .expect_err("interrupt before review");
+        let run_dir = fixture.pending_run_dir();
+        let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
+            .expect("manifest before tamper");
+        let artifact = manifest
+            .work
+            .and_then(|work| work.mechanical)
+            .and_then(|mechanical| mechanical.artifact_refs.into_iter().next())
+            .expect("verifier artifact");
+        std::fs::write(run_dir.join(artifact.path), b"tampered\n").expect("tamper artifact");
+
+        let error = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect_err("artifact tamper fails closed");
+        assert!(error.to_string().contains("artifact hash mismatch"));
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
         reason = "end-to-end provider fallback fixture verifies writeback ordering and final close together"
     )]
     fn fallback_e2e_retries_retryable_worker_failure_and_verifies_fallback_commit() {
@@ -4045,6 +4949,10 @@ dispatch_id = "fake-worker"
         fn head(&self, _repo: &Path) -> crate::dispatch::Result<Option<String>> {
             panic!("commit probe should not run")
         }
+
+        fn is_clean(&self, _repo: &Path) -> crate::dispatch::Result<bool> {
+            panic!("commit probe should not run")
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4097,6 +5005,18 @@ dispatch_id = "fake-worker"
                 .iter()
                 .filter(|event| matches!(event, BdEvent::Claim { .. }))
                 .count()
+        }
+
+        fn set_title(&self, title: &str) {
+            self.issue.borrow_mut().title = title.to_string();
+        }
+
+        fn set_verify_cmd(&self, command: &str) {
+            self.issue
+                .borrow_mut()
+                .metadata
+                .get_or_insert_with(BTreeMap::new)
+                .insert("verify_cmd".to_string(), json!(command));
         }
     }
 
@@ -4255,6 +5175,112 @@ dispatch_id = "fake-worker"
         }
     }
 
+    struct PendingReviewExec {
+        spawns: RefCell<Vec<SpawnRequest>>,
+        worker_spawns: RefCell<usize>,
+        review_spawns: RefCell<usize>,
+        review_behaviors: RefCell<Vec<ReviewBehavior>>,
+    }
+
+    enum ReviewBehavior {
+        Output(&'static [u8]),
+        Timeout,
+    }
+
+    impl PendingReviewExec {
+        fn new() -> Self {
+            Self::with_reviews(vec![
+                ReviewBehavior::Output(b"not verdict json"),
+                ReviewBehavior::Output(b"still not verdict json"),
+                ReviewBehavior::Output(br#"{"verdict":"ship","findings":[]}"#),
+            ])
+        }
+
+        fn ship_immediately() -> Self {
+            Self::with_reviews(vec![ReviewBehavior::Output(
+                br#"{"verdict":"ship","findings":[]}"#,
+            )])
+        }
+
+        fn timeout_then_ship() -> Self {
+            Self::with_reviews(vec![
+                ReviewBehavior::Timeout,
+                ReviewBehavior::Output(br#"{"verdict":"ship","findings":[]}"#),
+            ])
+        }
+
+        fn with_reviews(review_behaviors: Vec<ReviewBehavior>) -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+                worker_spawns: RefCell::new(0),
+                review_spawns: RefCell::new(0),
+                review_behaviors: RefCell::new(review_behaviors),
+            }
+        }
+
+        fn worker_spawns(&self) -> usize {
+            *self.worker_spawns.borrow()
+        }
+
+        fn review_spawns(&self) -> usize {
+            *self.review_spawns.borrow()
+        }
+    }
+
+    impl Exec for PendingReviewExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            self.spawns.borrow_mut().push(request.clone());
+            if request.argv.iter().any(|arg| arg == "senior-reviewer") {
+                *self.review_spawns.borrow_mut() += 1;
+                let behavior = self.review_behaviors.borrow_mut().remove(0);
+                std::fs::write(&request.stderr_path, b"").expect("write review stderr");
+                return match behavior {
+                    ReviewBehavior::Output(stdout) => {
+                        std::fs::write(&request.stdout_path, stdout).expect("write review stdout");
+                        Ok(Box::new(FakeChild::immediate(ProcessStatus::code(0))))
+                    }
+                    ReviewBehavior::Timeout => {
+                        std::fs::write(&request.stdout_path, b"").expect("write review stdout");
+                        Ok(Box::new(FakeChild::timeout_then_terminate()))
+                    }
+                };
+            }
+            if request.argv.first().map(String::as_str) == Some("pi") {
+                let worker = *self.worker_spawns.borrow();
+                *self.worker_spawns.borrow_mut() += 1;
+                std::fs::write(&request.stdout_path, b"worker ran\n").expect("write worker stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
+                if worker == 0 {
+                    std::fs::write(request.cwd.join("worker.txt"), b"done\n")
+                        .expect("write worker file");
+                    run(&request.cwd, "git", &["add", "worker.txt"]);
+                    run(
+                        &request.cwd,
+                        "git",
+                        &["commit", "-m", "worker: verified bursar-d6r artifact"],
+                    );
+                }
+                return Ok(Box::new(FakeChild::delayed_success()));
+            }
+            if request.argv.first().map(String::as_str) == Some("sh") {
+                let output = Command::new(&request.argv[0])
+                    .args(&request.argv[1..])
+                    .current_dir(&request.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("spawn verify shell");
+                std::fs::write(&request.stdout_path, &output.stdout).expect("write verify stdout");
+                std::fs::write(&request.stderr_path, &output.stderr).expect("write verify stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(
+                    output.status.code().unwrap_or(1),
+                ))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
     struct FallbackExec {
         spawns: RefCell<Vec<SpawnRequest>>,
         bursar: Option<FakeBursarClient>,
@@ -4349,6 +5375,13 @@ dispatch_id = "fake-worker"
             Self {
                 waits: Rc::new(RefCell::new(vec![Some(status)])),
                 wait_result: status,
+            }
+        }
+
+        fn timeout_then_terminate() -> Self {
+            Self {
+                waits: Rc::new(RefCell::new(vec![None, Some(ProcessStatus::signal())])),
+                wait_result: ProcessStatus::signal(),
             }
         }
     }

@@ -420,6 +420,7 @@ pub(crate) fn run(
                 mechanical: Some(ctx.verify_cmd.clone()),
                 qualitative: (!cfg.arena.judges.is_empty()).then(|| "arena-judges".to_string()),
             },
+            work: None,
             approval: None,
         },
     )?;

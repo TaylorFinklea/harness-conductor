@@ -264,7 +264,7 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
             }),
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
-            approval: None,
+            ..NewRun::default()
         },
     )
     .map_err(|error| CycleError::new(format!("run artifact: {error}")))?;

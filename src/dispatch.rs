@@ -138,6 +138,7 @@ pub(crate) trait ChildProcess {
 
 pub(crate) trait CommitProbe {
     fn head(&self, repo: &Path) -> Result<Option<String>>;
+    fn is_clean(&self, repo: &Path) -> Result<bool>;
 }
 
 pub(crate) fn run<E: Exec, C: CommitProbe>(
@@ -589,6 +590,31 @@ impl CommitProbe for GitCommitProbe {
         } else {
             Ok(Some(head))
         }
+    }
+
+    fn is_clean(&self, repo: &Path) -> Result<bool> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["status", "--porcelain", "--untracked-files=normal"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| {
+                DispatchError::new(format!(
+                    "failed to run git status in {}: {error}",
+                    repo.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(DispatchError::new(format!(
+                "git status failed in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(output.stdout.is_empty())
     }
 }
 
@@ -1090,6 +1116,10 @@ mod tests {
     impl CommitProbe for FakeCommits {
         fn head(&self, _repo: &Path) -> Result<Option<String>> {
             Ok(self.heads.borrow_mut().remove(0))
+        }
+
+        fn is_clean(&self, _repo: &Path) -> Result<bool> {
+            Ok(true)
         }
     }
 }

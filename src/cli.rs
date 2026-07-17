@@ -419,6 +419,7 @@ where
                 mechanical: None,
                 qualitative: Some("adversarial-synthesis-schema".to_string()),
             },
+            work: None,
             approval: Some(approval),
         },
     )
