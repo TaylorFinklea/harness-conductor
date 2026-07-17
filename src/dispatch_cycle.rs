@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -773,6 +774,7 @@ where
     let repo_cost_policy = cfg.cost_policy_for(&item.repo);
     let mut attempts = 0_u64;
     let mut deferred = Vec::new();
+    let mut cautious_providers = BTreeSet::new();
     for (idx, roster) in chain.iter().enumerate() {
         if let Some(rejection) =
             triage::candidate_rejection(roster, &fields.routing, repo_cost_policy)
@@ -786,39 +788,49 @@ where
             let decision =
                 bursar::evaluate_budget(bursar_client, &provider, cfg.budgets.use_bursar);
             record_budget_decision(report_path, item, roster, &decision)?;
-            if matches!(
-                decision.action,
-                BudgetAction::SpendCautiously | BudgetAction::Defer
-            ) {
-                deferred.push(decision.summary.clone());
-                let Some(next) =
-                    next_eligible_roster(&chain, idx + 1, &fields.routing, repo_cost_policy)
-                else {
-                    record_remaining_ineligible(
+            match decision.action {
+                BudgetAction::Defer => {
+                    deferred.push(decision.summary.clone());
+                    let Some(next) = next_eligible_roster(
                         &chain,
                         idx + 1,
-                        report_path,
-                        item,
                         &fields.routing,
                         repo_cost_policy,
-                        fields,
+                        &cautious_providers,
+                    ) else {
+                        record_remaining_ineligible(
+                            &chain,
+                            idx + 1,
+                            report_path,
+                            item,
+                            &fields.routing,
+                            repo_cost_policy,
+                            fields,
+                        )?;
+                        return Ok(WorkerChainOutcome::Deferred {
+                            summary: deferred.join("; "),
+                            attempts,
+                        });
+                    };
+                    patch_live(
+                        live,
+                        report_path,
+                        cycle_start,
+                        format!(
+                            "budget defer {}/{}: {} -> {}",
+                            item.repo, item.issue_id, roster.name, next.name
+                        ),
+                        progress,
                     )?;
-                    return Ok(WorkerChainOutcome::Deferred {
-                        summary: deferred.join("; "),
-                        attempts,
-                    });
-                };
-                patch_live(
-                    live,
-                    report_path,
-                    cycle_start,
-                    format!(
-                        "budget defer {}/{}: {} -> {}",
-                        item.repo, item.issue_id, roster.name, next.name
-                    ),
-                    progress,
-                )?;
-                continue;
+                    continue;
+                }
+                BudgetAction::SpendCautiously if !cautious_providers.insert(provider.clone()) => {
+                    record_cautious_cap_skip(report_path, item, roster, &provider)?;
+                    continue;
+                }
+                BudgetAction::Proceed
+                | BudgetAction::SpendCautiously
+                | BudgetAction::StaticCaps => {}
             }
         }
 
@@ -946,8 +958,13 @@ where
                 )?;
             }
         }
-        let Some(next) = next_eligible_roster(&chain, idx + 1, &fields.routing, repo_cost_policy)
-        else {
+        let Some(next) = next_eligible_roster(
+            &chain,
+            idx + 1,
+            &fields.routing,
+            repo_cost_policy,
+            &cautious_providers,
+        ) else {
             record_remaining_ineligible(
                 &chain,
                 idx + 1,
@@ -1348,11 +1365,34 @@ fn next_eligible_roster<'a>(
     start: usize,
     routing: &RoutingFields,
     repo_cost_policy: CostPolicy,
+    cautious_providers: &BTreeSet<String>,
 ) -> Option<&'a RosterEntry> {
-    chain
-        .iter()
-        .skip(start)
-        .find(|roster| triage::candidate_rejection(roster, routing, repo_cost_policy).is_none())
+    chain.iter().skip(start).find(|roster| {
+        triage::candidate_rejection(roster, routing, repo_cost_policy).is_none()
+            && (!is_metered_worker_backend(roster.backend)
+                || !cautious_providers.contains(&bursar_provider_for(roster)))
+    })
+}
+
+fn record_cautious_cap_skip(
+    report_path: &Path,
+    item: &PlannedItem,
+    roster: &RosterEntry,
+    provider: &str,
+) -> std::result::Result<(), DispatchCycleError> {
+    if !report_path.exists() {
+        return Ok(());
+    }
+    deck::append_callout(
+        report_path,
+        CalloutLevel::Warn,
+        "CAUTIOUS_CAP",
+        &format!(
+            "cautious provider attempt cap: {}/{}\n- roster: {}\n- provider: {}\n- cap: one worker attempt per provider in this chain",
+            item.repo, item.issue_id, roster.name, provider
+        ),
+    )
+    .map_err(|error| DispatchCycleError::message(format!("report cautious cap: {error}")))
 }
 
 fn record_remaining_ineligible(
@@ -2935,24 +2975,24 @@ dispatch_id = "fallback-worker"
     }
 
     #[test]
-    fn bursar_budget_cautious_provider_defers_and_reports_decision() {
+    fn bursar_budget_cautious_provider_dispatches_and_reports_decision() {
         let run = run_bursar_budget_case(
             "cautious",
             &FakeBursarClient::with_provider_availability("opencode-go", Availability::Caution),
         );
 
-        assert_eq!(run.result.dispatched, 0);
-        assert_eq!(run.result.verified, 0);
-        assert_eq!(run.result.failed, 1);
-        assert!(run.exec.spawns().is_empty(), "cautious before worker spawn");
-        assert_eq!(run.bd.release_count(), 1);
+        assert_eq!(run.result.dispatched, 1);
+        assert_eq!(run.result.verified, 1);
+        assert_eq!(run.result.failed, 0);
+        assert_eq!(run.exec.spawns().len(), 2, "cautious worker + verify");
+        assert_eq!(run.bd.release_count(), 0);
         let report = report_json_string(&run.reports, &run.cycle_id);
         assert!(report.contains("spend-cautiously"));
         assert!(report.contains("opencode-go"));
     }
 
     #[test]
-    fn bursar_budget_cautious_primary_skips_to_healthy_fallback() {
+    fn bursar_budget_cautious_primary_dispatches_before_healthy_fallback() {
         let bursar = FakeBursarClient::with_provider_availabilities(&[
             ("opencode-go", Availability::Caution),
             ("codex", Availability::Healthy),
@@ -2963,12 +3003,44 @@ dispatch_id = "fallback-worker"
         assert_eq!(run.result.verified, 1);
         assert_eq!(run.result.failed, 0);
         let spawns = run.exec.spawns();
-        assert_eq!(spawns.len(), 2, "healthy fallback worker + verify");
-        assert!(!spawns[0].argv.contains(&"primary-worker".to_string()));
-        assert!(spawns[0].argv.contains(&"fallback-worker".to_string()));
+        assert_eq!(spawns.len(), 2, "cautious worker + verify");
+        assert!(spawns[0].argv.contains(&"primary-worker".to_string()));
+        assert!(!spawns[0].argv.contains(&"fallback-worker".to_string()));
         let report = report_json_string(&run.reports, &run.cycle_id);
         assert!(report.contains("spend-cautiously"));
         assert!(report.contains("opencode-go"));
+    }
+
+    #[test]
+    fn bursar_budget_cautious_provider_caps_worker_chain() {
+        let bursar = FakeBursarClient::with_provider_availabilities(&[
+            ("opencode-go", Availability::Caution),
+            ("codex", Availability::Healthy),
+        ]);
+        let run = run_bursar_budget_cautious_chain_cap_case(&bursar);
+
+        assert_eq!(
+            run.result.dispatched, 2,
+            "cautious provider is capped at one attempt"
+        );
+        assert_eq!(run.result.verified, 1);
+        assert_eq!(run.result.failed, 0);
+        let spawns = run.exec.spawns();
+        assert_eq!(
+            spawns.len(),
+            3,
+            "cautious primary + healthy fallback + verify"
+        );
+        assert!(spawns[0].argv.contains(&"primary-worker".to_string()));
+        assert!(spawns[1].argv.contains(&"fallback-worker".to_string()));
+        assert!(
+            !spawns
+                .iter()
+                .any(|spawn| { spawn.argv.contains(&"cautious-peer".to_string()) })
+        );
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("CAUTIOUS_CAP"));
+        assert!(report.contains("spend-cautiously"));
     }
 
     #[test]
@@ -3003,16 +3075,19 @@ dispatch_id = "fallback-worker"
         assert!(!report.contains("static-caps"));
     }
 
-    struct BursarBudgetRun {
+    struct BursarBudgetRun<E> {
         _temp: TempDir,
         reports: PathBuf,
         cycle_id: String,
         result: DispatchCycleResult,
         bd: RecordingBdClient,
-        exec: SandboxExec,
+        exec: E,
     }
 
-    fn run_bursar_budget_case(label: &str, bursar: &FakeBursarClient) -> BursarBudgetRun {
+    fn run_bursar_budget_case(
+        label: &str,
+        bursar: &FakeBursarClient,
+    ) -> BursarBudgetRun<SandboxExec> {
         let temp = TempDir::new(&format!("bursar-budget-{label}"));
         let fleet = temp.path().join("fleet");
         std::fs::create_dir_all(&fleet).expect("mkdir fleet");
@@ -3091,7 +3166,7 @@ provider = "opencode-go"
         }
     }
 
-    fn run_bursar_budget_fallback_case(bursar: &FakeBursarClient) -> BursarBudgetRun {
+    fn run_bursar_budget_fallback_case(bursar: &FakeBursarClient) -> BursarBudgetRun<SandboxExec> {
         let temp = TempDir::new("bursar-budget-cautious-fallback");
         let fleet = temp.path().join("fleet");
         std::fs::create_dir_all(&fleet).expect("mkdir fleet");
@@ -3169,6 +3244,114 @@ provider = "codex"
             bursar,
         )
         .expect("cautious primary falls back to healthy worker");
+
+        BursarBudgetRun {
+            _temp: temp,
+            reports,
+            cycle_id: cycle_id.to_string(),
+            result,
+            bd,
+            exec,
+        }
+    }
+
+    fn run_bursar_budget_cautious_chain_cap_case(
+        bursar: &FakeBursarClient,
+    ) -> BursarBudgetRun<FallbackExec> {
+        let temp = TempDir::new("bursar-budget-cautious-chain-cap");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = true
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "primary-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "primary-worker"
+provider = "opencode-go"
+fallback = ["cautious-peer", "fallback-worker"]
+
+[[roster]]
+name = "cautious-peer"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "cautious-peer"
+provider = "opencode-go"
+
+[[roster]]
+name = "fallback-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fallback-worker"
+provider = "codex"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-20260707-bursar-cautious-chain-cap";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "primary-worker",
+            &["primary-worker", "cautious-peer", "fallback-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = FallbackExec::new();
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let result = run_dispatch_cycle(
+            &cfg,
+            &bd,
+            &exec,
+            &GitCommitProbe,
+            &reports,
+            &state,
+            &ledger,
+            cycle_id,
+            &options,
+            &live,
+            bursar,
+        )
+        .expect("cautious provider cap allows healthy fallback");
 
         BursarBudgetRun {
             _temp: temp,
@@ -3877,7 +4060,11 @@ dispatch_id = "fake-worker"
     impl Exec for FallbackExec {
         fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
             self.spawns.borrow_mut().push(request.clone());
-            if request.argv.iter().any(|arg| arg == "primary-worker") {
+            if request
+                .argv
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "primary-worker" | "cautious-peer"))
+            {
                 std::fs::write(&request.stdout_path, b"").expect("write primary stdout");
                 std::fs::write(&request.stderr_path, b"HTTP 429 quota exceeded\n")
                     .expect("write primary stderr");
