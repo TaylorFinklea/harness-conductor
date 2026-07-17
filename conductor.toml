@@ -1,10 +1,8 @@
-# Conductor fleet cycle runner — configuration.
+# Conductor fleet cycle runner — static configuration.
 #
-# The roster is the closed set of models that may receive work (invariant 1:
-# closed roster; fail closed, never default). `conductor roster drift` diffs
-# this against ~/.claude/model-scorecard.md and warns, never auto-edits.
-#
-# Defaults are shown explicitly; every knob is overridable.
+# Execution profiles, providers, and invocation identities are owned by Bursar.
+# Every launch consumes `bursar/roster@1`; Conductor pins its artifact path and
+# SHA-256 in the approved cycle plan.
 
 autonomy = "propose"
 
@@ -16,18 +14,9 @@ root = "~/git"
 # independent of this list — never scan/dispatch either (invariant 5).
 exclude = []
 
-# Per-repo data policy — gates the cost axis. `proprietary`/`internal` exclude
-# `free-trains-input` models; `oss`/`public` admit them. A repo ABSENT from this
-# table defaults to `proprietary` (fail closed), so listing a repo here is the
-# only way a free-train model may ever see its code.
-#
-# Every entry below was verified PUBLIC on GitHub (`gh repo view --json
-# visibility`) on 2026-07-13 — their code is already on the open internet, so a
-# free-train provider ingesting it is not an incremental disclosure.
-#
-# Deliberately ABSENT (verified PRIVATE, must stay fail-closed): `patchstand`,
-# `seedkeep`. Do not add a repo here without re-checking its visibility; the
-# whole point of the default is that silence means "assume secret".
+# Per-repo data policy. `proprietary`/`internal` exclude profiles whose Bursar
+# data policy permits training on submitted input. A repo absent from this table
+# defaults to `proprietary` (fail closed).
 [[repo_policy]]
 repo = "bursar"
 cost_policy = "oss"
@@ -95,467 +84,98 @@ enabled = true
 min_tier_gap = 1
 
 [adversarial_review]
-# N provider-distinct reviewers plus one additional Lead synthesis call.
+# N provider-distinct reviewers plus one additional Lead synthesis profile.
 max_reviewers = 7
 parallel = 3
-judge = "gpt-5.6-sol"
-judge_fallbacks = ["gpt-5.6-terra", "opus-4.8"]
+judge = "openai-codex--codex--gpt-5.6-sol--max"
+judge_fallbacks = ["openai-codex--codex--gpt-5.6-terra--xhigh", "anthropic--claude-code--claude-opus-4-8--none"]
 
 [arena]
-# Head-to-head Ralph arena defaults. Candidate runs are capped low and the
-# scheduler will not run two profiles with the same provider_group together.
+# Head-to-head defaults. Candidate profiles are resolved by Bursar.
 parallel = 2
 auto_apply = true
 min_score_x10 = 40
 keep_worktrees = false
 
-[[arena_profile]]
-name = "pi-glm52"
-harness = "pi"
-model = "opencode-go/glm-5.2"
-provider_group = "opencode-go"
+# Retry order is Conductor job policy, not roster ownership. Each ID must be
+# present in the Bursar snapshot; unavailable fallback profiles are omitted at
+# launch so a disabled provider can never be selected at dispatch time.
+[[job_fallback]]
+profile_id = "anthropic--claude-code--claude-sonnet-5--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-terra--xhigh", "openai-codex--codex--gpt-5.6-sol--max"]
 
-[[arena_profile]]
-name = "opencode-glm52"
-harness = "opencode"
-model = "opencode-go/glm-5.2"
-provider_group = "opencode-go"
+[[job_fallback]]
+profile_id = "anthropic--claude-code--claude-opus-4-8--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-sol--max", "openai-codex--codex--gpt-5.6-terra--xhigh"]
 
-[[arena_profile]]
-name = "pi-minimax-m3"
-harness = "pi"
-model = "opencode-go/minimax-m3"
-provider_group = "opencode-go"
+[[job_fallback]]
+profile_id = "opencode-go--pi--minimax-m3--none"
+fallback_profile_ids = ["ollama-cloud--pi--minimax-m3--none", "neuralwatt--pi--glm-5.2-short--none", "neuralwatt--pi--glm-5.2--none", "openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "opencode-minimax-m3"
-harness = "opencode"
-model = "opencode-go/minimax-m3"
-provider_group = "opencode-go"
+[[job_fallback]]
+profile_id = "opencode-go--pi--qwen3.7-max--none"
+fallback_profile_ids = ["neuralwatt--pi--glm-5.2-short--none", "neuralwatt--pi--glm-5.2--none", "openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "pi-qwen37max"
-harness = "pi"
-model = "opencode-go/qwen3.7-max"
-provider_group = "opencode-go"
+[[job_fallback]]
+profile_id = "opencode-go--pi--glm-5.2--none"
+fallback_profile_ids = ["ollama-cloud--pi--glm-5.2--none", "neuralwatt--pi--glm-5.2-short--none", "neuralwatt--pi--glm-5.2--none", "openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "opencode-qwen37max"
-harness = "opencode"
-model = "opencode-go/qwen3.7-max"
-provider_group = "opencode-go"
+[[job_fallback]]
+profile_id = "ollama-cloud--pi--glm-5.2--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--high"]
 
-# NeuralWatt provider lane — same base models as opencode-go but a distinct
-# provider/account (quota isolation). Valuable as fallback when the shared
-# opencode-go weekly quota is exhausted. Also serves the fast/short variants.
+[[job_fallback]]
+profile_id = "ollama-cloud--pi--kimi-k2.6--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "pi-nw-glm52"
-harness = "pi"
-model = "neuralwatt/glm-5.2"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "ollama-cloud--pi--minimax-m3--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "opencode-nw-glm52"
-harness = "opencode"
-model = "neuralwatt/glm-5.2"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "opencode-go--pi--glm-5.1--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "pi-nw-glm52-short"
-harness = "pi"
-model = "neuralwatt/glm-5.2-short"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "opencode-go--pi--mimo-v2.5--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "opencode-nw-glm52-short"
-harness = "opencode"
-model = "neuralwatt/glm-5.2-short"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "opencode-go--pi--qwen3.6-plus--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "pi-nw-glm52-fast"
-harness = "pi"
-model = "neuralwatt/glm-5.2-fast"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "opencode-go--pi--deepseek-v4-flash--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "opencode-nw-glm52-fast"
-harness = "opencode"
-model = "neuralwatt/glm-5.2-fast"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "google-ai-studio--pi--gemini-3.5-flash--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "pi-nw-kimi-k26"
-harness = "pi"
-model = "neuralwatt/kimi-k2.6"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "agy--agy--gemini-3.5-flash--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "opencode-nw-kimi-k26"
-harness = "opencode"
-model = "neuralwatt/kimi-k2.6"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "neuralwatt--pi--glm-5.2--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "pi-nw-kimi-k26-fast"
-harness = "pi"
-model = "neuralwatt/kimi-k2.6-fast"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "neuralwatt--pi--glm-5.2-short--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "opencode-nw-kimi-k26-fast"
-harness = "opencode"
-model = "neuralwatt/kimi-k2.6-fast"
-provider_group = "neuralwatt"
+[[job_fallback]]
+profile_id = "neuralwatt--pi--glm-5.2-fast--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "pi-ollama-glm52"
-harness = "pi"
-model = "ollama-cloud/glm-5.2"
-provider_group = "ollama-cloud"
+[[job_fallback]]
+profile_id = "neuralwatt--pi--glm-5.2-short-fast--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]
 
-[[arena_profile]]
-name = "opencode-ollama-glm52"
-harness = "opencode"
-model = "ollama-cloud/glm-5.2"
-provider_group = "ollama-cloud"
+[[job_fallback]]
+profile_id = "neuralwatt--pi--kimi-k2.6--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--high"]
 
-[[arena_profile]]
-name = "pi-ollama-kimi-k26"
-harness = "pi"
-model = "ollama-cloud/kimi-k2.6"
-provider_group = "ollama-cloud"
-
-[[arena_profile]]
-name = "opencode-ollama-kimi-k26"
-harness = "opencode"
-model = "ollama-cloud/kimi-k2.6"
-provider_group = "ollama-cloud"
-
-[[arena_profile]]
-name = "pi-ollama-minimax-m3"
-harness = "pi"
-model = "ollama-cloud/minimax-m3"
-provider_group = "ollama-cloud"
-
-[[arena_profile]]
-name = "opencode-ollama-minimax-m3"
-harness = "opencode"
-model = "ollama-cloud/minimax-m3"
-provider_group = "ollama-cloud"
-
-# GPT-5.6 Codex profiles carry their effort explicitly so Arena results do
-# not depend on the machine's global Codex setting.
-[[arena_profile]]
-name = "codex-gpt56-sol"
-harness = "codex"
-model = "gpt-5.6-sol"
-provider_group = "openai-codex"
-reasoning_effort = "max"
-
-[[arena_profile]]
-name = "codex-gpt56-terra"
-harness = "codex"
-model = "gpt-5.6-terra"
-provider_group = "openai-codex"
-reasoning_effort = "xhigh"
-
-[[arena_profile]]
-name = "codex-gpt56-luna-junior"
-harness = "codex"
-model = "gpt-5.6-luna"
-provider_group = "openai-codex"
-reasoning_effort = "medium"
-
-[[arena_profile]]
-name = "codex-gpt56-luna-senior"
-harness = "codex"
-model = "gpt-5.6-luna"
-provider_group = "openai-codex"
-reasoning_effort = "high"
-
-[[arena_judge]]
-name = "qwen37max"
-backend = "pi"
-dispatch_id = "opencode-go/qwen3.7-max"
-
-[[arena_judge]]
-name = "nw-glm52"
-backend = "pi"
-dispatch_id = "neuralwatt/glm-5.2"
-
-# Initial roster from scorecard 2026-07-01.
-# (sonnet-5's scorecard "XL via decomposition" is capped to L here because
-# decomposition is out of scope v1; XL lead items route to opus-4.8 or flag.)
-
-[[roster]]
-name = "sonnet-5"
-tier = "lead"
-ceiling = "L"
-efficiency = "std"
-backend = "claude"
-dispatch_id = "claude-sonnet-5"
-provider = "anthropic"
-cost = "paid"
-fallback = ["gpt-5.6-terra", "gpt-5.6-sol"]
-
-[[roster]]
-name = "opus-4.8"
-tier = "lead"
-ceiling = "XL"
-efficiency = "heavy"
-backend = "claude"
-dispatch_id = "claude-opus-4-8"
-provider = "anthropic"
-cost = "paid"
-fallback = ["gpt-5.6-sol", "gpt-5.6-terra"]
-
-[[roster]]
-name = "minimax-m3"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "opencode-go/minimax-m3"
-provider = "opencode-go"
-cost = "paid"
-fallback = ["ollama-minimax-m3", "nw-glm-5.2-short", "nw-glm-5.2", "gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "qwen3.7-max"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "opencode-go/qwen3.7-max"
-provider = "opencode-go"
-cost = "paid"
-fallback = ["nw-glm-5.2-short", "nw-glm-5.2", "gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "glm-5.2"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "opencode-go/glm-5.2"
-provider = "opencode-go"
-cost = "paid"
-fallback = ["ollama-glm-5.2", "nw-glm-5.2-short", "nw-glm-5.2", "gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "ollama-glm-5.2"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "ollama-cloud/glm-5.2"
-provider = "ollama-cloud"
-cost = "paid"
-fallback = ["gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "ollama-kimi-k2.6"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "ollama-cloud/kimi-k2.6"
-provider = "ollama-cloud"
-cost = "paid"
-fallback = ["gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "ollama-minimax-m3"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "ollama-cloud/minimax-m3"
-provider = "ollama-cloud"
-cost = "paid"
-fallback = ["gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "glm-5.1"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "opencode-go/glm-5.1"
-provider = "opencode-go"
-cost = "free"
-fallback = ["gpt-5.6-luna-junior"]
-
-[[roster]]
-name = "mimo-v2.5"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "opencode-go/mimo-v2.5"
-provider = "opencode-go"
-cost = "free"
-fallback = ["gpt-5.6-luna-junior"]
-
-[[roster]]
-name = "qwen3.6-plus"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "opencode-go/qwen3.6-plus"
-provider = "opencode-go"
-cost = "free"
-fallback = ["gpt-5.6-luna-junior"]
-
-[[roster]]
-name = "deepseek-v4-flash"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "opencode-go/deepseek-v4-flash"
-provider = "opencode-go"
-cost = "free"
-fallback = ["gpt-5.6-luna-junior"]
-
-[[roster]]
-name = "gemini-3.5-flash-free"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "google-ai-studio/gemini-3.5-flash"
-provider = "google-ai-studio"
-cost = "free-trains-input"
-fallback = ["gpt-5.6-luna-junior"]
-
-[[roster]]
-name = "agy-gemini-3.5-flash-free"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "agy"
-dispatch_id = "Gemini 3.5 Flash (High)"
-provider = "agy"
-cost = "free-trains-input"
-fallback = ["gpt-5.6-luna-junior"]
-
-# NeuralWatt provider lane — distinct account from opencode-go (quota isolation).
-# Same base models; the fast (non-reasoning) variants land as Junior, the short
-# (200K context, reasoning) variants stay Senior. Use as fallback when the
-# shared opencode-go weekly quota is exhausted.
-
-[[roster]]
-name = "nw-glm-5.2"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "neuralwatt/glm-5.2"
-provider = "neuralwatt"
-cost = "paid"
-fallback = ["gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "nw-glm-5.2-short"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "neuralwatt/glm-5.2-short"
-provider = "neuralwatt"
-cost = "paid"
-fallback = ["gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "nw-glm-5.2-fast"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "neuralwatt/glm-5.2-fast"
-provider = "neuralwatt"
-cost = "paid"
-fallback = ["gpt-5.6-luna-junior"]
-
-[[roster]]
-name = "nw-glm-5.2-short-fast"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "neuralwatt/glm-5.2-short-fast"
-provider = "neuralwatt"
-cost = "paid"
-fallback = ["gpt-5.6-luna-junior"]
-
-[[roster]]
-name = "nw-kimi-k2.6"
-tier = "senior"
-ceiling = "M"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "neuralwatt/kimi-k2.6"
-provider = "neuralwatt"
-cost = "paid"
-fallback = ["gpt-5.6-luna-senior"]
-
-[[roster]]
-name = "nw-kimi-k2.6-fast"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "pi"
-dispatch_id = "neuralwatt/kimi-k2.6-fast"
-provider = "neuralwatt"
-cost = "paid"
-fallback = ["gpt-5.6-luna-junior"]
-
-# GPT-5.6 Codex lane. Luna has separate stable row names by canonical effort
-# so scorecard drift can distinguish its Junior and Senior capability bands.
-[[roster]]
-name = "gpt-5.6-sol"
-tier = "lead"
-ceiling = "XL"
-efficiency = "heavy"
-backend = "codex"
-dispatch_id = "gpt-5.6-sol"
-reasoning_effort = "max"
-provider = "openai-codex"
-cost = "paid"
-
-[[roster]]
-name = "gpt-5.6-terra"
-tier = "lead"
-ceiling = "XL"
-efficiency = "heavy"
-backend = "codex"
-dispatch_id = "gpt-5.6-terra"
-reasoning_effort = "xhigh"
-provider = "openai-codex"
-cost = "paid"
-
-[[roster]]
-name = "gpt-5.6-luna-junior"
-tier = "junior"
-ceiling = "S"
-efficiency = "lean"
-backend = "codex"
-dispatch_id = "gpt-5.6-luna"
-reasoning_effort = "medium"
-provider = "openai-codex"
-cost = "paid"
-
-[[roster]]
-name = "gpt-5.6-luna-senior"
-tier = "senior"
-ceiling = "L"
-efficiency = "std"
-backend = "codex"
-dispatch_id = "gpt-5.6-luna"
-reasoning_effort = "high"
-provider = "openai-codex"
-cost = "paid"
+[[job_fallback]]
+profile_id = "neuralwatt--pi--kimi-k2.6-fast--none"
+fallback_profile_ids = ["openai-codex--codex--gpt-5.6-luna--medium"]

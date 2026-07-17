@@ -1,13 +1,7 @@
-//! Scorecard-vs-`conductor.toml` roster drift detector.
-//!
-//! Parses the "Live Roster" markdown table in `~/.claude/model-scorecard.md`
-//! (columns: Model, Dispatch ID, Reasoning, Tier, Ceiling, Reliability) and diffs it
-//! against `conductor.toml`'s roster. Reports missing models, extra models,
-//! and tier/ceiling mismatches.
-//!
-//! WARN only — stdout report, exit 0 — unless the scorecard file is
-//! unreadable or unparseable, in which case the caller should exit 1.
-//! Never auto-edits either file.
+//! Read-only legacy scorecard parser retained for a bounded compatibility
+//! window. It is intentionally disconnected from Conductor's CLI and launch
+//! path: Bursar's `bursar/roster@1` snapshot is the sole roster authority.
+//! Never auto-edits either input.
 
 #![allow(dead_code)]
 
@@ -949,6 +943,7 @@ Just some prose, no table at all.
     }
 
     #[test]
+    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
     fn roster_drift_diff_fixture_agreement_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-agreement.md")).unwrap();
         let cfg = load_conductor_config();
@@ -961,6 +956,7 @@ Just some prose, no table at all.
     }
 
     #[test]
+    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
     fn roster_drift_diff_fixture_missing_from_config_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-missing-from-config.md")).unwrap();
         let cfg = load_conductor_config();
@@ -975,6 +971,7 @@ Just some prose, no table at all.
     }
 
     #[test]
+    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
     fn roster_drift_diff_fixture_extra_in_config_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-extra-in-config.md")).unwrap();
         let cfg = load_conductor_config();
@@ -989,6 +986,7 @@ Just some prose, no table at all.
     }
 
     #[test]
+    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
     fn roster_drift_diff_fixture_tier_mismatch_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-tier-mismatch.md")).unwrap();
         let cfg = load_conductor_config();
@@ -1003,6 +1001,7 @@ Just some prose, no table at all.
     }
 
     #[test]
+    #[ignore = "legacy scorecard parser is disconnected after Bursar roster cutover"]
     fn roster_drift_diff_fixture_ceiling_mismatch_against_real_config() {
         let entries = parse_scorecard(&load_fixture("scorecard-ceiling-mismatch.md")).unwrap();
         let cfg = load_conductor_config();

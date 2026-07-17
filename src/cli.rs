@@ -794,7 +794,16 @@ fn run_route_explain(it: &mut std::vec::IntoIter<String>) -> ExitCode {
         }
     };
     let bursar = crate::bursar::CommandBursarClient::new();
-    let output = route_explain_output(&config, &options, &bursar);
+    let resolved_roster = match crate::bursar::resolve_roster(&config, &bursar) {
+        Ok(roster) => roster,
+        Err(error) => {
+            eprintln!("bursar roster snapshot: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut runtime_config = config;
+    runtime_config.roster = resolved_roster.roster;
+    let output = route_explain_output(&runtime_config, &options, &bursar);
     println!("{output}");
     ExitCode::SUCCESS
 }
@@ -1005,7 +1014,26 @@ fn run_config_check(it: &mut std::vec::IntoIter<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    println!("config: valid ({} roster entries)", cfg.roster.len());
+    let bursar = crate::bursar::CommandBursarClient::new();
+    let resolved_roster = match crate::bursar::resolve_roster(&cfg, &bursar) {
+        Ok(roster) => roster,
+        Err(error) => {
+            eprintln!("bursar roster snapshot: invalid — {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match resolved_roster.artifact {
+        Some(artifact) => println!(
+            "config: valid ({} Bursar profiles; snapshot {}#{})",
+            resolved_roster.roster.len(),
+            artifact.path,
+            artifact.sha256
+        ),
+        None => println!(
+            "config: valid ({} legacy roster entries; Bursar snapshot unavailable)",
+            resolved_roster.roster.len()
+        ),
+    }
 
     let path_var = std::env::var("PATH").unwrap_or_default();
     let state_dir = home_state_dir();
@@ -1076,73 +1104,22 @@ fn ledger_path() -> PathBuf {
 fn run_roster(it: &mut std::vec::IntoIter<String>) -> ExitCode {
     match it.next().as_deref() {
         None => {
-            eprintln!("usage: conductor roster drift [--config <path>]");
+            eprintln!(
+                "usage: conductor roster is owned by Bursar; use `bursar roster snapshot --json`"
+            );
             ExitCode::from(2)
         }
-        Some("drift") => run_roster_drift(it),
+        Some("drift") => {
+            eprintln!(
+                "roster drift is retired: Conductor does not parse scorecards; use the pinned Bursar snapshot"
+            );
+            ExitCode::from(2)
+        }
         Some(sub) => {
             eprintln!("unknown roster subcommand: {sub}");
             ExitCode::from(2)
         }
     }
-}
-
-fn run_roster_drift(it: &mut std::vec::IntoIter<String>) -> ExitCode {
-    let mut config_path = PathBuf::from("conductor.toml");
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--config" => {
-                let Some(p) = it.next() else {
-                    eprintln!("--config requires a path argument");
-                    return ExitCode::from(2);
-                };
-                config_path = PathBuf::from(p);
-            }
-            other => {
-                eprintln!("unknown argument: {other}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    let cfg = match config::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("config: invalid — {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => h,
-        _ => {
-            eprintln!("roster drift: HOME not set; cannot locate ~/.claude/model-scorecard.md");
-            return ExitCode::from(1);
-        }
-    };
-    let scorecard_path = PathBuf::from(home)
-        .join(".claude")
-        .join("model-scorecard.md");
-
-    let content = match std::fs::read_to_string(&scorecard_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("roster drift: cannot read scorecard: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let scorecard_entries = match crate::roster_drift::parse_scorecard(&content) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("roster drift: cannot parse scorecard: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let report = crate::roster_drift::diff(&scorecard_entries, &cfg.roster);
-    crate::roster_drift::print_report(&report);
-    ExitCode::SUCCESS
 }
 
 fn run_scan(it: &mut std::vec::IntoIter<String>) -> ExitCode {
@@ -1541,7 +1518,9 @@ fn print_help() {
     println!("Commands:");
     println!("  adversarial-review  Plan or dispatch an approval-gated read-only design review");
     println!("  config check   Validate conductor.toml and run preflight checks");
-    println!("  roster drift   Diff conductor.toml's roster against ~/.claude/model-scorecard.md");
+    println!(
+        "  roster         Bursar owns execution profiles; inspect `bursar roster snapshot --json`"
+    );
     println!("  scan           Enumerate fleet repos and snapshot ready work");
     println!("  status         Show the most recently recorded cycle");
     println!("  cycle          Dry-run scan -> triage -> plan and publish a report");

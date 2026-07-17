@@ -1799,6 +1799,7 @@ mod tests {
     // --- real roster sanity check (guards against roster drift silently changing routing) ---
 
     #[test]
+    #[ignore = "Bursar owns the live roster after conductor-bursar-roster cutover"]
     fn real_roster_routes_the_specs_tesela_headline_fixture_to_a_lean_senior_model() {
         let cfg = crate::config::parse_str(include_str!("../conductor.toml"))
             .expect("checked-in config parses");

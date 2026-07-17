@@ -118,6 +118,7 @@ struct PlannedItem {
     approved_route: Option<ProviderRouteRecord>,
     authorization_sha256: String,
     approval_scope: ApprovalScope,
+    bursar_roster_artifact: Option<crate::bursar::RosterArtifact>,
 }
 
 #[expect(
@@ -143,6 +144,12 @@ pub(crate) fn run_dispatch_cycle<
     live: &L,
     bursar: &U,
 ) -> std::result::Result<DispatchCycleResult, DispatchCycleError> {
+    let resolved_roster = bursar::resolve_roster(cfg, bursar)
+        .map_err(|error| DispatchCycleError::message(format!("bursar roster snapshot: {error}")))?;
+    let mut runtime_cfg = cfg.clone();
+    runtime_cfg.roster = resolved_roster.roster;
+    let cfg = &runtime_cfg;
+
     let run_dir = deck::report_run_dir(reports_home, cycle_id)
         .map_err(|e| DispatchCycleError::message(format!("report path: {e}")))?;
     let report_path = run_dir.join("report.json");
@@ -168,6 +175,26 @@ pub(crate) fn run_dispatch_cycle<
             "plan cycle id mismatch: expected {cycle_id}, found {}",
             plan.cycle_id
         )));
+    }
+    match (&plan.bursar_roster_artifact, &resolved_roster.artifact) {
+        (Some(expected), Some(actual)) if expected == actual => {}
+        (Some(expected), Some(actual)) => {
+            return Err(DispatchCycleError::message(format!(
+                "bursar roster snapshot changed after approval: expected {}#{}, found {}#{}",
+                expected.path, expected.sha256, actual.path, actual.sha256
+            )));
+        }
+        (Some(_), None) => {
+            return Err(DispatchCycleError::message(
+                "approved plan pins a Bursar roster artifact but dispatch resolved only legacy roster data",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DispatchCycleError::message(
+                "approved plan is missing its Bursar roster artifact",
+            ));
+        }
+        (None, None) => {}
     }
 
     let items = planned_items(&plan)?;
@@ -293,6 +320,7 @@ fn planned_items(plan: &CyclePlan) -> std::result::Result<Vec<PlannedItem>, Disp
             approved_route: approved_route(plan, repo, issue_id),
             authorization_sha256: matching[0].sha256.clone(),
             approval_scope: plan.approval_scope.clone(),
+            bursar_roster_artifact: plan.bursar_roster_artifact.clone(),
         });
     }
     Ok(items)
@@ -1052,7 +1080,12 @@ fn create_work_run(
                 bead: Some(item.issue_id.clone()),
             },
             approved_profiles: route.approved_models.clone(),
-            bursar_roster_artifact: None,
+            bursar_roster_artifact: item.bursar_roster_artifact.as_ref().map(|artifact| {
+                crate::run::ArtifactRef {
+                    path: artifact.path.clone(),
+                    sha256: artifact.sha256.clone(),
+                }
+            }),
             limits: RunLimits {
                 item_wall_clock_mins: Some(u64::from(cfg.budgets.item_wall_clock_mins)),
                 max_attempts: Some(max_attempts),
@@ -2174,6 +2207,7 @@ mod tests {
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: Vec::new(),
+            bursar_roster_artifact: None,
             approval_scope: ApprovalScope::default(),
             item_authorizations: Vec::new(),
         };
@@ -3583,6 +3617,7 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: Vec::new(),
+            bursar_roster_artifact: None,
             approval_scope: ApprovalScope::default(),
             item_authorizations: Vec::new(),
         };
@@ -3632,6 +3667,7 @@ dispatch_id = "fake-worker"
             flags: Vec::new(),
             skips: Vec::new(),
             provider_routes: vec![provider_route],
+            bursar_roster_artifact: None,
             approval_scope: ApprovalScope::new(
                 ApprovalScopeKind::ExactItemScope,
                 vec![ScopeSelector::ExactItem {

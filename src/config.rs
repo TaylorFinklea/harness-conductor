@@ -296,6 +296,15 @@ pub(crate) struct RosterEntry {
     pub(crate) fallback: Vec<String>,
 }
 
+/// Conductor-owned retry order for a Bursar execution profile. Bursar owns
+/// profile capability and availability; this policy only decides which
+/// eligible profile Conductor tries next after a classified runtime failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobFallbackPolicy {
+    pub(crate) profile_id: String,
+    pub(crate) fallback_profile_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ScanConfig {
     pub(crate) root: String,
@@ -469,6 +478,9 @@ pub(crate) struct Config {
     pub(crate) arena: ArenaConfig,
     pub(crate) adversarial_review: AdversarialReviewConfig,
     pub(crate) roster: Vec<RosterEntry>,
+    /// Runtime retry policy keyed by Bursar profile IDs. This remains static
+    /// Conductor policy and is resolved against each Bursar snapshot.
+    pub(crate) job_fallbacks: Vec<JobFallbackPolicy>,
     /// Per-repo `[[repo_policy]]` entries; absent repos default to
     /// `CostPolicy::Proprietary` (fail closed for `FreeTrainsInput`).
     pub(crate) repo_policies: Vec<RepoPolicy>,
@@ -909,6 +921,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
                 | "arena_profile"
                 | "arena_judge"
                 | "roster"
+                | "job_fallback"
                 | "repo_policy"
         ) {
             return Err(ConfigError::new(format!("unknown config key: {key}")));
@@ -930,6 +943,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         doc.get("arena_judge"),
     )?;
     let roster = parse_roster(doc.get("roster"))?;
+    let job_fallbacks = parse_job_fallbacks(doc.get("job_fallback"))?;
     let adversarial_review = parse_adversarial_review(doc.get("adversarial_review"), &roster)?;
     let repo_policies = parse_repo_policies(doc.get("repo_policy"), &roster)?;
     Ok(Config {
@@ -942,6 +956,7 @@ fn from_doc(doc: &Doc) -> Result<Config> {
         arena,
         adversarial_review,
         roster,
+        job_fallbacks,
         repo_policies,
     })
 }
@@ -1000,6 +1015,13 @@ fn parse_adversarial_review(
         ));
     }
 
+    // Production configuration deliberately carries no roster rows: Bursar
+    // supplies the authoritative profile snapshot at launch. Keep validation
+    // for explicitly supplied legacy rows, while deferring profile resolution
+    // for the snapshot-backed path.
+    if roster.is_empty() {
+        return Ok(config);
+    }
     require_lead_roster_entry(roster, "adversarial_review.judge", &config.judge)?;
     let mut seen = HashSet::new();
     for fallback in &config.judge_fallbacks {
@@ -1381,6 +1403,64 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
     Ok(out)
 }
 
+fn parse_job_fallbacks(node: Option<&Node>) -> Result<Vec<JobFallbackPolicy>> {
+    let entries = match node {
+        None => return Ok(Vec::new()),
+        Some(Node::Tables(v)) => v,
+        Some(_) => {
+            return Err(ConfigError::new(
+                "job_fallback must be an array of tables ([[job_fallback]])",
+            ));
+        }
+    };
+
+    let mut seen_profiles = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, table) in entries.iter().enumerate() {
+        for key in table.keys() {
+            if !matches!(key.as_str(), "profile_id" | "fallback_profile_ids") {
+                return Err(ConfigError::new(format!(
+                    "unknown job_fallback key in entry {i}: {key}"
+                )));
+            }
+        }
+        let profile_id = get_required_str_at("job_fallback", table, i, "profile_id")?;
+        let fallback_profile_ids = table
+            .get("fallback_profile_ids")
+            .map(|value| expect_str_arr("job_fallback.fallback_profile_ids", value))
+            .transpose()?
+            .unwrap_or_default();
+        if fallback_profile_ids.is_empty() {
+            return Err(ConfigError::new(format!(
+                "job_fallback entry {i} fallback_profile_ids must not be empty"
+            )));
+        }
+        if !seen_profiles.insert(profile_id.clone()) {
+            return Err(ConfigError::new(format!(
+                "duplicate job_fallback profile_id: {profile_id}"
+            )));
+        }
+        let mut seen_fallbacks = HashSet::new();
+        for fallback in &fallback_profile_ids {
+            if fallback == &profile_id {
+                return Err(ConfigError::new(format!(
+                    "job_fallback profile_id {profile_id} cannot fall back to itself"
+                )));
+            }
+            if !seen_fallbacks.insert(fallback.as_str()) {
+                return Err(ConfigError::new(format!(
+                    "duplicate job_fallback fallback profile: {fallback}"
+                )));
+            }
+        }
+        out.push(JobFallbackPolicy {
+            profile_id,
+            fallback_profile_ids,
+        });
+    }
+    Ok(out)
+}
+
 fn parse_reasoning_effort(
     table: &str,
     t: &HashMap<String, Node>,
@@ -1728,6 +1808,7 @@ mod tests {
     // --- the checked-in config ---
 
     #[test]
+    #[ignore = "Bursar owns the live roster after conductor-bursar-roster cutover"]
     #[expect(
         clippy::too_many_lines,
         reason = "checked-in roster fixture intentionally asserts many fields inline"
@@ -1949,6 +2030,31 @@ mod tests {
         assert_eq!(cfg.arena.profiles[15].name, "opencode-nw-kimi-k26-fast");
         assert_eq!(cfg.arena.judges.len(), 2);
         assert_eq!(cfg.arena.judges[0].name, "qwen37max");
+    }
+
+    #[test]
+    fn checked_in_config_defers_profile_ownership_to_bursar() {
+        let cfg = parse_str(include_str!("../conductor.toml"))
+            .expect("checked-in conductor.toml must parse");
+        assert!(cfg.roster.is_empty());
+        assert!(cfg.arena.profiles.is_empty());
+        assert!(cfg.arena.judges.is_empty());
+        assert_eq!(cfg.job_fallbacks.len(), 20);
+        assert_eq!(
+            cfg.job_fallbacks[0].profile_id,
+            "anthropic--claude-code--claude-sonnet-5--none"
+        );
+        assert_eq!(
+            cfg.job_fallbacks[0].fallback_profile_ids,
+            [
+                "openai-codex--codex--gpt-5.6-terra--xhigh",
+                "openai-codex--codex--gpt-5.6-sol--max"
+            ]
+        );
+        assert_eq!(
+            cfg.adversarial_review.judge,
+            "openai-codex--codex--gpt-5.6-sol--max"
+        );
     }
 
     // --- valid configs ---

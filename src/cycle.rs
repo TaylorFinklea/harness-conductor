@@ -176,6 +176,12 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     created_at: &str,
     scope_request: &CycleScopeRequest,
 ) -> Result<CycleResult, CycleError> {
+    let resolved_roster = crate::bursar::resolve_roster(cfg, bursar)
+        .map_err(|error| CycleError::new(format!("bursar roster snapshot: {error}")))?;
+    let mut runtime_cfg = cfg.clone();
+    runtime_cfg.roster = resolved_roster.roster;
+    let cfg = &runtime_cfg;
+
     // 1. Scan
     let snapshots =
         scan::scan(&cfg.scan, client).map_err(|e| CycleError::new(format!("scan: {e}")))?;
@@ -201,6 +207,7 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
     let provider_advice = provider_route_advice(cfg, &snapshots, &plan, bursar)?;
     let mut cycle_plan = CyclePlan::from_triage(cycle_id, created_at, &plan);
     cycle_plan.apply_provider_routes(provider_advice);
+    cycle_plan.bursar_roster_artifact = resolved_roster.artifact;
     let max_dispatch_count = match resolved_scope.kind {
         ApprovalScopeKind::FleetAudit => cycle_plan.dispatches.len(),
         ApprovalScopeKind::RepositoryScope | ApprovalScopeKind::ExactItemScope => {
@@ -249,7 +256,12 @@ pub(crate) fn run_dry_run_with_timestamps_scoped(
                 bead: None,
             },
             approved_profiles: Vec::new(),
-            bursar_roster_artifact: None,
+            bursar_roster_artifact: cycle_plan.bursar_roster_artifact.as_ref().map(|artifact| {
+                crate::run::ArtifactRef {
+                    path: artifact.path.clone(),
+                    sha256: artifact.sha256.clone(),
+                }
+            }),
             limits: RunLimits::default(),
             verifier: RunVerifier::default(),
             approval: None,
