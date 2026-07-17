@@ -1558,7 +1558,9 @@ fn retryable_failure_reason(
 ) -> std::result::Result<Option<RetryableFailure>, DispatchCycleError> {
     if !matches!(
         result.status,
-        dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::ExitNonZero { .. })
+        dispatch::DispatchStatus::Failed(
+            dispatch::DispatchFailure::TimedOut | dispatch::DispatchFailure::ExitNonZero { .. },
+        )
     ) {
         return Ok(None);
     }
@@ -1636,7 +1638,11 @@ fn extract_provider_reset(stderr: &str, now: DateTime<Utc>) -> Option<String> {
 }
 
 fn is_trusted_provider_error_line(line: &str) -> bool {
-    let line = line.trim_start().to_ascii_lowercase();
+    let line = line.trim_start();
+    if is_raw_json_provider_error(line) || is_timestamped_provider_error(line) {
+        return true;
+    }
+    let line = line.to_ascii_lowercase();
     [
         "api ",
         "api:",
@@ -1661,6 +1667,49 @@ fn is_trusted_provider_error_line(line: &str) -> bool {
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix))
+}
+
+fn is_raw_json_provider_error(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.contains_key("error")
+        || object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("error") || kind.contains("limit"))
+}
+
+fn is_timestamped_provider_error(line: &str) -> bool {
+    let (timestamp, rest) = if let Some(line) = line.strip_prefix('[') {
+        let Some(end) = line.find(']') else {
+            return false;
+        };
+        (&line[..end], line[end + 1..].trim_start())
+    } else {
+        let Some(end) = line.find(char::is_whitespace) else {
+            return false;
+        };
+        (&line[..end], line[end..].trim_start())
+    };
+    if DateTime::parse_from_rfc3339(timestamp).is_err() {
+        return false;
+    }
+    let level = rest.strip_prefix('[').map_or(rest, |rest| {
+        rest.split_once(']')
+            .map_or(rest, |(level, _)| level.trim_start())
+    });
+    let level = level
+        .split(|character: char| character.is_whitespace() || character == ':')
+        .next()
+        .unwrap_or_default();
+    matches!(
+        level.to_ascii_lowercase().as_str(),
+        "error" | "fatal" | "critical" | "warn" | "warning"
+    )
 }
 
 fn runtime_observation(
@@ -2885,6 +2934,15 @@ dispatch_id = "fallback-worker"
         assert!(is_retryable_worker_stderr(
             "429 {\"error\":\"Weekly usage limit reached\"}"
         ));
+        assert!(is_retryable_worker_stderr(
+            r#"{"error":{"type":"rate_limit_error","message":"requests are limited"}}"#
+        ));
+        assert!(is_retryable_worker_stderr(
+            "2026-07-13T10:00:00Z ERROR provider returned HTTP 429"
+        ));
+        assert!(is_retryable_worker_stderr(
+            "[2026-07-13T10:00:00Z] [ERROR] quota exceeded"
+        ));
         assert!(is_retryable_worker_stderr("quota exceeded"));
         assert!(is_retryable_worker_stderr("provider returned rate_limit"));
         assert!(is_retryable_worker_stderr("provider returned rate limit"));
@@ -2934,6 +2992,25 @@ dispatch_id = "fallback-worker"
         };
 
         assert_eq!(retryable_failure_reason(&result).expect("classify"), None);
+    }
+
+    #[test]
+    fn retryable_worker_failure_classifies_timed_out_process_stderr() {
+        let temp = TempDir::new("retryable-timeout");
+        let stderr_path = temp.path().join("worker.err");
+        std::fs::write(&stderr_path, b"quota exceeded\n").expect("write stderr");
+        let result = dispatch::DispatchResult {
+            status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::TimedOut),
+            stdout_path: temp.path().join("worker.out"),
+            stderr_path,
+            stdout_bytes: 0,
+            stderr_bytes: 15,
+        };
+
+        let failure = retryable_failure_reason(&result)
+            .expect("classify")
+            .expect("timed out provider limit");
+        assert_eq!(failure.reason, RuntimeLimitReason::QuotaExceeded);
     }
 
     #[test]
