@@ -611,10 +611,10 @@ fn validate_window_percents(status: &ProviderStatus) -> std::result::Result<Opti
                 .ok_or_else(|| format!("bursar window {} has no percent", window.label))?;
             if !percent.is_finite()
                 || !(0.0..=100.0).contains(&percent)
-                || (percent > 0.0 && percent < 1.0)
+                || (percent > 0.0 && percent <= 1.0)
             {
                 return Err(format!(
-                    "bursar window {} has invalid percent {percent:?}; expected 0 or 1..=100",
+                    "bursar window {} has invalid percent {percent:?}; expected 0 or >1..=100",
                     window.label
                 ));
             }
@@ -1156,6 +1156,7 @@ mod tests {
         for percent in [
             Value::Null,
             Value::from(0.42),
+            Value::from(1.0),
             Value::from(-1.0),
             Value::from(100.1),
         ] {
