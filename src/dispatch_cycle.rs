@@ -786,7 +786,10 @@ where
             let decision =
                 bursar::evaluate_budget(bursar_client, &provider, cfg.budgets.use_bursar);
             record_budget_decision(report_path, item, roster, &decision)?;
-            if decision.action == BudgetAction::Defer {
+            if matches!(
+                decision.action,
+                BudgetAction::SpendCautiously | BudgetAction::Defer
+            ) {
                 deferred.push(decision.summary.clone());
                 let Some(next) =
                     next_eligible_roster(&chain, idx + 1, &fields.routing, repo_cost_policy)
@@ -2928,6 +2931,23 @@ dispatch_id = "fallback-worker"
         assert_eq!(run.bd.release_count(), 1);
         let report = report_json_string(&run.reports, &run.cycle_id);
         assert!(report.contains("defer"));
+        assert!(report.contains("opencode-go"));
+    }
+
+    #[test]
+    fn bursar_budget_cautious_provider_defers_and_reports_decision() {
+        let run = run_bursar_budget_case(
+            "cautious",
+            &FakeBursarClient::with_provider_availability("opencode-go", Availability::Caution),
+        );
+
+        assert_eq!(run.result.dispatched, 0);
+        assert_eq!(run.result.verified, 0);
+        assert_eq!(run.result.failed, 1);
+        assert!(run.exec.spawns().is_empty(), "cautious before worker spawn");
+        assert_eq!(run.bd.release_count(), 1);
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("spend-cautiously"));
         assert!(report.contains("opencode-go"));
     }
 
