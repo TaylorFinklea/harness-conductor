@@ -2952,6 +2952,26 @@ dispatch_id = "fallback-worker"
     }
 
     #[test]
+    fn bursar_budget_cautious_primary_skips_to_healthy_fallback() {
+        let bursar = FakeBursarClient::with_provider_availabilities(&[
+            ("opencode-go", Availability::Caution),
+            ("codex", Availability::Healthy),
+        ]);
+        let run = run_bursar_budget_fallback_case(&bursar);
+
+        assert_eq!(run.result.dispatched, 1);
+        assert_eq!(run.result.verified, 1);
+        assert_eq!(run.result.failed, 0);
+        let spawns = run.exec.spawns();
+        assert_eq!(spawns.len(), 2, "healthy fallback worker + verify");
+        assert!(!spawns[0].argv.contains(&"primary-worker".to_string()));
+        assert!(spawns[0].argv.contains(&"fallback-worker".to_string()));
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("spend-cautiously"));
+        assert!(report.contains("opencode-go"));
+    }
+
+    #[test]
     fn bursar_budget_exhausted_provider_defers_and_reports_decision() {
         let run = run_bursar_budget_case(
             "exhausted",
@@ -3065,6 +3085,95 @@ provider = "opencode-go"
             _temp: temp,
             reports,
             cycle_id,
+            result,
+            bd,
+            exec,
+        }
+    }
+
+    fn run_bursar_budget_fallback_case(bursar: &FakeBursarClient) -> BursarBudgetRun {
+        let temp = TempDir::new("bursar-budget-cautious-fallback");
+        let fleet = temp.path().join("fleet");
+        std::fs::create_dir_all(&fleet).expect("mkdir fleet");
+        let repo = fleet.join("sandbox-repo");
+        init_sandbox_repo_without_bd(&repo);
+
+        let cfg = config::parse_str(&format!(
+            r#"[scan]
+root = "{}"
+
+[budgets]
+max_dispatches_per_cycle = 8
+max_active_per_repo = 1
+max_external_dispatches = 8
+use_bursar = true
+item_wall_clock_mins = 1
+cycle_wall_clock_mins = 1
+
+[verify]
+judge = "opencode-go/qwen3.7-max"
+always_orchestra = false
+
+[review]
+enabled = false
+min_tier_gap = 1
+
+[[roster]]
+name = "primary-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "primary-worker"
+provider = "opencode-go"
+fallback = ["fallback-worker"]
+
+[[roster]]
+name = "fallback-worker"
+tier = "junior"
+ceiling = "S"
+efficiency = "lean"
+backend = "pi"
+dispatch_id = "fallback-worker"
+provider = "codex"
+"#,
+            fleet.display()
+        ))
+        .expect("config parses");
+
+        let state = temp.path().join("state");
+        let reports = temp.path().join("reports");
+        let ledger = temp.path().join("ledger").join("model-bench.jsonl");
+        let cycle_id = "cycle-20260707-bursar-cautious-fallback";
+        write_plan_with_proposal(
+            &state,
+            &repo,
+            cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "primary-worker",
+            &["primary-worker", "fallback-worker"],
+            &cfg.roster,
+            &sandbox_issue(),
+        );
+        write_report(&reports, cycle_id);
+        write_response(&reports, cycle_id, "approved");
+
+        let bd = RecordingBdClient::new(sandbox_issue());
+        let exec = SandboxExec::new();
+        let commits = GitCommitProbe;
+        let live = RecordingLiveSink::new(true);
+        let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
+        let result = run_dispatch_cycle(
+            &cfg, &bd, &exec, &commits, &reports, &state, &ledger, cycle_id, &options, &live,
+            bursar,
+        )
+        .expect("cautious primary falls back to healthy worker");
+
+        BursarBudgetRun {
+            _temp: temp,
+            reports,
+            cycle_id: cycle_id.to_string(),
             result,
             bd,
             exec,
