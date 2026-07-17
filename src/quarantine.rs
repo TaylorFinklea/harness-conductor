@@ -116,7 +116,18 @@ pub(crate) trait RepoRecovery {
     /// Re-applies a patch previously produced by `capture_patch` onto the
     /// working tree (without touching the index). Used only to recover the
     /// pre-clean dirty state when `restore_clean` itself fails partway.
-    fn apply_patch(&self, repo: &Path, patch: &[u8]) -> std::result::Result<(), String>;
+    /// `excluding` lists paths to leave untouched — a partial `restore_clean`
+    /// failure can leave some paths already reflecting non-HEAD state (an
+    /// untracked file `clean` never reached, or a tracked file `reset` never
+    /// reached), and reapplying their hunks would either conflict (`apply`
+    /// refuses to recreate a file that already exists) or corrupt content
+    /// that is already correct.
+    fn apply_patch(
+        &self,
+        repo: &Path,
+        patch: &[u8],
+        excluding: &[String],
+    ) -> std::result::Result<(), String>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -133,8 +144,7 @@ impl RepoRecovery for GitRepoRecovery {
 
     fn capture_patch(&self, repo: &Path) -> std::result::Result<Vec<u8>, String> {
         let mut patch = git_bytes(repo, &["diff", "HEAD", "--binary", "--"])?;
-        let untracked_raw =
-            git_bytes(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let untracked_raw = git_bytes(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
         for path in split_nul_paths(&untracked_raw)? {
             let file_patch = git_bytes_diff_no_index(
                 repo,
@@ -169,8 +179,13 @@ impl RepoRecovery for GitRepoRecovery {
         Ok(())
     }
 
-    fn apply_patch(&self, repo: &Path, patch: &[u8]) -> std::result::Result<(), String> {
-        git_apply_stdin(repo, patch)
+    fn apply_patch(
+        &self,
+        repo: &Path,
+        patch: &[u8],
+        excluding: &[String],
+    ) -> std::result::Result<(), String> {
+        git_apply_stdin(repo, patch, excluding)
     }
 }
 
@@ -183,10 +198,17 @@ impl RepoRecovery for GitRepoRecovery {
 /// only the current path is a "changed path" going forward.
 fn parse_porcelain_z(raw: &[u8]) -> std::result::Result<Vec<String>, String> {
     let mut paths = Vec::new();
-    let mut tokens = raw.split(|&byte| byte == 0).filter(|token| !token.is_empty());
+    let mut tokens = raw
+        .split(|&byte| byte == 0)
+        .filter(|token| !token.is_empty());
     while let Some(token) = tokens.next() {
-        let text = std::str::from_utf8(token)
-            .map_err(|error| format!("git status produced a non-UTF-8 entry: {error}"))?;
+        let text = std::str::from_utf8(token).map_err(|error| {
+            format!(
+                "git status reported a non-UTF-8 path ({error}); refusing to guess at its \
+                 identity and leaving the repository completely untouched — this path requires \
+                 manual `git status`/`git diff` inspection and recovery outside Conductor"
+            )
+        })?;
         if text.len() < 3 {
             return Err(format!(
                 "git status produced a malformed porcelain entry: {text:?}"
@@ -213,9 +235,13 @@ fn split_nul_paths(raw: &[u8]) -> std::result::Result<Vec<String>, String> {
     raw.split(|&byte| byte == 0)
         .filter(|chunk| !chunk.is_empty())
         .map(|chunk| {
-            std::str::from_utf8(chunk)
-                .map(str::to_string)
-                .map_err(|error| format!("git produced a non-UTF-8 path: {error}"))
+            std::str::from_utf8(chunk).map(str::to_string).map_err(|error| {
+                format!(
+                    "git reported a non-UTF-8 path ({error}); refusing to guess at its identity \
+                     and leaving the repository completely untouched — this path requires \
+                     manual `git status`/`git diff` inspection and recovery outside Conductor"
+                )
+            })
         })
         .collect()
 }
@@ -236,8 +262,13 @@ fn git_text(repo: &Path, args: &[&str]) -> std::result::Result<String, String> {
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> std::result::Result<Vec<u8>, String> {
-    let output = run_git(repo, args)
-        .map_err(|error| format!("failed to run git {} in {}: {error}", args.join(" "), repo.display()))?;
+    let output = run_git(repo, args).map_err(|error| {
+        format!(
+            "failed to run git {} in {}: {error}",
+            args.join(" "),
+            repo.display()
+        )
+    })?;
     if !output.status.success() {
         return Err(format!(
             "git {} failed in {}: {}",
@@ -253,8 +284,13 @@ fn git_bytes(repo: &Path, args: &[&str]) -> std::result::Result<Vec<u8>, String>
 /// expected outcome for every untracked file — and only above 1 on a real
 /// error, so exit code 1 is accepted here unlike every other git call.
 fn git_bytes_diff_no_index(repo: &Path, args: &[&str]) -> std::result::Result<Vec<u8>, String> {
-    let output = run_git(repo, args)
-        .map_err(|error| format!("failed to run git {} in {}: {error}", args.join(" "), repo.display()))?;
+    let output = run_git(repo, args).map_err(|error| {
+        format!(
+            "failed to run git {} in {}: {error}",
+            args.join(" "),
+            repo.display()
+        )
+    })?;
     match output.status.code() {
         Some(0 | 1) => Ok(output.stdout),
         _ => Err(format!(
@@ -270,11 +306,22 @@ fn git_bytes_diff_no_index(repo: &Path, args: &[&str]) -> std::result::Result<Ve
 /// to the working tree only — never the index — so untracked files come
 /// back untracked and tracked edits come back unstaged, mirroring how
 /// `capture_patch` originally observed them.
-fn git_apply_stdin(repo: &Path, patch: &[u8]) -> std::result::Result<(), String> {
+fn git_apply_stdin(
+    repo: &Path,
+    patch: &[u8],
+    excluding: &[String],
+) -> std::result::Result<(), String> {
+    let mut args = vec![
+        "apply".to_string(),
+        "--binary".to_string(),
+        "--whitespace=nowarn".to_string(),
+    ];
+    args.extend(excluding.iter().map(|path| format!("--exclude={path}")));
+    args.push("-".to_string());
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["apply", "--binary", "--whitespace=nowarn", "-"])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -286,9 +333,12 @@ fn git_apply_stdin(repo: &Path, patch: &[u8]) -> std::result::Result<(), String>
         .ok_or_else(|| "git apply stdin was not piped".to_string())?
         .write_all(patch)
         .map_err(|error| format!("failed to write patch to git apply stdin: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to wait for git apply in {}: {error}", repo.display()))?;
+    let output = child.wait_with_output().map_err(|error| {
+        format!(
+            "failed to wait for git apply in {}: {error}",
+            repo.display()
+        )
+    })?;
     if !output.status.success() {
         return Err(format!(
             "git apply failed in {}: {}",
@@ -409,7 +459,22 @@ pub(crate) struct RepoLease {
 }
 
 impl RepoLease {
-    pub(crate) fn acquire(state_dir: &Path, canonical_repo: &str, holder_run_id: &str) -> Result<Self> {
+    /// Acquires the lease, reclaiming it exactly once if the recorded holder
+    /// process is provably dead. A lease file surviving its holder's crash
+    /// (killed before reaching the `Drop` release) would otherwise wedge
+    /// every future recovery attempt against this repo forever — an
+    /// unrecoverable state a purely advisory, `O_EXCL`-only lock cannot
+    /// escape on its own. Reclaim only fires when the recorded `pid` can be
+    /// read and is confirmed not running; an unparseable or unreadable
+    /// holder record is treated as still-held (ambiguous, not provably
+    /// dead), so it never auto-reclaims. The retry after reclaiming is
+    /// itself a single `O_EXCL` create — if another process wins that race,
+    /// this call still fails closed rather than double-acquiring.
+    pub(crate) fn acquire(
+        state_dir: &Path,
+        canonical_repo: &str,
+        holder_run_id: &str,
+    ) -> Result<Self> {
         let leases_dir = state_dir.join("leases");
         std::fs::create_dir_all(&leases_dir).map_err(|error| {
             QuarantineError::CaptureFailed(format!(
@@ -422,29 +487,54 @@ impl RepoLease {
             "run_id={holder_run_id}\npid={}\nrepo={canonical_repo}\n",
             std::process::id()
         );
-        match open_private_new(&path) {
-            Ok(mut file) => {
-                file.write_all(contents.as_bytes()).map_err(|error| {
-                    QuarantineError::CaptureFailed(format!(
-                        "failed to write repository lease at {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                Ok(Self { path })
+        match Self::create_lease_file(&path, &contents) {
+            Ok(()) => return Ok(Self { path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(QuarantineError::CaptureFailed(format!(
+                    "failed to acquire repository lease at {}: {error}",
+                    path.display()
+                )));
             }
+        }
+
+        let holder = std::fs::read_to_string(&path).unwrap_or_default();
+        let holder_pid = parse_lease_pid(&holder);
+        let stale = holder_pid.is_some_and(|pid| !process_alive(pid));
+        if !stale {
+            return Err(QuarantineError::CaptureFailed(format!(
+                "repository lease for {canonical_repo} is already held ({}); refusing to \
+                 touch a repo another Conductor operation may currently be using",
+                holder.trim().replace('\n', ", ")
+            )));
+        }
+
+        // The recorded holder process is confirmed dead — its advisory
+        // lease cannot represent real in-progress work, only a crash that
+        // never reached `Drop`. Reclaim it and retry exactly once so a
+        // genuine concurrent acquirer that wins this race is still
+        // respected rather than double-acquired.
+        let _ = std::fs::remove_file(&path);
+        match Self::create_lease_file(&path, &contents) {
+            Ok(()) => Ok(Self { path }),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = std::fs::read_to_string(&path).unwrap_or_default();
                 Err(QuarantineError::CaptureFailed(format!(
-                    "repository lease for {canonical_repo} is already held ({}); refusing to \
-                     touch a repo another Conductor operation may currently be using",
-                    holder.trim().replace('\n', ", ")
+                    "repository lease for {canonical_repo} was reclaimed from a dead holder \
+                     (pid {}) but immediately re-acquired by another process; refusing to race \
+                     a concurrent operation",
+                    holder_pid.unwrap_or_default()
                 )))
             }
             Err(error) => Err(QuarantineError::CaptureFailed(format!(
-                "failed to acquire repository lease at {}: {error}",
+                "failed to acquire repository lease at {} after reclaiming a stale holder: {error}",
                 path.display()
             ))),
         }
+    }
+
+    fn create_lease_file(path: &Path, contents: &str) -> std::io::Result<()> {
+        let mut file = open_private_new(path)?;
+        file.write_all(contents.as_bytes())
     }
 }
 
@@ -458,6 +548,44 @@ fn lease_key(canonical_repo: &str) -> String {
     format!("{:x}", Sha256::digest(canonical_repo.as_bytes()))
 }
 
+/// Extracts the `pid=<n>` value from a lease file's contents, as written by
+/// [`RepoLease::acquire`]. `None` for anything that doesn't parse cleanly —
+/// a corrupt or foreign-format lease file must never be treated as provably
+/// stale.
+fn parse_lease_pid(contents: &str) -> Option<u32> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Probes whether `pid` still refers to a live process via `kill -0`, the
+/// standard POSIX existence check (mirrors the shell-out style already used
+/// by [`send_signal_to_group`](crate::dispatch) for the same reason: this
+/// crate forbids `unsafe`, so a direct `kill(2)` syscall is not an option).
+/// A failed probe (the `kill` binary itself missing, e.g.) is treated as
+/// "cannot prove death" and returns `true` — reclaim only ever fires on a
+/// confirmed-dead holder, never on an inconclusive probe.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    match Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Scans every run recorded under `state_dir` for another run — one whose
 /// `run_id` is not `exclude_run_id` — that still targets `repo` and has not
 /// reached `Finished`. A `Running` run may still be writing to the working
@@ -467,7 +595,11 @@ fn lease_key(canonical_repo: &str) -> String {
 /// for the same bead — is a conflict. Fails closed (an `Err`, not a silent
 /// `Ok(None)`) on any manifest that might be relevant but cannot be read or
 /// parsed, for the same reason `most_recent_failed_run` does.
-fn running_run_conflict(state_dir: &Path, repo: &str, exclude_run_id: &str) -> Result<Option<String>> {
+fn running_run_conflict(
+    state_dir: &Path,
+    repo: &str,
+    exclude_run_id: &str,
+) -> Result<Option<String>> {
     let root = crate::run::runs_dir(state_dir);
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -596,33 +728,55 @@ fn recover_pre_clean_state<R>(
 where
     R: RepoRecovery + ?Sized,
 {
-    let matches = |current: &[String]| {
-        let mut current = current.to_vec();
-        let mut expected = expected_paths.to_vec();
-        current.sort();
-        expected.sort();
-        current == expected
-    };
+    let expected_hash = patch_hash(patch);
 
-    let before_apply = recovery.changed_paths(repo)?;
-    if matches(&before_apply) {
+    // Content, not just which paths are reported as changed, is what proves
+    // the pre-clean dirty state survived intact: a partial `reset --hard`
+    // can leave a tracked file's path in the same "changed" set while its
+    // *content* has already reverted to HEAD. Recapturing the tree as a
+    // patch and hashing it catches that a path-set comparison alone cannot.
+    let current_patch = recovery.capture_patch(repo)?;
+    if patch_hash(&current_patch) == expected_hash {
         // Nothing was actually destroyed (e.g. `restore_clean` failed before
-        // mutating anything) — reapplying would only conflict with content
-        // that already matches the expected dirty state.
+        // mutating anything, or every path already survived intact) — the
+        // working tree's content already matches the pre-clean dirty state
+        // byte-for-byte.
         return Ok(());
     }
 
-    recovery.apply_patch(repo, patch)?;
-    let after_apply = recovery.changed_paths(repo)?;
-    if matches(&after_apply) {
+    // Any path git still reports as changed already reflects some non-HEAD
+    // state: either the untouched original dirty edit (a survivor `clean`
+    // or `reset` never reached) or, for an untracked file, its untouched
+    // original content. Reapplying either would conflict (`apply` refuses
+    // to recreate a file that already exists) or corrupt content that is
+    // already correct, so those paths are excluded from reapplication —
+    // the hash check below, not this exclusion set, is what proves the
+    // final outcome.
+    let present = recovery.changed_paths(repo)?;
+    let excluding: Vec<String> = expected_paths
+        .iter()
+        .filter(|path| present.contains(path))
+        .cloned()
+        .collect();
+    if excluding.len() < expected_paths.len() {
+        recovery.apply_patch(repo, patch, &excluding)?;
+    }
+
+    let after_patch = recovery.capture_patch(repo)?;
+    let after_hash = patch_hash(&after_patch);
+    if after_hash == expected_hash {
         return Ok(());
     }
     Err(format!(
-        "reapplied patch but changed paths still do not match the pre-clean dirty state \
-         (expected {} path(s), found {})",
-        expected_paths.len(),
-        after_apply.len()
+        "the working tree content still does not match the pre-clean dirty state byte-for-byte \
+         after recovery (expected patch sha256 {}, found {})",
+        &expected_hash[..12],
+        &after_hash[..12],
     ))
+}
+
+fn patch_hash(patch: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(patch))
 }
 
 fn write_patch_artifact(
@@ -632,10 +786,16 @@ fn write_patch_artifact(
 ) -> std::result::Result<ArtifactRef, String> {
     let tmp = stage_private_patch_file(artifact_label, patch)
         .map_err(|error| format!("failed to stage quarantine patch: {error}"))?;
-    let destination = PathBuf::from("artifacts").join(format!("{}.patch", sanitize(artifact_label)));
+    let destination =
+        PathBuf::from("artifacts").join(format!("{}.patch", sanitize(artifact_label)));
     let result = run_artifacts
         .capture_artifact(&tmp, &destination)
-        .map_err(|error| format!("failed to capture quarantine artifact: {}", error.into_message()));
+        .map_err(|error| {
+            format!(
+                "failed to capture quarantine artifact: {}",
+                error.into_message()
+            )
+        });
     let _ = std::fs::remove_file(&tmp);
     result
 }
@@ -715,6 +875,14 @@ pub(crate) struct AdoptableRun {
     pub(crate) run_id: String,
     pub(crate) before_head: Option<String>,
     pub(crate) created_at: DateTime<Utc>,
+    /// Whether this run's own `events.jsonl` was readable and contained at
+    /// least one `AttemptStarted` event — durable proof that a worker
+    /// actually spawned against this repo, rather than a run that was
+    /// created and then abandoned or corrupted before any worker ran.
+    /// `false` for both "no such event" and "the event log could not be
+    /// read/parsed" — either way there is no proof, so automatic adoption
+    /// must not proceed without explicit operator authorization.
+    pub(crate) attempt_started: bool,
 }
 
 /// Scans every run recorded under `state_dir` and returns the single
@@ -793,11 +961,28 @@ pub(crate) fn most_recent_failed_run(
         return Ok(None);
     }
     let before_head = manifest.work.and_then(|work| work.before_head);
+    let attempt_started = run_has_readable_attempt_started_event(&root, &manifest.run_id);
     Ok(Some(AdoptableRun {
         run_id: manifest.run_id,
         before_head,
         created_at,
+        attempt_started,
     }))
+}
+
+/// Best-effort proof that `run_id` actually spawned a worker: its own
+/// `events.jsonl` must be readable and contain at least one `AttemptStarted`
+/// event. Any read/parse failure is treated the same as "no such event" —
+/// there is no proof either way, so the caller must require explicit
+/// operator authorization rather than adopt automatically.
+fn run_has_readable_attempt_started_event(runs_root: &Path, run_id: &str) -> bool {
+    let events_path = runs_root.join(run_id).join("events.jsonl");
+    let Ok(events) = crate::run::read_events(&events_path) else {
+        return false;
+    };
+    events
+        .iter()
+        .any(|event| event.kind == crate::run::EventKind::AttemptStarted)
 }
 
 /// Result of a best-effort, pre-validation relevance check on a manifest.
@@ -860,11 +1045,14 @@ fn manifest_relevance(manifest_path: &Path, repo: &str, bead: Option<&str>) -> M
 /// A manifest written before `before_head` capture existed has no such
 /// record, so there is no automatic, safe way to prove which commit it
 /// started from — timestamp comparisons are not evidence of authorship.
-/// The only path for that case is `operator_authorized_run_id` naming this
+/// Likewise, a run whose own event log cannot prove an `AttemptStarted`
+/// event ever fired has no proof a worker even ran — it may have been
+/// created and then abandoned or corrupted before any dispatch happened.
+/// The only path for either case is `operator_authorized_run_id` naming this
 /// exact `run.run_id`: a deliberate, per-run acknowledgment (not a blanket
 /// policy toggle) that an operator has manually reviewed this specific
 /// stranded run and accepts the residual risk of adopting its dirty tree
-/// without a HEAD proof. Even then, this never mutates the repository —
+/// without that proof. Even then, this never mutates the repository —
 /// it only reports the current HEAD for the caller to record as the
 /// authenticated `before_head` going forward.
 pub(crate) fn authenticate_legacy_adoption<C>(
@@ -876,8 +1064,18 @@ pub(crate) fn authenticate_legacy_adoption<C>(
 where
     C: CommitProbe + ?Sized,
 {
+    let operator_authorized = operator_authorized_run_id == Some(run.run_id.as_str());
+    if !run.attempt_started && !operator_authorized {
+        return Err(QuarantineError::CaptureFailed(format!(
+            "run {} has no readable AttemptStarted event proving a worker ever actually ran \
+             against this repository; automatic legacy adoption refuses to guess and requires \
+             explicit operator authorization naming this exact run_id before this repository \
+             can be recovered",
+            run.run_id
+        )));
+    }
     let Some(expected) = run.before_head.as_deref() else {
-        if operator_authorized_run_id != Some(run.run_id.as_str()) {
+        if !operator_authorized {
             return Err(QuarantineError::CaptureFailed(format!(
                 "run {} has no recorded before_head (predates worker-attempt provenance \
                  capture); automatic legacy adoption refuses to guess and requires explicit \
@@ -949,7 +1147,10 @@ mod tests {
     }
 
     impl FakeCommits {
-        fn new<const N: usize, const M: usize>(heads: [Option<&str>; N], cleans: [bool; M]) -> Self {
+        fn new<const N: usize, const M: usize>(
+            heads: [Option<&str>; N],
+            cleans: [bool; M],
+        ) -> Self {
             Self {
                 heads: RefCell::new(heads.into_iter().map(|h| h.map(str::to_string)).collect()),
                 cleans: RefCell::new(cleans.to_vec()),
@@ -972,20 +1173,31 @@ mod tests {
     /// state actually changing across the capture → restore-fails →
     /// transactional-recovery sequence. Tests that don't care about that
     /// distinction just set the fixed `changed_paths` field, which every
-    /// call falls back to once the sequence is drained.
+    /// call falls back to once the sequence is drained. `capture_patch`
+    /// works the same way, except its *first* call always returns the fixed
+    /// `patch` field (mirroring the one real initial capture inside
+    /// `quarantine_dirty_attempt`) — only calls after that pop
+    /// `capture_patch_sequence`, so a test can simulate the tree's actual
+    /// content diverging only during the transactional-recovery phase.
     #[derive(Default)]
     struct FakeRecovery {
         changed_paths: Vec<String>,
         changed_paths_sequence: RefCell<Vec<Vec<String>>>,
+        changed_paths_error: RefCell<Option<String>>,
         patch: Vec<u8>,
+        capture_patch_calls: RefCell<u32>,
+        capture_patch_sequence: RefCell<Vec<Vec<u8>>>,
         restore_error: RefCell<Option<String>>,
         restore_calls: RefCell<u32>,
         apply_error: RefCell<Option<String>>,
-        apply_calls: RefCell<u32>,
+        apply_excluding_calls: RefCell<Vec<Vec<String>>>,
     }
 
     impl RepoRecovery for FakeRecovery {
         fn changed_paths(&self, _repo: &Path) -> std::result::Result<Vec<String>, String> {
+            if let Some(message) = self.changed_paths_error.borrow().clone() {
+                return Err(message);
+            }
             let mut sequence = self.changed_paths_sequence.borrow_mut();
             if !sequence.is_empty() {
                 return Ok(sequence.remove(0));
@@ -994,6 +1206,15 @@ mod tests {
         }
 
         fn capture_patch(&self, _repo: &Path) -> std::result::Result<Vec<u8>, String> {
+            let mut calls = self.capture_patch_calls.borrow_mut();
+            *calls += 1;
+            if *calls == 1 {
+                return Ok(self.patch.clone());
+            }
+            let mut sequence = self.capture_patch_sequence.borrow_mut();
+            if !sequence.is_empty() {
+                return Ok(sequence.remove(0));
+            }
             Ok(self.patch.clone())
         }
 
@@ -1005,8 +1226,15 @@ mod tests {
             }
         }
 
-        fn apply_patch(&self, _repo: &Path, _patch: &[u8]) -> std::result::Result<(), String> {
-            *self.apply_calls.borrow_mut() += 1;
+        fn apply_patch(
+            &self,
+            _repo: &Path,
+            _patch: &[u8],
+            excluding: &[String],
+        ) -> std::result::Result<(), String> {
+            self.apply_excluding_calls
+                .borrow_mut()
+                .push(excluding.to_vec());
             match self.apply_error.borrow().clone() {
                 Some(message) => Err(message),
                 None => Ok(()),
@@ -1050,10 +1278,7 @@ mod tests {
     fn quarantine_worker_failure_captures_tracked_edits_and_restores_repo() {
         let temp = TempDir::new("tracked");
         let handle = run_handle(&temp, "tracked");
-        let commits = FakeCommits::new(
-            [Some("head1"), Some("head1")],
-            [false, true],
-        );
+        let commits = FakeCommits::new([Some("head1"), Some("head1")], [false, true]);
         let recovery = FakeRecovery {
             changed_paths: vec!["src/lib.rs".to_string()],
             patch: b"diff --git a/src/lib.rs b/src/lib.rs\n+dirty\n".to_vec(),
@@ -1086,10 +1311,7 @@ mod tests {
     fn quarantine_worker_failure_captures_untracked_files() {
         let temp = TempDir::new("untracked");
         let handle = run_handle(&temp, "untracked");
-        let commits = FakeCommits::new(
-            [Some("head1"), Some("head1")],
-            [false, true],
-        );
+        let commits = FakeCommits::new([Some("head1"), Some("head1")], [false, true]);
         let recovery = FakeRecovery {
             changed_paths: vec!["fixtures/new_case.json".to_string()],
             patch: b"diff --git a/fixtures/new_case.json b/fixtures/new_case.json\nnew file\n"
@@ -1225,10 +1447,7 @@ mod tests {
     fn quarantine_cleanup_that_leaves_tree_dirty_is_not_proven_and_fails_closed() {
         let temp = TempDir::new("cleanup-unproven");
         let handle = run_handle(&temp, "cleanup-unproven");
-        let commits = FakeCommits::new(
-            [Some("head1"), Some("head1")],
-            [false, false],
-        );
+        let commits = FakeCommits::new([Some("head1"), Some("head1")], [false, false]);
         let recovery = FakeRecovery {
             changed_paths: vec!["src/lib.rs".to_string()],
             patch: b"diff\n".to_vec(),
@@ -1249,13 +1468,102 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_transactional_recovery_detects_content_mismatch_even_when_path_set_matches() {
+        // A partial `reset --hard` can revert a tracked file's *content* to
+        // HEAD while git still reports the same path as changed (now for a
+        // different reason). A path-set-only comparison would wrongly call
+        // that "intact"; content hashing must catch it.
+        let temp = TempDir::new("transactional-content-mismatch");
+        let handle = run_handle(&temp, "transactional-content-mismatch");
+        let commits = FakeCommits::new([Some("head1")], [false]);
+        let original_patch = b"diff --git a/src/lib.rs b/src/lib.rs\n+dirty\n".to_vec();
+        let corrupted_patch = b"diff --git a/src/lib.rs b/src/lib.rs\n+DIFFERENT\n".to_vec();
+        let recovery = FakeRecovery {
+            changed_paths: vec!["src/lib.rs".to_string()],
+            patch: original_patch,
+            capture_patch_sequence: RefCell::new(vec![corrupted_patch.clone(), corrupted_patch]),
+            restore_error: RefCell::new(Some("disk full mid-reset".to_string())),
+            ..FakeRecovery::default()
+        };
+
+        let error = quarantine_dirty_attempt(
+            Path::new("/repo/conductor"),
+            &commits,
+            &recovery,
+            &handle,
+            Some("head1"),
+            "010-attempt",
+        )
+        .expect_err("content mismatch must fail closed even though the path set matches");
+
+        let QuarantineError::CleanupUnproven(message) = error else {
+            panic!("expected CleanupUnproven, got a different variant");
+        };
+        assert!(
+            message.contains("still does not match"),
+            "diagnostic must report the content-hash mismatch, got: {message}"
+        );
+        assert!(
+            recovery.apply_excluding_calls.borrow().is_empty(),
+            "the only path is a survivor by path-set, so reapply must never be attempted"
+        );
+    }
+
+    #[test]
+    fn quarantine_transactional_recovery_tolerates_survivors_and_reapplies_only_missing_paths() {
+        // "src/lib.rs" survived the partial `restore_clean` failure intact
+        // (its dirty content was never touched) while "fixtures/new.json"
+        // was already removed by `git clean` before the failure. Recovery
+        // must leave the survivor alone (excluded from `apply_patch`, never
+        // conflicting with an "already exists" error) and only reapply the
+        // missing path, then prove success by content hash.
+        let temp = TempDir::new("transactional-tolerates-survivors");
+        let handle = run_handle(&temp, "transactional-tolerates-survivors");
+        let commits = FakeCommits::new([Some("head1")], [false]);
+        let full_patch =
+            b"diff --git a/src/lib.rs b/src/lib.rs\n+dirty\ndiff --git a/fixtures/new.json\n+new\n"
+                .to_vec();
+        let partial_patch = b"diff --git a/src/lib.rs b/src/lib.rs\n+dirty\n".to_vec();
+        let recovery = FakeRecovery {
+            changed_paths_sequence: RefCell::new(vec![
+                vec!["src/lib.rs".to_string(), "fixtures/new.json".to_string()],
+                vec!["src/lib.rs".to_string()],
+            ]),
+            patch: full_patch.clone(),
+            capture_patch_sequence: RefCell::new(vec![partial_patch, full_patch]),
+            restore_error: RefCell::new(Some("permission denied removing new.json".to_string())),
+            ..FakeRecovery::default()
+        };
+
+        let error = quarantine_dirty_attempt(
+            Path::new("/repo/conductor"),
+            &commits,
+            &recovery,
+            &handle,
+            Some("head1"),
+            "011-attempt",
+        )
+        .expect_err("restore_clean itself still failed, even though recovery succeeded");
+
+        let QuarantineError::CleanupUnproven(message) = error else {
+            panic!("expected CleanupUnproven, got a different variant");
+        };
+        assert!(
+            message.contains("restored and verified intact"),
+            "diagnostic must report successful transactional recovery, got: {message}"
+        );
+        assert_eq!(
+            recovery.apply_excluding_calls.borrow().as_slice(),
+            [vec!["src/lib.rs".to_string()]],
+            "only the missing path is reapplied; the survivor is excluded"
+        );
+    }
+
+    #[test]
     fn quarantine_captured_artifact_tamper_is_detected_by_hash_validation() {
         let temp = TempDir::new("tamper");
         let handle = run_handle(&temp, "tamper");
-        let commits = FakeCommits::new(
-            [Some("head1"), Some("head1")],
-            [false, true],
-        );
+        let commits = FakeCommits::new([Some("head1"), Some("head1")], [false, true]);
         let recovery = FakeRecovery {
             changed_paths: vec!["src/lib.rs".to_string()],
             patch: b"diff --git a/src/lib.rs b/src/lib.rs\n+dirty\n".to_vec(),
@@ -1283,7 +1591,10 @@ mod tests {
         // The tampered bytes no longer match the hash recorded at capture
         // time — the same tamper-evidence property `run.rs` already proves
         // for every other artifact captured through `RunHandle`.
-        assert_ne!(format!("{:x}", Sha256::digest(b"tampered")), artifact.sha256);
+        assert_ne!(
+            format!("{:x}", Sha256::digest(b"tampered")),
+            artifact.sha256
+        );
         assert!(
             RunHandle::open(temp.path(), &run_id).is_ok(),
             "manifest itself is untouched by tampering an artifact it never referenced"
@@ -1294,15 +1605,11 @@ mod tests {
     fn quarantine_no_raw_patch_bytes_ever_reach_the_manifest_or_event_log() {
         let temp = TempDir::new("no-raw-patch");
         let handle = run_handle(&temp, "no-raw-patch");
-        let commits = FakeCommits::new(
-            [Some("head1"), Some("head1")],
-            [false, true],
-        );
+        let commits = FakeCommits::new([Some("head1"), Some("head1")], [false, true]);
         let secret_marker = "TOTALLY_UNIQUE_DIRTY_PATCH_CONTENT_MARKER";
         let recovery = FakeRecovery {
             changed_paths: vec!["src/lib.rs".to_string()],
-            patch: format!("diff --git a/src/lib.rs b/src/lib.rs\n+{secret_marker}\n")
-                .into_bytes(),
+            patch: format!("diff --git a/src/lib.rs b/src/lib.rs\n+{secret_marker}\n").into_bytes(),
             ..FakeRecovery::default()
         };
         let run_id = handle.run_id().to_string();
@@ -1318,14 +1625,12 @@ mod tests {
         .expect("capture succeeds");
         drop(handle);
 
-        let manifest_text = std::fs::read_to_string(
-            temp.path().join("runs").join(&run_id).join("manifest.json"),
-        )
-        .expect("read manifest");
-        let events_text = std::fs::read_to_string(
-            temp.path().join("runs").join(&run_id).join("events.jsonl"),
-        )
-        .expect("read events");
+        let manifest_text =
+            std::fs::read_to_string(temp.path().join("runs").join(&run_id).join("manifest.json"))
+                .expect("read manifest");
+        let events_text =
+            std::fs::read_to_string(temp.path().join("runs").join(&run_id).join("events.jsonl"))
+                .expect("read events");
         assert!(!manifest_text.contains(secret_marker));
         assert!(!events_text.contains(secret_marker));
     }
@@ -1368,10 +1673,65 @@ mod tests {
         handle.run_id().to_string()
     }
 
+    /// Same as `manifest_for`, but appends a real `AttemptStarted` event
+    /// before finishing — the durable proof a worker actually spawned that
+    /// `authenticate_legacy_adoption` now requires for automatic adoption.
+    fn finished_run_with_attempt_started_for(
+        temp: &TempDir,
+        repo: &str,
+        bead: &str,
+        outcome: &str,
+        created_at: DateTime<Utc>,
+    ) -> String {
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            crate::run::NewRun {
+                target: crate::run::RunTarget {
+                    repo: repo.to_string(),
+                    bead: Some(bead.to_string()),
+                },
+                approved_profiles: vec!["claude-sonnet-5".to_string()],
+                bursar_roster_artifact: None,
+                limits: crate::run::RunLimits::default(),
+                verifier: crate::run::RunVerifier::default(),
+                work: Some(crate::run::WorkState {
+                    cycle_id: "cycle-legacy".to_string(),
+                    authorization_sha256: "a".repeat(64),
+                    before_head: Some("d".repeat(40)),
+                    worker_profile: None,
+                    worker_commit: None,
+                    mechanical: None,
+                    stage: crate::run::WorkStage::Implementing,
+                }),
+                approval: None,
+            },
+            created_at,
+        )
+        .expect("create legacy run");
+        handle
+            .append_event(
+                EventKind::AttemptStarted,
+                EventInput {
+                    profile_id: Some("fake-worker".to_string()),
+                    outcome: Some("running".to_string()),
+                    ..EventInput::default()
+                },
+            )
+            .expect("append attempt-started event");
+        handle.finish(outcome).expect("finish legacy run");
+        handle.run_id().to_string()
+    }
+
     /// Creates a run manifest whose lifecycle is `Running` (Started ->
     /// Running happens on the first non-terminal event) and leaves it that
     /// way — used to exercise `running_run_conflict`.
-    fn running_manifest_for(temp: &TempDir, repo: &str, bead: &str, created_at: DateTime<Utc>) -> String {
+    fn running_manifest_for(
+        temp: &TempDir,
+        repo: &str,
+        bead: &str,
+        created_at: DateTime<Utc>,
+    ) -> String {
         let mut handle = RunHandle::create_at(
             temp.path(),
             RunJob::Work,
@@ -1443,6 +1803,60 @@ mod tests {
     }
 
     #[test]
+    fn repo_lease_reclaims_a_stale_holder_whose_process_is_confirmed_dead() {
+        // Simulates the crash case: a holder that never reached its `Drop`
+        // release because its process was killed. The lease file survives
+        // on disk, but the recorded pid is provably no longer running.
+        let temp = TempDir::new("lease-stale-reclaim");
+        let mut dead = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn short-lived process");
+        let dead_pid = dead.id();
+        dead.wait().expect("reap short-lived process");
+
+        let leases_dir = temp.path().join("leases");
+        std::fs::create_dir_all(&leases_dir).expect("mkdir leases dir");
+        let stale_path = leases_dir.join(format!("{}.lock", lease_key("/repo/bursar")));
+        std::fs::write(
+            &stale_path,
+            format!("run_id=stale-run\npid={dead_pid}\nrepo=/repo/bursar\n"),
+        )
+        .expect("write stale lease file");
+
+        let lease = RepoLease::acquire(temp.path(), "/repo/bursar", "run-new")
+            .expect("a lease held by a provably dead process must be reclaimed");
+
+        drop(lease);
+        assert!(
+            !stale_path.exists(),
+            "the reclaimed-then-released lease must be gone after drop"
+        );
+    }
+
+    #[test]
+    fn repo_lease_does_not_reclaim_when_the_holder_pid_cannot_be_parsed() {
+        // A corrupt or foreign-format lease file has no provable-dead pid —
+        // it must be treated as still held, never auto-reclaimed.
+        let temp = TempDir::new("lease-unparseable-holder");
+        let leases_dir = temp.path().join("leases");
+        std::fs::create_dir_all(&leases_dir).expect("mkdir leases dir");
+        let path = leases_dir.join(format!("{}.lock", lease_key("/repo/bursar")));
+        std::fs::write(&path, "not a lease file at all\n").expect("write corrupt lease file");
+
+        let error = RepoLease::acquire(temp.path(), "/repo/bursar", "run-new")
+            .expect_err("a lease whose holder cannot be proven dead must not be reclaimed");
+
+        assert!(matches!(error, QuarantineError::CaptureFailed(_)));
+        assert!(
+            path.exists(),
+            "the unparseable lease file must be left in place"
+        );
+    }
+
+    #[test]
     fn running_run_conflict_finds_another_running_run_for_the_same_repo() {
         let temp = TempDir::new("running-conflict");
         let running_run_id = running_manifest_for(&temp, "/repo/bursar", "bursar-467", fixed_now());
@@ -1478,8 +1892,8 @@ mod tests {
         );
         running_manifest_for(&temp, "/repo/other", "other-1", fixed_now());
 
-        let found = running_run_conflict(temp.path(), "/repo/bursar", "excluded")
-            .expect("scan succeeds");
+        let found =
+            running_run_conflict(temp.path(), "/repo/bursar", "excluded").expect("scan succeeds");
 
         assert_eq!(found, None);
     }
@@ -1509,7 +1923,11 @@ mod tests {
         .expect_err("must refuse while another run is Running against this repo");
 
         assert!(matches!(error, QuarantineError::CaptureFailed(_)));
-        assert_eq!(*recovery.restore_calls.borrow(), 0, "must not mutate the tree");
+        assert_eq!(
+            *recovery.restore_calls.borrow(),
+            0,
+            "must not mutate the tree"
+        );
     }
 
     #[test]
@@ -1532,19 +1950,36 @@ mod tests {
         assert_eq!(found.run_id, run_id);
         assert_eq!(found.before_head, None);
         assert_eq!(found.created_at, created_at);
+        assert!(
+            !found.attempt_started,
+            "manifest_for never appends an AttemptStarted event, so this must be false"
+        );
+    }
+
+    #[test]
+    fn most_recent_failed_run_reports_attempt_started_true_when_the_event_is_present() {
+        let temp = TempDir::new("legacy-attempt-started");
+        let created_at = fixed_now();
+        let run_id = finished_run_with_attempt_started_for(
+            &temp,
+            "/repo/bursar",
+            "bursar-467",
+            "failed",
+            created_at,
+        );
+
+        let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
+            .expect("lookup succeeds")
+            .expect("run found");
+
+        assert_eq!(found.run_id, run_id);
+        assert!(found.attempt_started);
     }
 
     #[test]
     fn most_recent_failed_run_ignores_runs_for_other_targets() {
         let temp = TempDir::new("legacy-other-target");
-        manifest_for(
-            &temp,
-            "/repo/other",
-            "other-1",
-            "failed",
-            None,
-            fixed_now(),
-        );
+        manifest_for(&temp, "/repo/other", "other-1", "failed", None, fixed_now());
 
         let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
             .expect("lookup succeeds");
@@ -1593,7 +2028,11 @@ mod tests {
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest["work"]["authorization_sha256"] = serde_json::json!("not-a-sha256");
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let error = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
             .expect_err("tampered evidence for our own target must fail closed");
@@ -1638,7 +2077,11 @@ mod tests {
         let temp = TempDir::new("legacy-unparseable-unrelated");
         let run_id = manifest_for(&temp, "/repo/other", "other-1", "failed", None, fixed_now());
         let manifest_path = temp.path().join("runs").join(&run_id).join("manifest.json");
-        std::fs::write(&manifest_path, b"{ not valid json, and unrelated to our target").unwrap();
+        std::fs::write(
+            &manifest_path,
+            b"{ not valid json, and unrelated to our target",
+        )
+        .unwrap();
 
         let found = most_recent_failed_run(temp.path(), "/repo/bursar", "bursar-467")
             .expect("unrelated corrupt manifest must not block the scan");
@@ -1653,6 +2096,7 @@ mod tests {
             run_id: "run-work-1".to_string(),
             before_head: Some("sha-a".to_string()),
             created_at: fixed_now(),
+            attempt_started: true,
         };
 
         let head = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
@@ -1668,6 +2112,7 @@ mod tests {
             run_id: "run-work-1".to_string(),
             before_head: Some("sha-a".to_string()),
             created_at: fixed_now(),
+            attempt_started: true,
         };
 
         let error = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
@@ -1690,6 +2135,7 @@ mod tests {
             run_id: "run-work-legacy".to_string(),
             before_head: None,
             created_at: fixed_now(),
+            attempt_started: true,
         };
 
         let error = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
@@ -1705,6 +2151,7 @@ mod tests {
             run_id: "run-work-legacy".to_string(),
             before_head: None,
             created_at: fixed_now(),
+            attempt_started: true,
         };
 
         let error = authenticate_legacy_adoption(
@@ -1730,6 +2177,7 @@ mod tests {
             run_id: "run-work-legacy".to_string(),
             before_head: None,
             created_at: fixed_now(),
+            attempt_started: true,
         };
 
         let head = authenticate_legacy_adoption(
@@ -1741,5 +2189,129 @@ mod tests {
         .expect("explicit per-run operator authorization is sufficient");
 
         assert_eq!(head, "current-head-sha");
+    }
+
+    #[test]
+    fn authenticate_legacy_adoption_refuses_when_attempt_started_is_missing_even_with_recorded_before_head()
+     {
+        // A recorded before_head alone is not proof a worker ever actually
+        // ran — a run manifest could in principle be created and then
+        // abandoned before any dispatch. An empty `heads` queue also proves
+        // `commits.head` is never called: refusal happens before any HEAD
+        // comparison is attempted.
+        let commits = FakeCommits::new([], []);
+        let run = AdoptableRun {
+            run_id: "run-work-no-attempt".to_string(),
+            before_head: Some("sha-a".to_string()),
+            created_at: fixed_now(),
+            attempt_started: false,
+        };
+
+        let error = authenticate_legacy_adoption(&commits, Path::new("/repo/bursar"), &run, None)
+            .expect_err("missing AttemptStarted proof must fail closed even with a before_head");
+
+        assert!(matches!(error, QuarantineError::CaptureFailed(_)));
+    }
+
+    #[test]
+    fn authenticate_legacy_adoption_accepts_missing_attempt_started_with_explicit_operator_authorization()
+     {
+        // The explicit per-run override covers both missing-evidence cases
+        // at once: no AttemptStarted proof, but the operator has manually
+        // reviewed and authorized this exact run_id. The recorded
+        // before_head is still checked against the current HEAD since it is
+        // present.
+        let commits = FakeCommits::new([Some("sha-a")], []);
+        let run = AdoptableRun {
+            run_id: "run-work-no-attempt".to_string(),
+            before_head: Some("sha-a".to_string()),
+            created_at: fixed_now(),
+            attempt_started: false,
+        };
+
+        let head = authenticate_legacy_adoption(
+            &commits,
+            Path::new("/repo/bursar"),
+            &run,
+            Some("run-work-no-attempt"),
+        )
+        .expect("operator authorization overrides missing AttemptStarted proof");
+
+        assert_eq!(head, "sha-a");
+    }
+
+    #[test]
+    fn parse_porcelain_z_rejects_non_utf8_paths_with_a_manual_recovery_diagnostic() {
+        // `-z` mode disables C-quoting entirely, so an invalid byte in a raw
+        // path appears literally rather than escaped — this is the exact
+        // shape `git status --porcelain -z` produces for a non-UTF-8 name.
+        let mut raw = b"?? stray-".to_vec();
+        raw.push(0xFF);
+        raw.extend_from_slice(b"name.tmp");
+        raw.push(0);
+
+        let error = parse_porcelain_z(&raw).expect_err("non-UTF-8 path must be rejected");
+
+        assert!(
+            error.to_lowercase().contains("utf-8"),
+            "diagnostic must explain the non-UTF-8 path, got: {error}"
+        );
+        assert!(
+            error.contains("manual"),
+            "diagnostic must point at manual recovery, got: {error}"
+        );
+    }
+
+    #[test]
+    fn split_nul_paths_rejects_non_utf8_paths_with_a_manual_recovery_diagnostic() {
+        let mut raw = b"stray-".to_vec();
+        raw.push(0xFF);
+        raw.extend_from_slice(b"name.tmp");
+        raw.push(0);
+
+        let error = split_nul_paths(&raw).expect_err("non-UTF-8 path must be rejected");
+
+        assert!(
+            error.to_lowercase().contains("utf-8"),
+            "diagnostic must explain the non-UTF-8 path, got: {error}"
+        );
+        assert!(
+            error.contains("manual"),
+            "diagnostic must point at manual recovery, got: {error}"
+        );
+    }
+
+    #[test]
+    fn quarantine_dirty_attempt_never_mutates_when_changed_paths_cannot_be_read() {
+        // Mirrors what a real non-UTF-8 path produces: `changed_paths` fails
+        // before any destructive git command has a chance to run. This
+        // proves the fail-closed property at the `quarantine_dirty_attempt`
+        // level, not just inside the parser.
+        let temp = TempDir::new("changed-paths-unreadable");
+        let handle = run_handle(&temp, "changed-paths-unreadable");
+        let commits = FakeCommits::new([Some("head1")], [false]);
+        let recovery = FakeRecovery {
+            changed_paths_error: RefCell::new(Some(
+                "git status reported a non-UTF-8 path".to_string(),
+            )),
+            ..FakeRecovery::default()
+        };
+
+        let error = quarantine_dirty_attempt(
+            Path::new("/repo/conductor"),
+            &commits,
+            &recovery,
+            &handle,
+            Some("head1"),
+            "013-attempt",
+        )
+        .expect_err("unreadable changed paths must fail closed");
+
+        assert!(matches!(error, QuarantineError::CaptureFailed(_)));
+        assert_eq!(*recovery.restore_calls.borrow(), 0, "must not mutate tree");
+        assert!(
+            recovery.apply_excluding_calls.borrow().is_empty(),
+            "must not attempt any reapply either"
+        );
     }
 }

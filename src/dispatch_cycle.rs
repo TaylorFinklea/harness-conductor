@@ -727,6 +727,7 @@ fn dispatch_one<
         }
     };
 
+    let mut legacy_capture: Option<quarantine::QuarantineCapture> = None;
     if legacy_adopt_head.is_some() {
         match quarantine::quarantine_dirty_attempt_with_lease(
             &repo_path,
@@ -748,6 +749,25 @@ fn dispatch_one<
                         capture.summary()
                     ),
                 );
+                // Pin the adopted artifact into this run's own durable
+                // evidence immediately — a bd comment alone is not run
+                // evidence, and the retry dispatched below must be able to
+                // reuse this capture rather than it being archived and
+                // forgotten.
+                run_artifacts
+                    .append_event(
+                        EventKind::CoverageGap,
+                        EventInput {
+                            artifact_refs: capture.artifact.clone().into_iter().collect(),
+                            outcome: Some(format!(
+                                "legacy_dirty_repo_adopted: {}",
+                                capture.summary()
+                            )),
+                            ..EventInput::default()
+                        },
+                    )
+                    .map_err(run_artifact_error)?;
+                legacy_capture = Some(capture);
             }
             Ok(_) => {}
             Err(error) => {
@@ -789,6 +809,7 @@ fn dispatch_one<
         bursar,
         &mut run_artifacts,
         before_head.as_deref(),
+        legacy_capture,
     );
     let worker_outcome = match worker_outcome {
         Ok(outcome) => outcome,
@@ -1299,6 +1320,7 @@ fn run_worker_chain<E, C, L, U>(
     bursar_client: &U,
     run_artifacts: &mut RunHandle,
     before_head: Option<&str>,
+    legacy_capture: Option<quarantine::QuarantineCapture>,
 ) -> std::result::Result<WorkerChainOutcome, DispatchCycleError>
 where
     E: Exec + ?Sized,
@@ -1320,7 +1342,10 @@ where
     // later attempt's prompt (path + hash only, never patch content) so a
     // fallback or legacy retry worker knows prior partial work exists as a
     // run artifact, even though its own working tree always starts clean.
-    let mut prior_capture: Option<quarantine::QuarantineCapture> = None;
+    // Seeded from a pre-loop legacy adoption (if one happened) so the very
+    // first attempt in this chain already carries that evidence forward,
+    // not just attempts after this chain's own first quarantine.
+    let mut prior_capture: Option<quarantine::QuarantineCapture> = legacy_capture;
     for (idx, roster) in chain.iter().enumerate() {
         if let Some(rejection) =
             triage::candidate_rejection(roster, &fields.routing, repo_cost_policy)
@@ -1398,7 +1423,11 @@ where
             backend: roster.backend,
             dispatch_id: roster.dispatch_id.clone(),
             reasoning_effort: roster.reasoning_effort,
-            prompt: attempt_prompt_with_capture_note(prompt, prior_capture.as_ref()),
+            prompt: attempt_prompt_with_capture_note(
+                prompt,
+                prior_capture.as_ref(),
+                run_artifacts.dir(),
+            ),
         };
         let result = dispatch::run_with_heartbeat(
             exec,
@@ -1998,10 +2027,14 @@ fn sanitize_artifact_piece(value: &str) -> String {
 /// fallback or legacy-retry worker knows that evidence exists as a run
 /// artifact even though its own working tree always starts clean. Never
 /// includes patch content — only what `capture.summary()`-style metadata
-/// already exposes in run events.
+/// already exposes in run events. The artifact path recorded on the capture
+/// is run-relative (e.g. `artifacts/foo.patch`); a worker's cwd is the
+/// target repository, not the run directory, so `run_dir` is joined in to
+/// produce a path the worker can actually resolve.
 fn attempt_prompt_with_capture_note(
     prompt: &str,
     prior_capture: Option<&quarantine::QuarantineCapture>,
+    run_dir: &Path,
 ) -> String {
     let Some(artifact) = prior_capture.and_then(|capture| capture.artifact.as_ref()) else {
         return prompt.to_string();
@@ -2011,7 +2044,8 @@ fn attempt_prompt_with_capture_note(
          were captured and the working tree was restored to a clean state before this attempt \
          started. The captured patch is available as a run artifact at `{}` (sha256 `{}`) for \
          context if useful — you are starting from a clean tree and are not required to use it.",
-        artifact.path, artifact.sha256,
+        run_dir.join(&artifact.path).display(),
+        artifact.sha256,
     )
 }
 
@@ -4511,9 +4545,11 @@ dispatch_id = "fake-worker"
                     .is_some_and(|name| name != stranded_run_id)
             })
             .expect("new run directory exists");
-        // Legacy adoption records its evidence as a captured artifact plus a
-        // bounded bd comment (already asserted above), not a run event —
-        // the manifest/event log must still carry no raw patch content.
+        // Legacy adoption records its evidence as a captured artifact, a
+        // bounded bd comment (already asserted above), and — immediately,
+        // before the retry is dispatched — a run event pinning that
+        // artifact into this run's own durable evidence, never a run event
+        // carrying raw patch content.
         let artifacts_dir = new_run_dir.join("artifacts");
         let patch_files: Vec<_> = std::fs::read_dir(&artifacts_dir)
             .expect("artifacts dir")
@@ -4526,13 +4562,55 @@ dispatch_id = "fake-worker"
             patch_text.contains("stranded partial edit")
                 || patch_text.contains("stranded-leftover.tmp")
         );
-        let manifest_text =
-            std::fs::read_to_string(new_run_dir.join("manifest.json")).expect("manifest");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(new_run_dir.join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        let manifest_text = manifest.to_string();
         let events_text =
             std::fs::read_to_string(new_run_dir.join("events.jsonl")).expect("events");
         assert!(!manifest_text.contains("stranded partial edit"));
         assert!(!events_text.contains("stranded partial edit"));
         assert!(!events_text.contains("stray from stranded run"));
+        assert!(
+            events_text.contains("legacy_dirty_repo_adopted"),
+            "adoption must be pinned into this run's own event evidence, not just a bd comment"
+        );
+        let artifact_path = manifest["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .iter()
+            .filter_map(|artifact| artifact["path"].as_str())
+            .find(|path| {
+                std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("patch"))
+            })
+            .expect("adopted patch artifact is pinned in manifest.artifacts before dispatch");
+
+        // The adopted artifact must reach the very first attempt's prompt —
+        // there is only one roster entry in this fixture, and it succeeds
+        // on the first try, so prior_capture must already be seeded from
+        // the legacy adoption rather than starting empty.
+        let spawns = exec.spawns();
+        let worker_spawn = spawns
+            .iter()
+            .find(|request| request.argv.first().map(String::as_str) == Some("pi"))
+            .expect("worker was spawned");
+        let prompt = prompt_arg(worker_spawn);
+        assert!(
+            prompt.contains(artifact_path),
+            "the retried worker's prompt must reference the adopted artifact's resolvable path"
+        );
+        assert!(
+            prompt.contains(new_run_dir.to_str().expect("utf8 run dir")),
+            "the artifact reference must include the run directory so the worker can resolve it \
+             from its own cwd (the target repo), not a bare run-relative path"
+        );
+        assert!(
+            !prompt.contains("stranded partial edit"),
+            "the prompt note must carry the artifact reference, never raw patch content"
+        );
     }
 
     #[test]

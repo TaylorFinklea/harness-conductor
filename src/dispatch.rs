@@ -364,7 +364,7 @@ fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
     items.into_iter().map(str::to_string).collect()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct ProcessRun {
     status: ProcessStatus,
     timed_out: bool,
@@ -391,30 +391,63 @@ where
             break;
         }
         let wait = timeout.saturating_sub(elapsed).min(heartbeat_interval);
-        if let Some(status) = child.wait_for(wait)? {
+        let status = match child.wait_for(wait) {
+            Ok(status) => status,
+            Err(error) => {
+                // A poll/wait error here (e.g. the OS call itself failing)
+                // must never be mistaken for "the worker is done" — the
+                // process, and any descendants in its group, could still be
+                // running and writing to the repository. Terminate and reap
+                // the whole group before propagating so no orphaned writer
+                // can outlive the `dispatch_error` this returns.
+                terminate_and_reap_best_effort(child);
+                return Err(error);
+            }
+        };
+        if let Some(status) = status {
             return Ok(ProcessRun {
                 status,
                 timed_out: false,
             });
         }
         elapsed = elapsed.saturating_add(wait);
-        heartbeat(elapsed)?;
+        if let Err(error) = heartbeat(elapsed) {
+            // Same reasoning as above: a heartbeat failure (e.g. the live
+            // report patch call erroring) must not leave the worker running
+            // unattended after this function returns an error.
+            terminate_and_reap_best_effort(child);
+            return Err(error);
+        }
     }
 
-    child.terminate()?;
-    if let Some(status) = child.wait_for(KILL_GRACE)? {
+    let _ = child.terminate();
+    if let Ok(Some(status)) = child.wait_for(KILL_GRACE) {
         return Ok(ProcessRun {
             status,
             timed_out: true,
         });
     }
 
-    child.kill()?;
+    let _ = child.kill();
     let status = child.wait()?;
     Ok(ProcessRun {
         status,
         timed_out: true,
     })
+}
+
+/// Escalates from a graceful signal to a hard kill and reaps the child,
+/// swallowing every intermediate failure so a failure to signal (or to
+/// observe the grace-period exit) never skips the harder escalation that
+/// follows it. Used only on an already-erroring path, where the caller is
+/// about to propagate a different error and cannot usefully report this
+/// one too — an orphaned worker that keeps writing after Conductor has
+/// moved on is worse than losing a diagnostic about noisy termination.
+fn terminate_and_reap_best_effort(child: &mut dyn ChildProcess) {
+    let _ = child.terminate();
+    let _ = child.wait_for(KILL_GRACE);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn classify<C: CommitProbe + ?Sized>(
@@ -901,6 +934,63 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_error_terminates_and_reaps_the_process_group_before_propagating() {
+        // A `wait_for` failure (e.g. the OS poll call itself erroring) must
+        // never be mistaken for "the worker finished" — it, and any
+        // descendants in its process group, could still be running. The
+        // group must be terminated and reaped before the error propagates,
+        // not after.
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut child = FakeChild::wait_for_error(Rc::clone(&events));
+
+        let error = wait_with_timeout_and_heartbeat(
+            &mut child,
+            Duration::from_secs(45),
+            Duration::from_secs(45),
+            |_elapsed| Ok(()),
+        )
+        .expect_err("a wait_for error must propagate, not be swallowed");
+
+        assert_eq!(error.to_string(), "simulated wait_for failure");
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                ExecEvent::WaitFor(Duration::from_secs(45)),
+                ExecEvent::Terminate,
+                ExecEvent::WaitFor(KILL_GRACE),
+                ExecEvent::Kill,
+                ExecEvent::Wait,
+            ]
+        );
+    }
+
+    #[test]
+    fn heartbeat_error_terminates_and_reaps_the_process_group_before_propagating() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut child = FakeChild::pending(Rc::clone(&events));
+
+        let error = wait_with_timeout_and_heartbeat(
+            &mut child,
+            Duration::from_secs(45),
+            Duration::from_secs(45),
+            |_elapsed| Err(DispatchError::new("simulated heartbeat failure")),
+        )
+        .expect_err("a heartbeat error must propagate, not be swallowed");
+
+        assert_eq!(error.to_string(), "simulated heartbeat failure");
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                ExecEvent::WaitFor(Duration::from_secs(45)),
+                ExecEvent::Terminate,
+                ExecEvent::WaitFor(KILL_GRACE),
+                ExecEvent::Kill,
+                ExecEvent::Wait,
+            ]
+        );
+    }
+
+    #[test]
     fn stdout_and_stderr_logs_are_written_under_cycle_and_bead() {
         let temp = TempDir::new("logs");
         let repo = temp.path().join("repo");
@@ -1080,6 +1170,11 @@ mod tests {
     struct FakeChild {
         events: Rc<RefCell<Vec<ExecEvent>>>,
         wait_for_results: RefCell<Vec<Option<ProcessStatus>>>,
+        /// 0-indexed `wait_for` call number that should return `Err` instead
+        /// of popping `wait_for_results` — used to prove the caller reaps
+        /// the process group rather than leaving it running on error.
+        wait_for_error_at_call: Option<usize>,
+        wait_for_calls: usize,
         wait_result: ProcessStatus,
     }
 
@@ -1088,6 +1183,8 @@ mod tests {
             Self {
                 events,
                 wait_for_results: RefCell::new(vec![Some(ProcessStatus::code(0))]),
+                wait_for_error_at_call: None,
+                wait_for_calls: 0,
                 wait_result: ProcessStatus::code(0),
             }
         }
@@ -1096,6 +1193,32 @@ mod tests {
             Self {
                 events,
                 wait_for_results: RefCell::new(vec![None, None]),
+                wait_for_error_at_call: None,
+                wait_for_calls: 0,
+                wait_result: ProcessStatus::signal(),
+            }
+        }
+
+        /// The very first `wait_for` call fails outright — simulates an OS
+        /// poll error while the worker may still be running.
+        fn wait_for_error(events: Rc<RefCell<Vec<ExecEvent>>>) -> Self {
+            Self {
+                events,
+                wait_for_results: RefCell::new(vec![Some(ProcessStatus::code(0))]),
+                wait_for_error_at_call: Some(0),
+                wait_for_calls: 0,
+                wait_result: ProcessStatus::signal(),
+            }
+        }
+
+        /// The first `wait_for` call reports "still running" (`None`) so a
+        /// caller-supplied heartbeat closure gets invoked next.
+        fn pending(events: Rc<RefCell<Vec<ExecEvent>>>) -> Self {
+            Self {
+                events,
+                wait_for_results: RefCell::new(vec![None, Some(ProcessStatus::code(0))]),
+                wait_for_error_at_call: None,
+                wait_for_calls: 0,
                 wait_result: ProcessStatus::signal(),
             }
         }
@@ -1104,6 +1227,11 @@ mod tests {
     impl ChildProcess for FakeChild {
         fn wait_for(&mut self, timeout: Duration) -> Result<Option<ProcessStatus>> {
             self.events.borrow_mut().push(ExecEvent::WaitFor(timeout));
+            let call = self.wait_for_calls;
+            self.wait_for_calls += 1;
+            if self.wait_for_error_at_call == Some(call) {
+                return Err(DispatchError::new("simulated wait_for failure"));
+            }
             Ok(self.wait_for_results.borrow_mut().remove(0))
         }
 
