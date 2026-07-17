@@ -3190,7 +3190,7 @@ dispatch_id = "fake-worker"
     }
 
     #[test]
-    fn qualitative_review_e2e_repairs_and_ledgers_both_attempts() {
+    fn qualitative_review_e2e_accepts_fenced_verdict_and_ledgers_one_attempt() {
         let temp = TempDir::new("review-e2e-sandbox");
         let fleet = temp.path().join("fleet");
         std::fs::create_dir_all(&fleet).expect("mkdir fleet");
@@ -3256,7 +3256,7 @@ dispatch_id = "senior-reviewer"
         write_response(&reports, cycle_id, "approved");
 
         let bd = RecordingBdClient::new(sandbox_issue());
-        let exec = SandboxExec::new_with_qualitative_review_repair();
+        let exec = SandboxExec::new_with_bounded_qualitative_review();
         let commits = GitCommitProbe;
         let live = RecordingLiveSink::new(true);
         let options = DispatchCycleOptions::for_tests(Duration::from_millis(1));
@@ -3270,33 +3270,38 @@ dispatch_id = "senior-reviewer"
 
         assert_eq!(result.gate, ApprovalGate::Approved);
         assert_eq!(
-            result.dispatched, 3,
-            "worker + review dispatch are budget-counted"
+            result.dispatched, 2,
+            "worker + bounded review dispatch are budget-counted"
         );
         assert_eq!(result.verified, 1);
         assert_eq!(bd.close_count(), 1);
 
         let spawns = exec.spawns();
-        assert_eq!(spawns.len(), 4, "worker + verify_cmd + review + repair");
+        assert_eq!(spawns.len(), 3, "worker + verify_cmd + review");
         assert!(prompt_arg(&spawns[2]).contains("READ-ONLY qualitative review"));
         assert!(spawns[2].argv.contains(&"senior-reviewer".to_string()));
-        assert!(spawns[3].argv.contains(&"--no-tools".to_string()));
-        assert!(!spawns[3].argv.contains(&"--approve".to_string()));
 
         let ledger_line = std::fs::read_to_string(&ledger).expect("ledger exists");
         let rows: Vec<serde_json::Value> = ledger_line
             .lines()
             .map(|line| serde_json::from_str(line).expect("ledger line json"))
             .collect();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["role"], "review");
         assert_eq!(rows[0]["model"], "senior-reviewer");
-        assert_eq!(rows[1]["role"], "review");
-        assert_eq!(rows[1]["model"], "senior-reviewer");
-        assert_eq!(rows[2]["role"], "implement");
-        assert_eq!(rows[2]["model"], "fake-worker");
+        assert_eq!(rows[1]["role"], "implement");
+        assert_eq!(rows[1]["model"], "fake-worker");
 
-        assert_qualitative_contract_run(&state);
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(report_path(&reports, cycle_id)).expect("report exists"),
+        )
+        .expect("report json");
+        assert_eq!(
+            report["live"]["step"],
+            "complete cycle-20260702-review: verified 1/2, failed 0"
+        );
+
+        assert_qualitative_contract_run(&state, 1);
     }
 
     #[test]
@@ -4958,7 +4963,7 @@ dispatch_id = "fake-worker"
         runs.pop().expect("one run")
     }
 
-    fn assert_qualitative_contract_run(state: &Path) {
+    fn assert_qualitative_contract_run(state: &Path, expected_review_events: usize) {
         let run_dir = single_contract_run(state);
         let events = crate::run::read_events(&run_dir.join("events.jsonl"))
             .expect("qualitative review run event log");
@@ -4966,7 +4971,7 @@ dispatch_id = "fake-worker"
             .iter()
             .filter(|event| event.kind == EventKind::ReviewFinished)
             .collect::<Vec<_>>();
-        assert_eq!(review_events.len(), 2);
+        assert_eq!(review_events.len(), expected_review_events);
         assert!(review_events.iter().all(|event| {
             event.profile_id.as_deref() == Some("senior-reviewer")
                 && event
@@ -5417,6 +5422,7 @@ dispatch_id = "fake-worker"
 
     struct SandboxExec {
         spawns: RefCell<Vec<SpawnRequest>>,
+        bounded_review: bool,
         malformed_first_review: bool,
         review_attempts: RefCell<usize>,
     }
@@ -5425,6 +5431,16 @@ dispatch_id = "fake-worker"
         fn new() -> Self {
             Self {
                 spawns: RefCell::new(Vec::new()),
+                bounded_review: false,
+                malformed_first_review: false,
+                review_attempts: RefCell::new(0),
+            }
+        }
+
+        fn new_with_bounded_qualitative_review() -> Self {
+            Self {
+                spawns: RefCell::new(Vec::new()),
+                bounded_review: true,
                 malformed_first_review: false,
                 review_attempts: RefCell::new(0),
             }
@@ -5433,6 +5449,7 @@ dispatch_id = "fake-worker"
         fn new_with_qualitative_review_repair() -> Self {
             Self {
                 spawns: RefCell::new(Vec::new()),
+                bounded_review: false,
                 malformed_first_review: true,
                 review_attempts: RefCell::new(0),
             }
@@ -5451,6 +5468,8 @@ dispatch_id = "fake-worker"
                 *self.review_attempts.borrow_mut() += 1;
                 let stdout = if self.malformed_first_review && review_attempt == 0 {
                     b"Verdict: ship with evidence".as_slice()
+                } else if self.bounded_review {
+                    b"```json\n{\"verdict\":\"ship\",\"findings\":[]}\n```".as_slice()
                 } else {
                     br#"{"verdict":"ship","findings":[]}"#.as_slice()
                 };
