@@ -3017,7 +3017,7 @@ dispatch_id = "fallback-worker"
             ("opencode-go", Availability::Caution),
             ("codex", Availability::Healthy),
         ]);
-        let run = run_bursar_budget_cautious_chain_cap_case(&bursar);
+        let run = run_bursar_budget_cautious_chain_cap_case(&bursar, "opencode-go");
 
         assert_eq!(
             run.result.dispatched, 2,
@@ -3041,6 +3041,29 @@ dispatch_id = "fallback-worker"
         let report = report_json_string(&run.reports, &run.cycle_id);
         assert!(report.contains("CAUTIOUS_CAP"));
         assert!(report.contains("spend-cautiously"));
+    }
+
+    #[test]
+    fn bursar_budget_cautious_distinct_providers_each_get_one_attempt() {
+        let bursar = FakeBursarClient::with_provider_availabilities(&[
+            ("opencode-go", Availability::Caution),
+            ("anthropic", Availability::Caution),
+            ("codex", Availability::Healthy),
+        ]);
+        let run = run_bursar_budget_cautious_chain_cap_case(&bursar, "anthropic");
+
+        assert_eq!(run.result.dispatched, 3);
+        assert_eq!(run.result.verified, 1);
+        assert_eq!(run.result.failed, 0);
+        let spawns = run.exec.spawns();
+        assert_eq!(spawns.len(), 4, "two cautious workers + fallback + verify");
+        assert!(spawns[0].argv.contains(&"primary-worker".to_string()));
+        assert!(spawns[1].argv.contains(&"cautious-peer".to_string()));
+        assert!(spawns[2].argv.contains(&"fallback-worker".to_string()));
+        let report = report_json_string(&run.reports, &run.cycle_id);
+        assert!(report.contains("opencode-go"));
+        assert!(report.contains("anthropic"));
+        assert!(!report.contains("CAUTIOUS_CAP"));
     }
 
     #[test]
@@ -3257,6 +3280,7 @@ provider = "codex"
 
     fn run_bursar_budget_cautious_chain_cap_case(
         bursar: &FakeBursarClient,
+        cautious_peer_provider: &str,
     ) -> BursarBudgetRun<FallbackExec> {
         let temp = TempDir::new("bursar-budget-cautious-chain-cap");
         let fleet = temp.path().join("fleet");
@@ -3301,7 +3325,7 @@ ceiling = "S"
 efficiency = "lean"
 backend = "pi"
 dispatch_id = "cautious-peer"
-provider = "opencode-go"
+provider = "{}"
 
 [[roster]]
 name = "fallback-worker"
@@ -3312,7 +3336,8 @@ backend = "pi"
 dispatch_id = "fallback-worker"
 provider = "codex"
 "#,
-            fleet.display()
+            fleet.display(),
+            cautious_peer_provider
         ))
         .expect("config parses");
 
