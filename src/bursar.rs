@@ -211,6 +211,10 @@ pub(crate) fn parse_roster_snapshot(bytes: &[u8]) -> Result<RosterSnapshot> {
 }
 
 impl RosterSnapshot {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear fail-closed validation keeps each evidence rejection explicit"
+    )]
     fn validate(&self) -> Result<()> {
         if self.schema != ROSTER_SCHEMA {
             return Err(BursarError::json(format!(
@@ -219,7 +223,7 @@ impl RosterSnapshot {
             )));
         }
         parse_time("roster generated_at", &self.generated_at)
-            .map_err(|error| BursarError::json(error.to_string()))?;
+            .map_err(|error| BursarError::json(error.clone()))?;
         let artifact_path = std::path::Path::new(&self.artifact.path);
         if !artifact_path.is_absolute() {
             return Err(BursarError::json(
@@ -257,14 +261,14 @@ impl RosterSnapshot {
                 return Err(BursarError::json("malformed bursar roster provider"));
             }
             parse_time("roster provider checked_at", &provider.checked_at)
-                .map_err(|error| BursarError::json(error.to_string()))?;
+                .map_err(|error| BursarError::json(error.clone()))?;
             if let Some(data_as_of) = provider.data_as_of.as_deref() {
                 parse_time("roster provider data_as_of", data_as_of)
-                    .map_err(|error| BursarError::json(error.to_string()))?;
+                    .map_err(|error| BursarError::json(error.clone()))?;
             }
             if let Some(expires_at) = provider.expires_at.as_deref() {
                 parse_time("roster provider expires_at", expires_at)
-                    .map_err(|error| BursarError::json(error.to_string()))?;
+                    .map_err(|error| BursarError::json(error.clone()))?;
             }
             if provider.eligible
                 && (!provider.enabled
