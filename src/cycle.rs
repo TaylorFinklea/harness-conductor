@@ -1181,15 +1181,15 @@ mod tests {
                     checked_at: checked_at.clone(),
                     data_as_of: Some(data_as_of.clone()),
                     expires_at: Some(expires_at.clone()),
-                    windows: (availability == Availability::Healthy)
-                        .then(|| {
-                            vec![crate::bursar::Window {
-                                label: "primary".to_string(),
-                                percent: Some(42.0),
-                                reset_at: Some("2100-01-01T00:00:00Z".to_string()),
-                            }]
-                        })
-                        .unwrap_or_default(),
+                    windows: if availability == Availability::Healthy {
+                        vec![crate::bursar::Window {
+                            label: "primary".to_string(),
+                            percent: Some(42.0),
+                            reset_at: Some("2100-01-01T00:00:00Z".to_string()),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
                     reason: (availability != Availability::Healthy)
                         .then(|| "fixture limit".to_string()),
                     extra,
