@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 const SCHEMA: &str = "bursar/status@2";
 const MAX_STATUS_AGE_MINS: i64 = 5;
+const NEAR_EXHAUSTED_PERCENT: f64 = 90.0;
 const PROVIDERS: [&str; 4] = ["anthropic", "codex", "opencode-go", "agy"];
 
 pub(crate) type Result<T> = std::result::Result<T, BursarError>;
@@ -548,6 +549,39 @@ fn evaluate_budget_at<C: BursarClient + ?Sized>(
         }
     };
 
+    let max_window_percent = match validate_window_percents(status) {
+        Ok(value) => value,
+        Err(error) => {
+            return defer_with_status(provider, status, format!("{provider}: defer — {error}"));
+        }
+    };
+    if status.availability == Availability::Healthy {
+        let Some(max_window_percent) = max_window_percent else {
+            return decision_with_status(
+                provider,
+                status,
+                model,
+                expiry_basis,
+                BudgetAction::SpendCautiously,
+                format!(
+                    "{provider}: spend-cautiously — bursar healthy status has no percent windows"
+                ),
+            );
+        };
+        if max_window_percent >= NEAR_EXHAUSTED_PERCENT {
+            return decision_with_status(
+                provider,
+                status,
+                model,
+                expiry_basis,
+                BudgetAction::Defer,
+                format!(
+                    "{provider}: defer — bursar window utilization {max_window_percent:.1}% is >= {NEAR_EXHAUSTED_PERCENT:.1}%"
+                ),
+            );
+        }
+    }
+
     let (action, label) = match status.availability {
         Availability::Healthy => (BudgetAction::Proceed, "proceed"),
         Availability::Caution => (BudgetAction::SpendCautiously, "spend-cautiously"),
@@ -565,6 +599,29 @@ fn evaluate_budget_at<C: BursarClient + ?Sized>(
             reason_suffix(status.reason.as_deref())
         ),
     )
+}
+
+fn validate_window_percents(status: &ProviderStatus) -> std::result::Result<Option<f64>, String> {
+    status
+        .windows
+        .iter()
+        .try_fold(None::<f64>, |max_percent, window| {
+            let percent = window
+                .percent
+                .ok_or_else(|| format!("bursar window {} has no percent", window.label))?;
+            if !percent.is_finite()
+                || !(0.0..=100.0).contains(&percent)
+                || (percent > 0.0 && percent < 1.0)
+            {
+                return Err(format!(
+                    "bursar window {} has invalid percent {percent:?}; expected 0 or 1..=100",
+                    window.label
+                ));
+            }
+            Ok(Some(
+                max_percent.map_or(percent, |current| current.max(percent)),
+            ))
+        })
 }
 
 fn parse_time(label: &str, value: &str) -> std::result::Result<DateTime<Utc>, String> {
@@ -699,6 +756,13 @@ pub(crate) mod test_support {
                     status.availability = *availability;
                     status.reason =
                         (*availability != Availability::Healthy).then(|| "test status".to_string());
+                    if *availability == Availability::Healthy {
+                        status.windows = vec![Window {
+                            label: "primary".to_string(),
+                            percent: Some(42.0),
+                            reset_at: Some("2100-01-01T00:00:00Z".to_string()),
+                        }];
+                    }
                 }
             }
             Self::from_result(Ok(StatusReport {
@@ -1084,6 +1148,54 @@ mod tests {
             assert_eq!(decision.action, BudgetAction::Defer);
             assert!(decision.summary.contains("observation_expiry_basis"));
         }
+    }
+
+    #[test]
+    fn healthy_provider_requires_bounded_non_fractional_window_percent() {
+        let now = at("2026-07-13T10:03:00Z");
+        for percent in [
+            Value::Null,
+            Value::from(0.42),
+            Value::from(-1.0),
+            Value::from(100.1),
+        ] {
+            let mut value: Value =
+                serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                    .expect("fixture JSON");
+            value["providers"]["codex"]["windows"] = Value::Array(vec![serde_json::json!({
+                "label": "primary",
+                "percent": percent,
+                "reset_at": "2100-01-01T00:00:00Z"
+            })]);
+            let decision =
+                evaluate_budget_at(&client_from_json(&value.to_string()), "codex", true, now);
+            assert_eq!(decision.action, BudgetAction::Defer);
+            assert!(decision.summary.contains("percent"));
+        }
+
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                .expect("fixture JSON");
+        value["providers"]["codex"]["windows"] = Value::Array(Vec::new());
+        let decision =
+            evaluate_budget_at(&client_from_json(&value.to_string()), "codex", true, now);
+        assert_eq!(decision.action, BudgetAction::SpendCautiously);
+        assert!(decision.summary.contains("no percent windows"));
+    }
+
+    #[test]
+    fn healthy_provider_defers_at_near_exhausted_window_percent() {
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bursar-status-v2.json"))
+                .expect("fixture JSON");
+        value["providers"]["codex"]["windows"][0]["percent"] = Value::from(90.0);
+        let decision = evaluate_budget_at(
+            &client_from_json(&value.to_string()),
+            "codex",
+            true,
+            at("2026-07-13T10:03:00Z"),
+        );
+        assert_eq!(decision.action, BudgetAction::Defer);
     }
 
     #[test]
