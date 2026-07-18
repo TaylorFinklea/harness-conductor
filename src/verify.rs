@@ -72,6 +72,7 @@ pub(crate) struct VerifyRequest {
     pub(crate) verify_cmd: String,
     pub(crate) verify: VerifyConfig,
     pub(crate) worker_status: DispatchStatus,
+    pub(crate) worker_commit: Option<String>,
     pub(crate) before_head: Option<String>,
 }
 
@@ -212,16 +213,23 @@ fn run_mechanical_with_backoff<B: BdClient + ?Sized, E: Exec + ?Sized, C: Commit
     }
 
     let after_head = commits.head(&request.repo)?;
-    if !has_new_commit(request.before_head.as_deref(), after_head.as_deref()) {
-        return fail(
-            bd,
-            request,
-            VerifyDecision::Failed,
-            "no new commit after worker".to_string(),
-        )
-        .map(MechanicalOutcome::Failed);
+    if !has_worker_commit(
+        request.before_head.as_deref(),
+        after_head.as_deref(),
+        request.worker_commit.as_deref(),
+    ) {
+        let summary = if after_head.as_deref() == request.before_head.as_deref() {
+            "no new commit after worker"
+        } else {
+            "repository HEAD is not the worker's authenticated commit"
+        };
+        return fail(bd, request, VerifyDecision::Failed, summary.to_string())
+            .map(MechanicalOutcome::Failed);
     }
-    let worker_commit = after_head.expect("new commit check requires after HEAD");
+    let worker_commit = request
+        .worker_commit
+        .clone()
+        .expect("worker commit check requires authenticated commit");
 
     let verify_run = run_spawn(exec, &verify_spawn(request)?)?;
     if !verify_run.status.success() {
@@ -270,14 +278,21 @@ fn dispatch_failure_summary(failure: &DispatchFailure) -> String {
             |code| format!("exit {code}"),
         ),
         DispatchFailure::NoNewCommit => "no new commit".to_string(),
+        DispatchFailure::UnauthenticatedCommit => {
+            "HEAD is not the worker's authenticated commit".to_string()
+        }
         DispatchFailure::BackendFlakeZeroStdoutNoCommit => {
             "backend flake: zero stdout and no new commit".to_string()
         }
     }
 }
 
-fn has_new_commit(before: Option<&str>, after: Option<&str>) -> bool {
-    after.is_some() && after != before
+fn has_worker_commit(
+    before: Option<&str>,
+    after: Option<&str>,
+    worker_commit: Option<&str>,
+) -> bool {
+    worker_commit.is_some() && after == worker_commit && after != before
 }
 
 fn should_run_orchestra(request: &VerifyRequest) -> bool {
@@ -1172,6 +1187,35 @@ mod tests {
     }
 
     #[test]
+    fn verify_refuses_foreign_head_instead_of_verifying_it_for_the_worker() {
+        let temp = TempDir::new("foreign-worker-commit");
+        let mut request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("1111111111111111111111111111111111111111"),
+        );
+        request.worker_commit = Some("2222222222222222222222222222222222222222".to_string());
+        let bd = FakeBdClient::new(&request.issue);
+        let exec = FakeExec::new(vec![]);
+        let commits = FakeCommits::new([Some("3333333333333333333333333333333333333333")]);
+
+        let outcome = run_with_backoff(&bd, &exec, &commits, &request, Duration::ZERO)
+            .expect("verify pipeline reports failure");
+
+        assert_eq!(outcome.decision, VerifyDecision::Failed);
+        assert!(
+            exec.spawns().is_empty(),
+            "verify_cmd must not run against a foreign commit"
+        );
+        assert_release_then_comment_contains(
+            &bd.events(),
+            &request.repo,
+            "worker's authenticated commit",
+        );
+    }
+
+    #[test]
     fn verify_fails_releases_and_comments_when_worker_did_not_exit_cleanly() {
         let temp = TempDir::new("worker-failed");
         let mut request = request(
@@ -1991,6 +2035,7 @@ mod tests {
             verify_cmd: "cargo test verify".to_string(),
             verify,
             worker_status: DispatchStatus::Success,
+            worker_commit: Some("after".to_string()),
             before_head: before_head.map(str::to_string),
         }
     }
@@ -2227,6 +2272,15 @@ mod tests {
         }
 
         fn is_clean(&self, _repo: &Path) -> crate::dispatch::Result<bool> {
+            Ok(true)
+        }
+
+        fn is_direct_child(
+            &self,
+            _repo: &Path,
+            _before: Option<&str>,
+            _commit: &str,
+        ) -> crate::dispatch::Result<bool> {
             Ok(true)
         }
     }

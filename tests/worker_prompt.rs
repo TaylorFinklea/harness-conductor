@@ -21,12 +21,13 @@ const DELIMITERS: [&str; 2] = [
     "=== END TASK DATA ===",
 ];
 
-const RULE_PHRASES: [&str; 5] = [
+const RULE_PHRASES: [&str; 6] = [
     "ONE git commit",
     "NEVER git push",
     "NEVER run bd",
     "NEVER run chezmoi",
     "FAILED: ",
+    "CONDUCTOR_WORKER_COMMIT: <full git HEAD>",
 ];
 
 // Rule 8 phrases that distinguish the default-deny path (`.beads/`

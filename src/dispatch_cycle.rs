@@ -953,6 +953,7 @@ fn dispatch_one<
         verify_cmd: extracted.verify_cmd.clone(),
         verify: cfg.verify.clone(),
         worker_status: worker_attempt.result.status.clone(),
+        worker_commit: worker_attempt.result.worker_commit.clone(),
         before_head,
     };
     let review = ReviewSettings {
@@ -1002,52 +1003,6 @@ fn dispatch_one<
             });
         }
     };
-    let post_verify_head = match commits.head(&verify_request.repo) {
-        Ok(head) => head,
-        Err(error) => {
-            return Err(finish_and_release_claim(
-                bd,
-                &repo_path,
-                &item.issue_id,
-                &mut run_artifacts,
-                "post_verify_error",
-                DispatchCycleError::message(format!("git head after verify: {error}")),
-            ));
-        }
-    };
-    if post_verify_head.as_deref() != Some(worker_commit.as_str()) {
-        return Err(finish_and_release_claim(
-            bd,
-            &repo_path,
-            &item.issue_id,
-            &mut run_artifacts,
-            "post_verify_error",
-            DispatchCycleError::message("worker commit changed during mechanical verification"),
-        ));
-    }
-    let is_clean = match commits.is_clean(&verify_request.repo) {
-        Ok(is_clean) => is_clean,
-        Err(error) => {
-            return Err(finish_and_release_claim(
-                bd,
-                &repo_path,
-                &item.issue_id,
-                &mut run_artifacts,
-                "post_verify_error",
-                DispatchCycleError::message(format!("git status after verify: {error}")),
-            ));
-        }
-    };
-    if !is_clean {
-        return Err(finish_and_release_claim(
-            bd,
-            &repo_path,
-            &item.issue_id,
-            &mut run_artifacts,
-            "post_verify_error",
-            DispatchCycleError::message("repository is dirty after mechanical verification"),
-        ));
-    }
     let verifier_refs =
         match capture_mechanical_logs(&run_artifacts, state_dir, cycle_id, &item.issue_id) {
             Ok(refs) => refs,
@@ -1075,6 +1030,32 @@ fn dispatch_one<
             &mut run_artifacts,
             "checkpoint_error",
             run_artifact_error(error),
+        ));
+    }
+    let post_verify_head = match commits.head(&verify_request.repo) {
+        Ok(head) => head,
+        Err(error) => {
+            return Err(DispatchCycleError::message(format!(
+                "git head after verify: {error}; pending-review checkpoint retained for dispatch --resume"
+            )));
+        }
+    };
+    if post_verify_head.as_deref() != Some(worker_commit.as_str()) {
+        return Err(DispatchCycleError::message(
+            "worker commit changed during mechanical verification; pending-review checkpoint retained for dispatch --resume",
+        ));
+    }
+    let is_clean = match commits.is_clean(&verify_request.repo) {
+        Ok(is_clean) => is_clean,
+        Err(error) => {
+            return Err(DispatchCycleError::message(format!(
+                "git status after verify: {error}; pending-review checkpoint retained for dispatch --resume"
+            )));
+        }
+    };
+    if !is_clean {
+        return Err(DispatchCycleError::message(
+            "repository is dirty after mechanical verification; pending-review checkpoint retained for dispatch --resume",
         ));
     }
     if interrupt_before_review(options) {
@@ -1309,6 +1290,7 @@ fn resume_pending_review<
         verify_cmd: extracted.verify_cmd.clone(),
         verify: cfg.verify.clone(),
         worker_status: dispatch::DispatchStatus::Success,
+        worker_commit: Some(worker_commit.clone()),
         before_head: None,
     };
     let review = ReviewSettings {
@@ -2209,6 +2191,9 @@ fn dispatch_status_label(status: &dispatch::DispatchStatus) -> String {
         }
         dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::NoNewCommit) => {
             "no_new_commit".to_string()
+        }
+        dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::UnauthenticatedCommit) => {
+            "unauthenticated_commit".to_string()
         }
         dispatch::DispatchStatus::Failed(
             dispatch::DispatchFailure::BackendFlakeZeroStdoutNoCommit,
@@ -3777,7 +3762,11 @@ dispatch_id = "fake-worker"
     }
 
     #[test]
-    fn dispatch_continues_after_post_verify_failure_and_finishes_report() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end regression covers checkpoint and next-item continuity"
+    )]
+    fn dispatch_keeps_post_verify_drift_resumable_and_continues_the_cycle() {
         let temp = TempDir::new("partial-dispatch");
         let fleet = temp.path().join("fleet");
         std::fs::create_dir_all(&fleet).expect("mkdir fleet");
@@ -3861,8 +3850,31 @@ dispatch_id = "fake-worker"
         assert_eq!(result.verified, 1);
         assert_eq!(result.failed, 1);
         assert_eq!(bd.close_count(), 1);
-        assert_eq!(bd.release_count(), 1);
-        assert_eq!(bd.show(&first_repo, "sandbox-1").unwrap().status, "open");
+        assert_eq!(bd.release_count(), 0);
+        assert_eq!(
+            bd.show(&first_repo, "sandbox-1").unwrap().status,
+            "in_progress"
+        );
+        let canonical_first = std::fs::canonicalize(&first_repo)
+            .expect("canonical first repo")
+            .display()
+            .to_string();
+        let pending =
+            crate::run::find_pending_work_run(&state, cycle_id, &canonical_first, "sandbox-1")
+                .expect("scan pending work runs")
+                .expect("post-verify drift must preserve a resumable checkpoint");
+        let pending_run = RunHandle::open(&state, &pending).expect("open pending work run");
+        assert_eq!(
+            pending_run.work().map(|work| work.stage),
+            Some(WorkStage::PendingReview)
+        );
+        assert!(
+            pending_run
+                .work()
+                .and_then(|work| work.worker_commit.as_deref())
+                .is_some(),
+            "the resumable checkpoint must retain the authenticated worker commit"
+        );
         assert!(report.contains("\"status\": \"done\""));
         assert!(report.contains("DISPATCH_ERROR"));
         assert!(report.contains("first-repo/sandbox-1"));
@@ -6840,6 +6852,7 @@ dispatch_id = "fallback-worker"
         .expect("write stderr");
         let result = dispatch::DispatchResult {
             status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::NoNewCommit),
+            worker_commit: None,
             stdout_path: temp.path().join("worker.out"),
             stderr_path,
             stdout_bytes: 1,
@@ -6856,6 +6869,7 @@ dispatch_id = "fallback-worker"
         std::fs::write(&stderr_path, b"quota exceeded\n").expect("write stderr");
         let result = dispatch::DispatchResult {
             status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::TimedOut),
+            worker_commit: None,
             stdout_path: temp.path().join("worker.out"),
             stderr_path,
             stdout_bytes: 0,
@@ -7806,6 +7820,15 @@ dispatch_id = "fake-worker"
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    fn write_worker_commit_stdout(request: &SpawnRequest, summary: &str) {
+        let commit = git(&request.cwd, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            &request.stdout_path,
+            format!("{summary}\nCONDUCTOR_WORKER_COMMIT: {}\n", commit.trim()),
+        )
+        .expect("write worker stdout");
+    }
+
     fn prompt_arg(spawn: &SpawnRequest) -> &str {
         let pos = spawn
             .argv
@@ -7939,6 +7962,15 @@ dispatch_id = "fake-worker"
         fn is_clean(&self, _repo: &Path) -> crate::dispatch::Result<bool> {
             panic!("commit probe should not run")
         }
+
+        fn is_direct_child(
+            &self,
+            _repo: &Path,
+            _before: Option<&str>,
+            _commit: &str,
+        ) -> crate::dispatch::Result<bool> {
+            panic!("commit probe should not run")
+        }
     }
 
     struct DirtyAfterVerifyCommitProbe {
@@ -7971,6 +8003,15 @@ dispatch_id = "fake-worker"
             } else {
                 GitCommitProbe.is_clean(repo)
             }
+        }
+
+        fn is_direct_child(
+            &self,
+            repo: &Path,
+            before: Option<&str>,
+            commit: &str,
+        ) -> crate::dispatch::Result<bool> {
+            GitCommitProbe.is_direct_child(repo, before, commit)
         }
     }
 
@@ -8239,7 +8280,6 @@ dispatch_id = "fake-worker"
                 return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(0))));
             }
             if request.argv.first().map(String::as_str) == Some("pi") {
-                std::fs::write(&request.stdout_path, b"worker ran\n").expect("write worker stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
                 std::fs::write(request.cwd.join("worker.txt"), b"done\n")
                     .expect("write worker file");
@@ -8249,6 +8289,7 @@ dispatch_id = "fake-worker"
                     "git",
                     &["commit", "-m", "worker: complete sandbox bead"],
                 );
+                write_worker_commit_stdout(request, "worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
@@ -8342,7 +8383,6 @@ dispatch_id = "fake-worker"
             if request.argv.first().map(String::as_str) == Some("pi") {
                 let worker = *self.worker_spawns.borrow();
                 *self.worker_spawns.borrow_mut() += 1;
-                std::fs::write(&request.stdout_path, b"worker ran\n").expect("write worker stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
                 if worker == 0 {
                     std::fs::write(request.cwd.join("worker.txt"), b"done\n")
@@ -8354,6 +8394,7 @@ dispatch_id = "fake-worker"
                         &["commit", "-m", "worker: verified bursar-d6r artifact"],
                     );
                 }
+                write_worker_commit_stdout(request, "worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
@@ -8471,8 +8512,6 @@ dispatch_id = "fake-worker"
                         "runtime observation must precede fallback spawn"
                     );
                 }
-                std::fs::write(&request.stdout_path, b"fallback worker ran\n")
-                    .expect("write fallback stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
                 std::fs::write(request.cwd.join("worker.txt"), b"done\n")
                     .expect("write worker file");
@@ -8482,6 +8521,7 @@ dispatch_id = "fake-worker"
                     "git",
                     &["commit", "-m", "worker: fallback complete sandbox bead"],
                 );
+                write_worker_commit_stdout(request, "fallback worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
@@ -8577,8 +8617,6 @@ dispatch_id = "fake-worker"
                     status.is_empty(),
                     "fallback attempt must start from a clean repo, found: {status}"
                 );
-                std::fs::write(&request.stdout_path, b"fallback worker ran\n")
-                    .expect("write fallback stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
                 std::fs::write(request.cwd.join("worker.txt"), b"done\n")
                     .expect("write worker file");
@@ -8588,6 +8626,7 @@ dispatch_id = "fake-worker"
                     "git",
                     &["commit", "-m", "worker: fallback complete sandbox bead"],
                 );
+                write_worker_commit_stdout(request, "fallback worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {

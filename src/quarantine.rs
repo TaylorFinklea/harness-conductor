@@ -1623,6 +1623,15 @@ mod tests {
         fn is_clean(&self, _repo: &Path) -> crate::dispatch::Result<bool> {
             Ok(self.cleans.borrow_mut().remove(0))
         }
+
+        fn is_direct_child(
+            &self,
+            _repo: &Path,
+            _before: Option<&str>,
+            _commit: &str,
+        ) -> crate::dispatch::Result<bool> {
+            Ok(true)
+        }
     }
 
     /// `changed_paths_sequence`, when non-empty, overrides `changed_paths` on

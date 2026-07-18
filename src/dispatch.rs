@@ -52,6 +52,7 @@ pub(crate) struct DispatchRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DispatchResult {
     pub(crate) status: DispatchStatus,
+    pub(crate) worker_commit: Option<String>,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
     pub(crate) stdout_bytes: u64,
@@ -69,6 +70,7 @@ pub(crate) enum DispatchFailure {
     TimedOut,
     ExitNonZero { code: Option<i32> },
     NoNewCommit,
+    UnauthenticatedCommit,
     BackendFlakeZeroStdoutNoCommit,
 }
 
@@ -185,6 +187,10 @@ impl WorkerHooks for () {}
 pub(crate) trait CommitProbe {
     fn head(&self, repo: &Path) -> Result<Option<String>>;
     fn is_clean(&self, repo: &Path) -> Result<bool>;
+    /// Proves `commit` is the single commit immediately after `before`.
+    /// This rejects merge commits and any foreign commit inserted during the
+    /// worker run instead of silently attributing that history to the worker.
+    fn is_direct_child(&self, repo: &Path, before: Option<&str>, commit: &str) -> Result<bool>;
 }
 
 pub(crate) fn run<E: Exec, C: CommitProbe>(
@@ -253,16 +259,19 @@ where
         wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
-    let status = classify(
+    let announced_commit = worker_commit_from_stdout(&spawn.stdout_path)?;
+    let (status, worker_commit) = classify(
         process,
         stdout_bytes,
         before_head.as_deref(),
+        announced_commit.as_deref(),
         commits,
         &request.repo,
     )?;
 
     Ok(DispatchResult {
         status,
+        worker_commit,
         stdout_path: spawn.stdout_path,
         stderr_path: spawn.stderr_path,
         stdout_bytes,
@@ -510,29 +519,68 @@ fn classify<C: CommitProbe + ?Sized>(
     process: ProcessRun,
     stdout_bytes: u64,
     before_head: Option<&str>,
+    announced_commit: Option<&str>,
     commits: &C,
     repo: &Path,
-) -> Result<DispatchStatus> {
+) -> Result<(DispatchStatus, Option<String>)> {
     if process.timed_out {
-        return Ok(DispatchStatus::Failed(DispatchFailure::TimedOut));
+        return Ok((DispatchStatus::Failed(DispatchFailure::TimedOut), None));
     }
     if !process.status.success {
-        return Ok(DispatchStatus::Failed(DispatchFailure::ExitNonZero {
-            code: process.status.code,
-        }));
+        return Ok((
+            DispatchStatus::Failed(DispatchFailure::ExitNonZero {
+                code: process.status.code,
+            }),
+            None,
+        ));
     }
 
     let after_head = commits.head(repo)?;
     if after_head.as_deref() != before_head {
-        return Ok(DispatchStatus::Success);
+        if after_head.as_deref() == announced_commit
+            && commits.is_direct_child(
+                repo,
+                before_head,
+                announced_commit.expect("matched commit"),
+            )?
+        {
+            return Ok((DispatchStatus::Success, after_head));
+        }
+        return Ok((
+            DispatchStatus::Failed(DispatchFailure::UnauthenticatedCommit),
+            None,
+        ));
     }
     if stdout_bytes == 0 {
-        Ok(DispatchStatus::Failed(
-            DispatchFailure::BackendFlakeZeroStdoutNoCommit,
+        Ok((
+            DispatchStatus::Failed(DispatchFailure::BackendFlakeZeroStdoutNoCommit),
+            None,
         ))
     } else {
-        Ok(DispatchStatus::Failed(DispatchFailure::NoNewCommit))
+        Ok((DispatchStatus::Failed(DispatchFailure::NoNewCommit), None))
     }
+}
+
+fn worker_commit_from_stdout(path: &Path) -> Result<Option<String>> {
+    let stdout = fs::read(path).map_err(|e| {
+        DispatchError::new(format!(
+            "failed to read worker stdout {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(parse_worker_commit(&String::from_utf8_lossy(&stdout)))
+}
+
+fn parse_worker_commit(stdout: &str) -> Option<String> {
+    const MARKER: &str = "CONDUCTOR_WORKER_COMMIT: ";
+    let line = stdout.lines().rev().find(|line| !line.trim().is_empty())?;
+    let commit = line.strip_prefix(MARKER)?;
+    let valid_len = commit.len() == 40 || commit.len() == 64;
+    (valid_len
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| commit.to_string())
 }
 
 fn file_len(path: &Path) -> Result<u64> {
@@ -739,6 +787,35 @@ impl CommitProbe for GitCommitProbe {
         }
         Ok(output.stdout.is_empty())
     }
+
+    fn is_direct_child(&self, repo: &Path, before: Option<&str>, commit: &str) -> Result<bool> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-list", "--parents", "-n", "1", commit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| {
+                DispatchError::new(format!(
+                    "failed to inspect commit parents in {}: {e}",
+                    repo.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut fields = stdout.split_whitespace();
+        if fields.next() != Some(commit) {
+            return Ok(false);
+        }
+        Ok(match before {
+            Some(parent) => fields.next() == Some(parent) && fields.next().is_none(),
+            None => fields.next().is_none(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -749,6 +826,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const BEFORE_COMMIT: &str = "1111111111111111111111111111111111111111";
+    const WORKER_COMMIT: &str = "2222222222222222222222222222222222222222";
+    const WORKER_STDOUT: &str =
+        "worker stdout\nCONDUCTOR_WORKER_COMMIT: 2222222222222222222222222222222222222222\n";
 
     /// Adapts a bare heartbeat closure to the [`WorkerHooks`] trait so the
     /// wait-loop tests can drive `on_heartbeat` without a full observer.
@@ -765,8 +847,8 @@ mod tests {
         let temp = TempDir::new("pi-argv");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let exec = FakeExec::success("worker stdout\n", "");
-        let commits = FakeCommits::new([Some("before"), Some("after")]);
+        let exec = FakeExec::success(WORKER_STDOUT, "");
+        let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
         let request = request(&repo, Backend::Pi, "opencode-go/glm-5.2");
 
         let result = run(
@@ -779,6 +861,7 @@ mod tests {
         .expect("dispatch succeeds");
 
         assert_eq!(result.status, DispatchStatus::Success);
+        assert_eq!(result.worker_commit.as_deref(), Some(WORKER_COMMIT));
         let spawn = exec.spawned();
         assert_eq!(
             spawn.argv,
@@ -810,8 +893,8 @@ mod tests {
         let temp = TempDir::new("codex-argv");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let exec = FakeExec::success("worker stdout\n", "");
-        let commits = FakeCommits::new([Some("before"), Some("after")]);
+        let exec = FakeExec::success(WORKER_STDOUT, "");
+        let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
         let mut request = request(&repo, Backend::Codex, "gpt-5.6-sol");
         request.reasoning_effort = Some(ReasoningEffort::Max);
 
@@ -843,8 +926,8 @@ mod tests {
         let temp = TempDir::new("agy-argv");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let exec = FakeExec::success("worker stdout\n", "");
-        let commits = FakeCommits::new([Some("before"), Some("after")]);
+        let exec = FakeExec::success(WORKER_STDOUT, "");
+        let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
         let request = request(&repo, Backend::Agy, "Gemini 3.5 Flash (High)");
 
         run(
@@ -876,8 +959,8 @@ mod tests {
         let temp = TempDir::new("claude-argv");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let exec = FakeExec::success("worker stdout\n", "");
-        let commits = FakeCommits::new([Some("before"), Some("after")]);
+        let exec = FakeExec::success(WORKER_STDOUT, "");
+        let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
         let request = request(&repo, Backend::Claude, "claude-sonnet-5");
 
         run(
@@ -1170,8 +1253,8 @@ mod tests {
         let temp = TempDir::new("logs");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let exec = FakeExec::success("worker stdout\n", "worker stderr\n");
-        let commits = FakeCommits::new([Some("before"), Some("after")]);
+        let exec = FakeExec::success(WORKER_STDOUT, "worker stderr\n");
+        let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
         let request = request(&repo, Backend::Pi, "opencode-go/glm-5.2");
 
         let result = run(
@@ -1193,13 +1276,13 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&result.stdout_path).unwrap(),
-            "worker stdout\n"
+            WORKER_STDOUT
         );
         assert_eq!(
             std::fs::read_to_string(&result.stderr_path).unwrap(),
             "worker stderr\n"
         );
-        assert_eq!(result.stdout_bytes, 14);
+        assert_eq!(result.stdout_bytes, WORKER_STDOUT.len() as u64);
         assert_eq!(result.stderr_bytes, 14);
     }
 
@@ -1251,6 +1334,67 @@ mod tests {
             DispatchStatus::Failed(DispatchFailure::NoNewCommit)
         );
         assert_eq!(result.stdout_bytes, 13);
+    }
+
+    #[test]
+    fn exit_zero_with_foreign_head_change_is_not_worker_success() {
+        let temp = TempDir::new("foreign-head");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let exec = FakeExec::success(
+            "CONDUCTOR_WORKER_COMMIT: 2222222222222222222222222222222222222222\n",
+            "",
+        );
+        let commits = FakeCommits::new([
+            Some("1111111111111111111111111111111111111111"),
+            Some("3333333333333333333333333333333333333333"),
+        ]);
+        let request = request(&repo, Backend::Pi, "opencode-go/glm-5.2");
+
+        let result = run(
+            &exec,
+            &commits,
+            &request,
+            temp.path(),
+            Duration::from_secs(45),
+        )
+        .expect("dispatch result");
+
+        assert!(
+            !matches!(result.status, DispatchStatus::Success),
+            "a foreign HEAD change must not authenticate worker success"
+        );
+    }
+
+    #[test]
+    fn foreign_commit_inserted_before_worker_commit_is_not_worker_success() {
+        let temp = TempDir::new("foreign-parent");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.name", "Conductor Test"]);
+        git(
+            &repo,
+            &["config", "user.email", "conductor-test@example.invalid"],
+        );
+        std::fs::write(repo.join("README.md"), b"base\n").expect("write base");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let request = request(&repo, Backend::Pi, "opencode-go/glm-5.2");
+
+        let result = run(
+            &ForeignThenWorkerExec,
+            &GitCommitProbe,
+            &request,
+            temp.path(),
+            Duration::from_secs(45),
+        )
+        .expect("dispatch result");
+
+        assert!(
+            !matches!(result.status, DispatchStatus::Success),
+            "a foreign commit inserted between the base and worker commit must not authenticate success"
+        );
     }
 
     const PROMPT: &str = "work on the bead";
@@ -1330,6 +1474,55 @@ mod tests {
         fn events(&self) -> Vec<ExecEvent> {
             self.events.borrow().clone()
         }
+    }
+
+    struct ForeignThenWorkerExec;
+
+    impl Exec for ForeignThenWorkerExec {
+        fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>> {
+            std::fs::write(request.cwd.join("foreign.txt"), b"foreign\n")
+                .expect("write foreign change");
+            git(&request.cwd, &["add", "foreign.txt"]);
+            git(
+                &request.cwd,
+                &["commit", "-m", "foreign: concurrent change"],
+            );
+
+            std::fs::write(request.cwd.join("worker.txt"), b"worker\n")
+                .expect("write worker change");
+            git(&request.cwd, &["add", "worker.txt"]);
+            git(&request.cwd, &["commit", "-m", "worker: intended change"]);
+            let worker_commit = git(&request.cwd, &["rev-parse", "HEAD"]);
+
+            std::fs::write(
+                &request.stdout_path,
+                format!("CONDUCTOR_WORKER_COMMIT: {worker_commit}\n"),
+            )
+            .expect("write worker stdout");
+            std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
+            Ok(Box::new(FakeChild::success(Rc::new(RefCell::new(
+                Vec::new(),
+            )))))
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     impl Exec for FakeExec {
@@ -1452,6 +1645,15 @@ mod tests {
         }
 
         fn is_clean(&self, _repo: &Path) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn is_direct_child(
+            &self,
+            _repo: &Path,
+            _before: Option<&str>,
+            _commit: &str,
+        ) -> Result<bool> {
             Ok(true)
         }
     }
