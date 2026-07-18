@@ -167,6 +167,11 @@ pub(crate) fn run_dispatch_cycle<
     live: &L,
     bursar: &U,
 ) -> std::result::Result<DispatchCycleResult, DispatchCycleError> {
+    let _dispatch_lease = quarantine::DispatchLease::acquire(state_dir, cycle_id).map_err(
+        |error| {
+            DispatchCycleError::message(format!("exclusive dispatch lease unavailable: {error}"))
+        },
+    )?;
     let resolved_roster = bursar::resolve_roster(cfg, bursar)
         .map_err(|error| DispatchCycleError::message(format!("bursar roster snapshot: {error}")))?;
     let mut runtime_cfg = cfg.clone();
@@ -550,6 +555,11 @@ fn dispatch_one<
         crate::run::find_pending_work_run(state_dir, cycle_id, &canonical_repo, &item.issue_id)
             .map_err(run_artifact_error)?;
     if let Some(run_id) = pending_run {
+        if !options.resume {
+            return Err(DispatchCycleError::message(
+                "pending-review recovery requires explicit dispatch --resume",
+            ));
+        }
         return resume_pending_review(
             cfg,
             bd,
@@ -935,7 +945,7 @@ fn dispatch_one<
             error,
         ));
     }
-    let verify_request = VerifyRequest {
+    let mut verify_request = VerifyRequest {
         repo: repo_path.clone(),
         state_dir: state_dir.to_path_buf(),
         cycle_id: cycle_id.to_string(),
@@ -1072,6 +1082,37 @@ fn dispatch_one<
             "simulated process interruption before qualitative review",
         ));
     }
+    let _review_lease = quarantine::RepoLease::acquire(
+        state_dir,
+        &canonical_repo,
+        run_artifacts.run_id(),
+    )
+    .map_err(|error| {
+        DispatchCycleError::message(format!("qualitative-review repository lease: {error}"))
+    })?;
+    let review_issue = bd.show(&repo_path, &item.issue_id).map_err(|error| {
+        DispatchCycleError::message(format!("qualitative-review claim re-fetch: {error}"))
+    })?;
+    if review_issue.status != "in_progress"
+        || review_issue.assignee.as_deref() != Some("conductor")
+    {
+        return Err(DispatchCycleError::message(
+            "qualitative-review claim is no longer held by conductor",
+        ));
+    }
+    validate_item_authorization(cfg, item, roster, &canonical_repo, &review_issue).map_err(
+        |reason| {
+            DispatchCycleError::message(format!(
+                "qualitative-review approval changed after checkpoint: {reason}"
+            ))
+        },
+    )?;
+    if !head_matches_clean(commits, &repo_path, &worker_commit)? {
+        return Err(DispatchCycleError::message(
+            "repository changed after the pending-review checkpoint",
+        ));
+    }
+    verify_request.issue = review_issue;
     let outcome =
         verify::run_review_stage(bd, exec, &verify_request, &review, options.item_timeout)
             .map_err(|error| DispatchCycleError::message(format!("review: {error}")))?;
@@ -1092,7 +1133,7 @@ fn dispatch_one<
             cfg,
             ledger_path,
             &item.repo,
-            &claimed,
+            &verify_request.issue,
             &extracted,
             cycle_id,
             &outcome,
@@ -1102,7 +1143,7 @@ fn dispatch_one<
             cfg,
             ledger_path,
             &item.repo,
-            &claimed,
+            &verify_request.issue,
             &extracted,
             &active_roster,
             cycle_id,
@@ -1145,31 +1186,52 @@ fn resume_pending_review<
     current: &Issue,
     run_id: &str,
 ) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
+    if !options.resume {
+        return Err(DispatchCycleError::message(
+            "pending-review recovery requires explicit dispatch --resume",
+        ));
+    }
     if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
         return Err(DispatchCycleError::message(
-            "pending-review repository lease is no longer held by conductor",
+            "pending-review claim is no longer held by conductor",
         ));
     }
-    let extracted =
-        validate_item_authorization(cfg, item, selected_roster, canonical_repo, current).map_err(
-            |reason| {
-                DispatchCycleError::message(format!("pending-review approval is stale: {reason}"))
-            },
-        )?;
-    let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
-    let manifest = run_artifacts.manifest().clone();
-    let work = run_artifacts
-        .work()
-        .cloned()
-        .ok_or_else(|| DispatchCycleError::message("pending-review run has no work state"))?;
-    if work.stage != WorkStage::PendingReview
-        || work.cycle_id != cycle_id
-        || work.authorization_sha256 != item.authorization_sha256
-    {
+
+    // Cheap pre-lease gate only. Authority comes from reopening the run and
+    // re-fetching the Bead after the repo lease is held below.
+    let preflight_run = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    validate_pending_work(&preflight_run, item, cycle_id)?;
+    authenticate_pending_review_owner(&preflight_run)?;
+    drop(preflight_run);
+
+    let _review_lease = quarantine::RepoLease::acquire(state_dir, canonical_repo, run_id)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "pending-review repository lease unavailable: {error}"
+            ))
+        })?;
+    let current = bd.show(repo_path, &item.issue_id).map_err(|error| {
+        DispatchCycleError::message(format!("pending-review claim re-fetch: {error}"))
+    })?;
+    if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
         return Err(DispatchCycleError::message(
-            "pending-review run does not match the approved cycle item",
+            "pending-review claim is no longer held by conductor",
         ));
     }
+    let extracted = validate_item_authorization(
+        cfg,
+        item,
+        selected_roster,
+        canonical_repo,
+        &current,
+    )
+    .map_err(|reason| {
+        DispatchCycleError::message(format!("pending-review approval is stale: {reason}"))
+    })?;
+    let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    let work = validate_pending_work(&run_artifacts, item, cycle_id)?;
+    authenticate_pending_review_owner(&run_artifacts)?;
+    let manifest = run_artifacts.manifest().clone();
     if manifest.verifier.mechanical.as_deref() != Some(extracted.verify_cmd.as_str()) {
         return Err(DispatchCycleError::message(
             "pending-review verifier command changed after mechanical verification",
@@ -1189,12 +1251,12 @@ fn resume_pending_review<
 
     let worker_commit = work
         .worker_commit
-        .as_deref()
+        .clone()
         .ok_or_else(|| DispatchCycleError::message("pending-review run has no worker commit"))?;
     let current_head = commits
         .head(repo_path)
         .map_err(|error| DispatchCycleError::message(format!("resume git head: {error}")))?;
-    if current_head.as_deref() != Some(worker_commit) {
+    if current_head.as_deref() != Some(worker_commit.as_str()) {
         return Err(DispatchCycleError::message(format!(
             "pending-review worker commit changed: expected {worker_commit}, found {}",
             current_head.as_deref().unwrap_or("<none>")
@@ -1211,7 +1273,7 @@ fn resume_pending_review<
 
     let worker_profile = work
         .worker_profile
-        .as_deref()
+        .clone()
         .ok_or_else(|| DispatchCycleError::message("pending-review run has no worker profile"))?;
     let approved_chain = fallback_chain(
         &cfg.roster,
@@ -1275,7 +1337,7 @@ fn resume_pending_review<
             cfg,
             ledger_path,
             &item.repo,
-            current,
+            &current,
             &extracted,
             cycle_id,
             &outcome,
@@ -1285,7 +1347,7 @@ fn resume_pending_review<
             cfg,
             ledger_path,
             &item.repo,
-            current,
+            &current,
             &extracted,
             &active_roster,
             cycle_id,
@@ -1296,6 +1358,46 @@ fn resume_pending_review<
         decision: Some(outcome.decision),
         dispatches: outcome.review_dispatches,
     })
+}
+
+fn validate_pending_work(
+    run_artifacts: &RunHandle,
+    item: &PlannedItem,
+    cycle_id: &str,
+) -> std::result::Result<WorkState, DispatchCycleError> {
+    let work = run_artifacts
+        .work()
+        .cloned()
+        .ok_or_else(|| DispatchCycleError::message("pending-review run has no work state"))?;
+    if work.stage != WorkStage::PendingReview
+        || work.cycle_id != cycle_id
+        || work.authorization_sha256 != item.authorization_sha256
+    {
+        return Err(DispatchCycleError::message(
+            "pending-review run does not match the approved cycle item",
+        ));
+    }
+    Ok(work)
+}
+
+fn authenticate_pending_review_owner(
+    run_artifacts: &RunHandle,
+) -> std::result::Result<(), DispatchCycleError> {
+    let last_seen = run_artifacts.last_seen().map_err(run_artifact_error)?;
+    if Utc::now().signed_duration_since(last_seen) < STALE_CLAIM_THRESHOLD {
+        return Err(DispatchCycleError::message(format!(
+            "pending-review owner is still fresh (last seen {last_seen})"
+        )));
+    }
+    let owner_pid = run_artifacts.owner_pid().ok_or_else(|| {
+        DispatchCycleError::message("pending-review owner identity is missing; refusing recovery")
+    })?;
+    if quarantine::process_alive(owner_pid) {
+        return Err(DispatchCycleError::message(format!(
+            "pending-review owner pid {owner_pid} is still alive"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_pending_approval(
@@ -3989,6 +4091,7 @@ dispatch_id = "senior-reviewer"
                 .get("role")
                 == Some(&serde_json::json!("review"))
         }));
+        mark_pending_review_recoverable(&state);
 
         let second = run_dispatch_cycle(
             &cfg,
@@ -3999,7 +4102,7 @@ dispatch_id = "senior-reviewer"
             &state,
             &ledger,
             cycle_id,
-            &options,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             &live,
             &bursar,
         )
@@ -4035,7 +4138,7 @@ dispatch_id = "senior-reviewer"
             &state,
             &ledger,
             cycle_id,
-            &options,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             &live,
             &bursar,
         )
@@ -4162,6 +4265,253 @@ dispatch_id = "senior-reviewer"
         fn pending_run_dir(&self) -> PathBuf {
             single_contract_run(&self.state)
         }
+
+        fn mark_pending_review_recoverable(&self) {
+            mark_pending_review_recoverable(&self.state);
+        }
+    }
+
+    #[test]
+    fn pending_review_plain_dispatch_requires_explicit_resume() {
+        let fixture = ResumeFixture::new("plain-pending-review");
+        let exec = PendingReviewExec::ship_immediately();
+        fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_before_review(),
+            )
+            .expect("interrupt before review is isolated to the item");
+
+        let plain = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("plain dispatch refusal is isolated to the item");
+
+        assert_eq!(plain.verified, 0);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+    }
+
+    #[test]
+    fn pending_review_resume_refuses_a_fresh_dead_owner() {
+        let fixture = ResumeFixture::new("fresh-dead-pending-review");
+        let exec = PendingReviewExec::ship_immediately();
+        fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_before_review(),
+            )
+            .expect("interrupt before review is isolated to the item");
+        set_pending_review_owner(&fixture.state, spawn_dead_pid(), Utc::now());
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("fresh-owner refusal is isolated to the item");
+
+        assert_eq!(resumed.verified, 0);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+    }
+
+    #[test]
+    fn pending_review_resume_refuses_a_stale_live_owner() {
+        let fixture = ResumeFixture::new("stale-live-pending-review");
+        let exec = PendingReviewExec::ship_immediately();
+        fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_before_review(),
+            )
+            .expect("interrupt before review is isolated to the item");
+        set_pending_review_owner(
+            &fixture.state,
+            std::process::id(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("live-owner refusal is isolated to the item");
+
+        assert_eq!(resumed.verified, 0);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+    }
+
+    #[test]
+    fn pending_review_resume_refetches_the_claim_inside_the_repo_lease() {
+        let fixture = ResumeFixture::new("pending-review-close-race");
+        let exec = PendingReviewExec::ship_immediately();
+        fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_before_review(),
+            )
+            .expect("interrupt before review is isolated to the item");
+        fixture.mark_pending_review_recoverable();
+        fixture.bd.close_after_shows(1);
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("raced close refusal is isolated to the item");
+
+        assert_eq!(resumed.verified, 0);
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 1);
+    }
+
+    #[test]
+    fn pending_review_resume_refuses_when_another_reviewer_holds_the_repo_lease() {
+        let fixture = ResumeFixture::new("pending-review-repo-lease");
+        let exec = PendingReviewExec::ship_immediately();
+        fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_before_review(),
+            )
+            .expect("interrupt before review is isolated to the item");
+        fixture.mark_pending_review_recoverable();
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize repo")
+            .to_str()
+            .expect("utf8 repo")
+            .to_string();
+        let _held = quarantine::RepoLease::acquire(
+            &fixture.state,
+            &canonical_repo,
+            "active-reviewer",
+        )
+        .expect("hold the repo lease as a concurrent reviewer");
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("repo-lease refusal is isolated to the item");
+
+        assert_eq!(resumed.verified, 0);
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 1);
+    }
+
+    #[test]
+    fn concurrent_dispatch_refuses_a_second_process_while_the_dispatch_lease_is_held() {
+        let fixture = ResumeFixture::new("concurrent-dispatch-lease");
+        let exec = PendingReviewExec::ship_immediately();
+        let _held = quarantine::DispatchLease::acquire(&fixture.state, "first-dispatch")
+            .expect("hold the process-wide dispatch lease");
+
+        let error = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect_err("a concurrent dispatch must fail before reading or mutating the item");
+
+        assert!(error.to_string().contains("dispatch lease"));
+        assert_eq!(fixture.bd.claim_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_pending_review_pass_cannot_race_a_revise_release() {
+        let fixture = ResumeFixture::new("concurrent-pending-review-pass-fail");
+        let setup_exec = PendingReviewExec::ship_immediately();
+        fixture
+            .dispatch(
+                &setup_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_before_review(),
+            )
+            .expect("initial interruption leaves one pending-review run");
+        fixture.mark_pending_review_recoverable();
+
+        let exec = ReentrantPendingReviewExec::new(&fixture);
+        let passed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("invocation A passes review");
+        assert_eq!(passed.verified, 1);
+
+        let blocked = exec
+            .losing_result()
+            .expect("invocation B ran while A was inside review");
+        let error = blocked.expect_err("invocation B must stop at the dispatch lease");
+        assert!(error.to_string().contains("dispatch lease"));
+
+        let repeated = fixture
+            .dispatch(
+                exec.losing_exec(),
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("the losing invocation remains a no-op after A settles the run");
+        assert_eq!(repeated.dispatched, 0);
+        assert_eq!(setup_exec.worker_spawns(), 1);
+        assert_eq!(exec.winning_review_spawns(), 1, "no duplicate review spend");
+        assert_eq!(exec.losing_exec().worker_spawns(), 0, "resume is review-only");
+        assert_eq!(exec.losing_exec().review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 1, "the passing reviewer closes once");
+        assert_eq!(
+            fixture.bd.release_count(),
+            0,
+            "the losing revise path must never reopen the closed Bead"
+        );
+        assert_eq!(
+            fixture
+                .bd
+                .show(&fixture.repo, "sandbox-1")
+                .expect("show settled Bead")
+                .status,
+            "closed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.ledger)
+                .expect("read serialized ledger")
+                .lines()
+                .count(),
+            2,
+            "only one review and its implementation outcome are recorded"
+        );
+        let run_dir = fixture.pending_run_dir();
+        let run_id = run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("run id");
+        let reopened = RunHandle::open(&fixture.state, run_id)
+            .expect("the winning invocation leaves an uncorrupted run manifest");
+        assert_eq!(reopened.manifest().outcome.as_deref(), Some("verified"));
     }
 
     #[test]
@@ -4191,11 +4541,12 @@ dispatch_id = "senior-reviewer"
         assert!(mechanical.passed);
         assert_eq!(mechanical.command, "test -f worker.txt");
         assert!(!mechanical.artifact_refs.is_empty());
+        fixture.mark_pending_review_recoverable();
 
         let resumed = fixture
             .dispatch(
                 &exec,
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             )
             .expect("pending review resumes");
         assert_eq!(resumed.verified, 1);
@@ -4223,11 +4574,12 @@ dispatch_id = "senior-reviewer"
             manifest.work.expect("work state").stage,
             WorkStage::PendingReview
         );
+        fixture.mark_pending_review_recoverable();
 
         let second = fixture
             .dispatch(
                 &exec,
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             )
             .expect("review retries after timeout");
         assert_eq!(second.verified, 1);
@@ -4244,6 +4596,7 @@ dispatch_id = "senior-reviewer"
         fixture
             .dispatch(&exec, &interrupted)
             .expect("interrupt before review is isolated to the item");
+        fixture.mark_pending_review_recoverable();
         std::fs::write(fixture.repo.join("changed.txt"), b"changed\n").expect("write change");
         run(&fixture.repo, "git", &["add", "changed.txt"]);
         run(
@@ -4255,7 +4608,7 @@ dispatch_id = "senior-reviewer"
         let result = fixture
             .dispatch(
                 &exec,
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             )
             .expect("changed head failure is isolated to the item");
         assert_eq!(result.failed, 1);
@@ -4272,12 +4625,13 @@ dispatch_id = "senior-reviewer"
         fixture
             .dispatch(&exec, &interrupted)
             .expect("interrupt before review is isolated to the item");
+        fixture.mark_pending_review_recoverable();
         std::fs::write(fixture.repo.join("dirty.txt"), b"dirty\n").expect("write dirty file");
 
         let result = fixture
             .dispatch(
                 &exec,
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             )
             .expect("dirty tree failure is isolated to the item");
         assert_eq!(result.failed, 1);
@@ -4295,6 +4649,7 @@ dispatch_id = "senior-reviewer"
             fixture
                 .dispatch(&exec, &interrupted)
                 .expect("interrupt before review is isolated to the item");
+            fixture.mark_pending_review_recoverable();
             if mutate == "verify" {
                 fixture.bd.set_verify_cmd("cargo test changed");
             } else {
@@ -4304,7 +4659,7 @@ dispatch_id = "senior-reviewer"
             let result = fixture
                 .dispatch(
                     &exec,
-                    &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                    &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
                 )
                 .expect("stale resume input failure is isolated to the item");
             assert_eq!(result.failed, 1, "{label}");
@@ -4322,6 +4677,7 @@ dispatch_id = "senior-reviewer"
         fixture
             .dispatch(&exec, &interrupted)
             .expect("interrupt before review is isolated to the item");
+        fixture.mark_pending_review_recoverable();
         let run_dir = fixture.pending_run_dir();
         let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
             .expect("manifest before tamper");
@@ -4335,7 +4691,7 @@ dispatch_id = "senior-reviewer"
         let result = fixture
             .dispatch(
                 &exec,
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             )
             .expect("artifact tamper failure is isolated to the item");
         assert_eq!(result.failed, 1);
@@ -4398,6 +4754,29 @@ dispatch_id = "senior-reviewer"
         let pid = dead.id();
         dead.wait().expect("reap short-lived process");
         pid
+    }
+
+    fn set_pending_review_owner(state_dir: &Path, owner_pid: u32, last_seen: DateTime<Utc>) {
+        let run_dir = single_contract_run(state_dir);
+        let manifest_path = run_dir.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read pending-review manifest"),
+        )
+        .expect("parse pending-review manifest");
+        manifest["work"]["owner_pid"] = serde_json::json!(owner_pid);
+        let mut bytes = serde_json::to_vec_pretty(&manifest).expect("serialize stale manifest");
+        bytes.push(b'\n');
+        std::fs::write(&manifest_path, bytes).expect("write stale pending-review manifest");
+        std::fs::write(run_dir.join("heartbeat"), last_seen.to_rfc3339())
+            .expect("write pending-review heartbeat");
+    }
+
+    fn mark_pending_review_recoverable(state_dir: &Path) {
+        set_pending_review_owner(
+            state_dir,
+            spawn_dead_pid(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
     }
 
     /// Spawns a real, long-lived process as the leader of its own process
@@ -7775,11 +8154,19 @@ dispatch_id = "fake-worker"
         fn set_metadata(
             &self,
             _repo: &Path,
-            _id: &str,
-            _key: &str,
-            _value: &str,
+            id: &str,
+            key: &str,
+            value: &str,
         ) -> crate::bd::Result<Issue> {
-            Err(BdError::new("set_metadata not implemented in fake"))
+            let mut issues = self.issues.borrow_mut();
+            let issue = issues
+                .get_mut(id)
+                .ok_or_else(|| BdError::new(format!("unknown issue {id}")))?;
+            issue
+                .metadata
+                .get_or_insert_with(BTreeMap::new)
+                .insert(key.to_string(), serde_json::Value::String(value.to_string()));
+            Ok(issue.clone())
         }
     }
 
@@ -7974,6 +8361,56 @@ dispatch_id = "fake-worker"
                 ))));
             }
             panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    struct ReentrantPendingReviewExec<'a> {
+        fixture: &'a ResumeFixture,
+        winner: PendingReviewExec,
+        loser: PendingReviewExec,
+        losing_result:
+            RefCell<Option<std::result::Result<DispatchCycleResult, DispatchCycleError>>>,
+    }
+
+    impl<'a> ReentrantPendingReviewExec<'a> {
+        fn new(fixture: &'a ResumeFixture) -> Self {
+            Self {
+                fixture,
+                winner: PendingReviewExec::ship_immediately(),
+                loser: PendingReviewExec::with_reviews(vec![ReviewBehavior::Output(
+                    br#"{"verdict":"revise","findings":["forced loser"]}"#,
+                )]),
+                losing_result: RefCell::new(None),
+            }
+        }
+
+        fn losing_result(
+            &self,
+        ) -> Option<std::result::Result<DispatchCycleResult, DispatchCycleError>> {
+            self.losing_result.borrow().clone()
+        }
+
+        fn losing_exec(&self) -> &PendingReviewExec {
+            &self.loser
+        }
+
+        fn winning_review_spawns(&self) -> usize {
+            self.winner.review_spawns()
+        }
+    }
+
+    impl Exec for ReentrantPendingReviewExec<'_> {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            if request.argv.iter().any(|arg| arg == "senior-reviewer")
+                && self.losing_result.borrow().is_none()
+            {
+                let result = self.fixture.dispatch(
+                    &self.loser,
+                    &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+                );
+                *self.losing_result.borrow_mut() = Some(result);
+            }
+            self.winner.spawn(request)
         }
     }
 

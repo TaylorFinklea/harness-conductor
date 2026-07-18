@@ -544,6 +544,22 @@ impl Drop for RepoLease {
     }
 }
 
+/// State-directory-wide process lease for top-level dispatch. It reuses the
+/// same exclusive-create and provably-dead-holder reclaim boundary as
+/// [`RepoLease`], but has a dedicated synthetic resource identity so it never
+/// collides with a canonical repository path.
+#[derive(Debug)]
+pub(crate) struct DispatchLease {
+    _lease: RepoLease,
+}
+
+impl DispatchLease {
+    pub(crate) fn acquire(state_dir: &Path, cycle_id: &str) -> Result<Self> {
+        RepoLease::acquire(state_dir, "conductor://dispatch", cycle_id)
+            .map(|lease| Self { _lease: lease })
+    }
+}
+
 fn lease_key(canonical_repo: &str) -> String {
     format!("{:x}", Sha256::digest(canonical_repo.as_bytes()))
 }
