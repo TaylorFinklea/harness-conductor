@@ -1471,6 +1471,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum TestLeaseOwnerFormat {
+        Legacy,
+        V2,
+    }
+
+    impl TestLeaseOwnerFormat {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Legacy => "legacy",
+                Self::V2 => "v2",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestLeaseRace {
+        Ordered,
+        Simultaneous,
+    }
+
+    impl TestLeaseRace {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Ordered => "ordered",
+                Self::Simultaneous => "simultaneous",
+            }
+        }
+    }
+
     enum TestHeldLease {
         Repo(RepoLease),
         Dispatch(DispatchLease),
@@ -2289,29 +2319,59 @@ mod tests {
         )
     }
 
-    fn seed_legacy_dead_holder(state_dir: &Path, identity: &str) -> PathBuf {
-        let (guard_path, _, _) = lease_artifact_paths(state_dir, identity);
+    fn seed_dead_holder(
+        state_dir: &Path,
+        identity: &str,
+        owner_format: TestLeaseOwnerFormat,
+    ) -> PathBuf {
+        let (guard_path, owner_path, _) = lease_artifact_paths(state_dir, identity);
         std::fs::create_dir_all(guard_path.parent().expect("lease parent"))
             .expect("mkdir leases dir");
         let dead_pid = spawn_dead_pid();
-        std::fs::write(
-            &guard_path,
-            format!("run_id=stale-run\npid={dead_pid}\nrepo={identity}\n"),
-        )
-        .expect("seed stale lease");
+        match owner_format {
+            TestLeaseOwnerFormat::Legacy => {
+                std::fs::write(
+                    &guard_path,
+                    format!("run_id=stale-run\npid={dead_pid}\nrepo={identity}\n"),
+                )
+                .expect("seed legacy stale lease");
+            }
+            TestLeaseOwnerFormat::V2 => {
+                std::fs::write(&guard_path, b"").expect("seed stable lease guard");
+                std::fs::write(
+                    &owner_path,
+                    format!(
+                        "lease_version=2\ngeneration={}\nrun_id=stale-run\npid={dead_pid}\nrepo={identity}\n",
+                        "a".repeat(64)
+                    ),
+                )
+                .expect("seed v2 stale lease owner");
+            }
+        }
         guard_path
+    }
+
+    fn seed_legacy_dead_holder(state_dir: &Path, identity: &str) -> PathBuf {
+        seed_dead_holder(state_dir, identity, TestLeaseOwnerFormat::Legacy)
     }
 
     fn assert_single_winner_contention_round(
         root: &Path,
         kind: TestLeaseKind,
         identity: &str,
+        owner_format: TestLeaseOwnerFormat,
+        race: TestLeaseRace,
         round: usize,
     ) {
-        let state_dir = root.join(format!("{}-{round}", kind.label()));
+        let state_dir = root.join(format!(
+            "{}-{}-{}-{round}",
+            kind.label(),
+            owner_format.label(),
+            race.label()
+        ));
         let gate_dir = state_dir.join("gate");
         std::fs::create_dir_all(&gate_dir).expect("mkdir reclaim gate");
-        let guard_path = seed_legacy_dead_holder(&state_dir, identity);
+        let guard_path = seed_dead_holder(&state_dir, identity, owner_format);
         let (_, owner_path, pending_path) = lease_artifact_paths(&state_dir, identity);
         let run_a = format!("{}-{round}-a", kind.label());
         let run_b = format!("{}-{round}-b", kind.label());
@@ -2323,11 +2383,23 @@ mod tests {
         wait_for_path(&gate_dir.join("a.ready"));
         wait_for_path(&gate_dir.join("b.ready"));
 
-        std::fs::write(gate_dir.join("a.go"), b"go\n").expect("release contender a");
-        wait_for_path(&gate_dir.join("a.result"));
-        std::fs::write(gate_dir.join("b.go"), b"go\n").expect("release contender b");
-        wait_for_path(&gate_dir.join("b.result"));
+        match race {
+            TestLeaseRace::Ordered => {
+                std::fs::write(gate_dir.join("a.go"), b"go\n").expect("release contender a");
+                wait_for_path(&gate_dir.join("a.result"));
+                std::fs::write(gate_dir.join("b.go"), b"go\n").expect("release contender b");
+                wait_for_path(&gate_dir.join("b.result"));
+            }
+            TestLeaseRace::Simultaneous => {
+                std::fs::write(gate_dir.join("a.go"), b"go\n").expect("release contender a");
+                std::fs::write(gate_dir.join("b.go"), b"go\n").expect("release contender b");
+                wait_for_path(&gate_dir.join("a.result"));
+                wait_for_path(&gate_dir.join("b.result"));
+            }
+        }
 
+        // Capture both outcomes and the committed owner before either winner
+        // can drop, so the loser cannot hide an overwrite behind clean release.
         let result_a =
             std::fs::read_to_string(gate_dir.join("a.result")).expect("read contender a result");
         let result_b =
@@ -2337,8 +2409,7 @@ mod tests {
         } else {
             &guard_path
         };
-        let holder_while_a_is_live = std::fs::read_to_string(authoritative_holder)
-            .expect("read lease while the winning process holds it");
+        let holder_while_winner_is_live = std::fs::read_to_string(authoritative_holder);
 
         std::fs::write(gate_dir.join("a.release"), b"release\n")
             .expect("release contender a lease");
@@ -2347,14 +2418,30 @@ mod tests {
         assert!(contender_a.wait().expect("wait contender a").success());
         assert!(contender_b.wait().expect("wait contender b").success());
 
-        assert_eq!(result_a, "acquired", "first released contender must win");
+        let (winner_run, loser_run, loser_result) = match (
+            result_a.as_str() == "acquired",
+            result_b.as_str() == "acquired",
+        ) {
+            (true, false) => (run_a.as_str(), run_b.as_str(), result_b.as_str()),
+            (false, true) => (run_b.as_str(), run_a.as_str(), result_a.as_str()),
+            _ => panic!("exactly one contender must acquire; got a={result_a:?}, b={result_b:?}"),
+        };
+        if matches!(race, TestLeaseRace::Ordered) {
+            assert_eq!(winner_run, run_a, "first released contender must win");
+        }
         assert!(
-            result_b.starts_with("refused:"),
-            "the losing contender must fail closed, got {result_b:?}"
+            loser_result.starts_with("refused:"),
+            "the losing contender must fail closed, got {loser_result:?}"
+        );
+        let holder_while_winner_is_live =
+            holder_while_winner_is_live.expect("read lease while the winning process holds it");
+        assert!(
+            holder_while_winner_is_live.contains(&format!("run_id={winner_run}")),
+            "the loser removed or overwrote the winner's lease: {holder_while_winner_is_live:?}"
         );
         assert!(
-            holder_while_a_is_live.contains(&format!("run_id={run_a}")),
-            "the loser removed or overwrote the winner's lease: {holder_while_a_is_live:?}"
+            !holder_while_winner_is_live.contains(&format!("run_id={loser_run}")),
+            "the loser replaced the winner's identity: {holder_while_winner_is_live:?}"
         );
 
         {
@@ -2385,14 +2472,36 @@ mod tests {
                 temp.path(),
                 TestLeaseKind::Repo,
                 "/repo/bursar",
+                TestLeaseOwnerFormat::Legacy,
+                TestLeaseRace::Ordered,
                 round,
             );
             assert_single_winner_contention_round(
                 temp.path(),
                 TestLeaseKind::Dispatch,
                 "conductor://dispatch",
+                TestLeaseOwnerFormat::Legacy,
+                TestLeaseRace::Ordered,
                 round,
             );
+            for owner_format in [TestLeaseOwnerFormat::Legacy, TestLeaseOwnerFormat::V2] {
+                assert_single_winner_contention_round(
+                    temp.path(),
+                    TestLeaseKind::Repo,
+                    "/repo/bursar",
+                    owner_format,
+                    TestLeaseRace::Simultaneous,
+                    round,
+                );
+                assert_single_winner_contention_round(
+                    temp.path(),
+                    TestLeaseKind::Dispatch,
+                    "conductor://dispatch",
+                    owner_format,
+                    TestLeaseRace::Simultaneous,
+                    round,
+                );
+            }
         }
     }
 
