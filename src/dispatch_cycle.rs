@@ -4445,73 +4445,84 @@ dispatch_id = "senior-reviewer"
 
     #[test]
     fn concurrent_pending_review_pass_cannot_race_a_revise_release() {
-        let fixture = ResumeFixture::new("concurrent-pending-review-pass-fail");
-        let setup_exec = PendingReviewExec::ship_immediately();
-        fixture
-            .dispatch(
-                &setup_exec,
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
-                    .interrupt_before_review(),
-            )
-            .expect("initial interruption leaves one pending-review run");
-        fixture.mark_pending_review_recoverable();
-
-        let exec = ReentrantPendingReviewExec::new(&fixture);
-        let passed = fixture
-            .dispatch(
-                &exec,
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
-            )
-            .expect("invocation A passes review");
-        assert_eq!(passed.verified, 1);
-
-        let blocked = exec
-            .losing_result()
-            .expect("invocation B ran while A was inside review");
-        let error = blocked.expect_err("invocation B must stop at the dispatch lease");
-        assert!(error.to_string().contains("dispatch lease"));
-
-        let repeated = fixture
-            .dispatch(
-                exec.losing_exec(),
-                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
-            )
-            .expect("the losing invocation remains a no-op after A settles the run");
-        assert_eq!(repeated.dispatched, 0);
-        assert_eq!(setup_exec.worker_spawns(), 1);
-        assert_eq!(exec.winning_review_spawns(), 1, "no duplicate review spend");
-        assert_eq!(exec.losing_exec().worker_spawns(), 0, "resume is review-only");
-        assert_eq!(exec.losing_exec().review_spawns(), 0);
-        assert_eq!(fixture.bd.close_count(), 1, "the passing reviewer closes once");
-        assert_eq!(
-            fixture.bd.release_count(),
-            0,
-            "the losing revise path must never reopen the closed Bead"
-        );
-        assert_eq!(
+        for round in 0..3 {
+            let fixture =
+                ResumeFixture::new(&format!("concurrent-pending-review-pass-fail-{round}"));
+            let setup_exec = PendingReviewExec::ship_immediately();
             fixture
-                .bd
-                .show(&fixture.repo, "sandbox-1")
-                .expect("show settled Bead")
-                .status,
-            "closed"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&fixture.ledger)
-                .expect("read serialized ledger")
-                .lines()
-                .count(),
-            2,
-            "only one review and its implementation outcome are recorded"
-        );
-        let run_dir = fixture.pending_run_dir();
-        let run_id = run_dir
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .expect("run id");
-        let reopened = RunHandle::open(&fixture.state, run_id)
-            .expect("the winning invocation leaves an uncorrupted run manifest");
-        assert_eq!(reopened.manifest().outcome.as_deref(), Some("verified"));
+                .dispatch(
+                    &setup_exec,
+                    &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                        .interrupt_before_review(),
+                )
+                .expect("initial interruption leaves one pending-review run");
+            fixture.mark_pending_review_recoverable();
+
+            let exec = ReentrantPendingReviewExec::new(&fixture);
+            let passed = fixture
+                .dispatch(
+                    &exec,
+                    &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+                )
+                .expect("invocation A passes review");
+            assert_eq!(passed.verified, 1);
+
+            let blocked = exec
+                .losing_result()
+                .expect("invocation B ran while A was inside review");
+            let error = blocked.expect_err("invocation B must stop at the dispatch lease");
+            assert!(error.to_string().contains("dispatch lease"));
+
+            let repeated = fixture
+                .dispatch(
+                    exec.losing_exec(),
+                    &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+                )
+                .expect("the losing invocation remains a no-op after A settles the run");
+            assert_eq!(repeated.dispatched, 0);
+            assert_eq!(setup_exec.worker_spawns(), 1);
+            assert_eq!(exec.winning_review_spawns(), 1, "no duplicate review spend");
+            assert_eq!(
+                exec.losing_exec().worker_spawns(),
+                0,
+                "resume is review-only"
+            );
+            assert_eq!(exec.losing_exec().review_spawns(), 0);
+            assert_eq!(
+                fixture.bd.close_count(),
+                1,
+                "the passing reviewer closes once"
+            );
+            assert_eq!(
+                fixture.bd.release_count(),
+                0,
+                "the losing revise path must never reopen the closed Bead"
+            );
+            assert_eq!(
+                fixture
+                    .bd
+                    .show(&fixture.repo, "sandbox-1")
+                    .expect("show settled Bead")
+                    .status,
+                "closed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&fixture.ledger)
+                    .expect("read serialized ledger")
+                    .lines()
+                    .count(),
+                2,
+                "only one review and its implementation outcome are recorded"
+            );
+            let run_dir = fixture.pending_run_dir();
+            let run_id = run_dir
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("run id");
+            let reopened = RunHandle::open(&fixture.state, run_id)
+                .expect("the winning invocation leaves an uncorrupted run manifest");
+            assert_eq!(reopened.manifest().outcome.as_deref(), Some("verified"));
+        }
     }
 
     #[test]

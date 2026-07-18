@@ -14,11 +14,13 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt as _;
 use sha2::{Digest, Sha256};
 
 use crate::dispatch::CommitProbe;
@@ -446,16 +448,23 @@ where
 }
 
 /// Holds an exclusive, repo-scoped advisory lease for the duration of a
-/// capture/restore. Backed by an `O_EXCL`-created lock file under
-/// `<state_dir>/leases/`, so a second concurrent attempt against the same
-/// repo (another cycle, another fallback worker, a manual recovery run)
-/// fails closed immediately rather than racing destructive git operations
-/// against each other. Released automatically on drop — including on every
-/// early-return error path — so a lease can never outlive the operation
-/// that acquired it.
+/// capture/restore. A stable guard file under `<state_dir>/leases/` carries a
+/// kernel whole-file lock, so exactly one process can inspect or replace the
+/// separately committed owner generation. Keeping the guard inode stable is
+/// what makes dead-holder reclaim single-winner: no contender ever unlinks the
+/// path another holder has locked.
+///
+/// The owner record is written to a private staging file and atomically
+/// renamed into place only after it is complete. A process crash releases the
+/// kernel lock automatically; the next process either sees the complete dead
+/// generation or safely discards an uncommitted staging file. Clean `Drop`
+/// removes only the exact generation this value installed while the guard is
+/// still locked.
 #[derive(Debug)]
 pub(crate) struct RepoLease {
-    path: PathBuf,
+    guard: std::fs::File,
+    owner_path: PathBuf,
+    generation: String,
 }
 
 impl RepoLease {
@@ -465,11 +474,15 @@ impl RepoLease {
     /// every future recovery attempt against this repo forever — an
     /// unrecoverable state a purely advisory, `O_EXCL`-only lock cannot
     /// escape on its own. Reclaim only fires when the recorded `pid` can be
-    /// read and is confirmed not running; an unparseable or unreadable
-    /// holder record is treated as still-held (ambiguous, not provably
-    /// dead), so it never auto-reclaims. The retry after reclaiming is
-    /// itself a single `O_EXCL` create — if another process wins that race,
-    /// this call still fails closed rather than double-acquiring.
+    /// read and is confirmed not running; an unparseable, unauthenticated, or
+    /// unreadable holder record is treated as still-held (ambiguous, not
+    /// provably dead), so it never auto-reclaims. The stable guard's
+    /// nonblocking kernel lock is the atomic single-winner primitive shared by
+    /// ordinary acquisition and dead-holder reclaim.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "lease reclaim keeps lock, liveness, and crash-atomic owner transitions together"
+    )]
     pub(crate) fn acquire(
         state_dir: &Path,
         canonical_repo: &str,
@@ -482,72 +495,240 @@ impl RepoLease {
                 leases_dir.display()
             ))
         })?;
-        let path = leases_dir.join(format!("{}.lock", lease_key(canonical_repo)));
-        let contents = format!(
-            "run_id={holder_run_id}\npid={}\nrepo={canonical_repo}\n",
-            std::process::id()
-        );
-        match Self::create_lease_file(&path, &contents) {
-            Ok(()) => return Ok(Self { path }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        let key = lease_key(canonical_repo);
+        let path = leases_dir.join(format!("{key}.lock"));
+        let owner_path = leases_dir.join(format!("{key}.owner"));
+        let pending_path = leases_dir.join(format!("{key}.owner.pending"));
+        let mut guard = open_private_lock(&path).map_err(|error| {
+            QuarantineError::CaptureFailed(format!(
+                "failed to open repository lease guard at {}: {error}",
+                path.display()
+            ))
+        })?;
+
+        #[cfg(test)]
+        wait_at_test_reclaim_gate();
+        match guard.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                return Err(QuarantineError::CaptureFailed(format!(
+                    "repository lease for {canonical_repo} is already held; refusing to touch a \
+                     repo another Conductor operation may currently be using"
+                )));
+            }
             Err(error) => {
                 return Err(QuarantineError::CaptureFailed(format!(
-                    "failed to acquire repository lease at {}: {error}",
+                    "failed to lock repository lease guard at {}: {error}",
                     path.display()
                 )));
             }
         }
 
-        let holder = std::fs::read_to_string(&path).unwrap_or_default();
-        let holder_pid = parse_lease_pid(&holder);
-        let stale = holder_pid.is_some_and(|pid| !process_alive(pid));
-        if !stale {
+        #[cfg(test)]
+        abort_at_test_lease_phase("after_guard_lock");
+
+        let (holder, owner_exists) = match std::fs::read_to_string(&owner_path) {
+            Ok(holder) => (holder, true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                guard.seek(SeekFrom::Start(0)).map_err(|error| {
+                    QuarantineError::CaptureFailed(format!(
+                        "failed to seek legacy repository lease at {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                let mut holder = String::new();
+                guard.read_to_string(&mut holder).map_err(|error| {
+                    QuarantineError::CaptureFailed(format!(
+                        "failed to read legacy repository lease at {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                (holder, false)
+            }
+            Err(error) => {
+                return Err(QuarantineError::CaptureFailed(format!(
+                    "failed to read repository lease owner at {}: {error}",
+                    owner_path.display()
+                )));
+            }
+        };
+
+        let holder_pid = if owner_exists {
+            Some(
+                parse_lease_owner(&holder, canonical_repo)
+                    .ok_or_else(|| lease_held_error(canonical_repo, &holder))?
+                    .pid,
+            )
+        } else if holder.trim().is_empty() {
+            None
+        } else {
+            Some(
+                parse_lease_pid(&holder)
+                    .ok_or_else(|| lease_held_error(canonical_repo, &holder))?,
+            )
+        };
+        if holder_pid.is_some_and(process_alive) {
+            return Err(lease_held_error(canonical_repo, &holder));
+        }
+
+        remove_stale_pending_owner(&pending_path)?;
+        let generation = lease_generation(canonical_repo, holder_run_id);
+        let contents = format!(
+            "lease_version=2\ngeneration={generation}\nrun_id={holder_run_id}\npid={}\nrepo={canonical_repo}\n",
+            std::process::id()
+        );
+        if let Err(error) = write_pending_owner(&pending_path, &contents) {
+            let _ = std::fs::remove_file(&pending_path);
             return Err(QuarantineError::CaptureFailed(format!(
-                "repository lease for {canonical_repo} is already held ({}); refusing to \
-                 touch a repo another Conductor operation may currently be using",
-                holder.trim().replace('\n', ", ")
+                "failed to stage repository lease owner at {}: {error}",
+                pending_path.display()
             )));
         }
 
-        // The recorded holder process is confirmed dead — its advisory
-        // lease cannot represent real in-progress work, only a crash that
-        // never reached `Drop`. Reclaim it and retry exactly once so a
-        // genuine concurrent acquirer that wins this race is still
-        // respected rather than double-acquired.
-        let _ = std::fs::remove_file(&path);
-        match Self::create_lease_file(&path, &contents) {
-            Ok(()) => Ok(Self { path }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(QuarantineError::CaptureFailed(format!(
-                    "repository lease for {canonical_repo} was reclaimed from a dead holder \
-                     (pid {}) but immediately re-acquired by another process; refusing to race \
-                     a concurrent operation",
-                    holder_pid.unwrap_or_default()
-                )))
-            }
-            Err(error) => Err(QuarantineError::CaptureFailed(format!(
-                "failed to acquire repository lease at {} after reclaiming a stale holder: {error}",
-                path.display()
-            ))),
-        }
-    }
+        #[cfg(test)]
+        abort_at_test_lease_phase("after_owner_stage");
 
-    fn create_lease_file(path: &Path, contents: &str) -> std::io::Result<()> {
-        let mut file = open_private_new(path)?;
-        file.write_all(contents.as_bytes())
+        if !owner_exists && !holder.is_empty() {
+            let clear_result = guard
+                .set_len(0)
+                .and_then(|()| guard.seek(SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|()| guard.sync_data());
+            if let Err(error) = clear_result {
+                let _ = std::fs::remove_file(&pending_path);
+                return Err(QuarantineError::CaptureFailed(format!(
+                    "failed to clear reclaimed legacy lease at {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+        match std::fs::remove_file(&owner_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = std::fs::remove_file(&pending_path);
+                return Err(QuarantineError::CaptureFailed(format!(
+                    "failed to retire stale repository lease owner at {}: {error}",
+                    owner_path.display()
+                )));
+            }
+        }
+
+        #[cfg(test)]
+        abort_at_test_lease_phase("after_owner_remove");
+
+        if let Err(error) = std::fs::rename(&pending_path, &owner_path) {
+            let _ = std::fs::remove_file(&pending_path);
+            return Err(QuarantineError::CaptureFailed(format!(
+                "failed to commit repository lease owner at {}: {error}",
+                owner_path.display()
+            )));
+        }
+        #[cfg(test)]
+        abort_at_test_lease_phase("after_owner_commit");
+        Ok(Self {
+            guard,
+            owner_path,
+            generation,
+        })
     }
 }
 
 impl Drop for RepoLease {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let owned_generation = std::fs::read_to_string(&self.owner_path)
+            .ok()
+            .and_then(|contents| parse_lease_generation(&contents));
+        if owned_generation.as_deref() == Some(self.generation.as_str()) {
+            let _ = std::fs::remove_file(&self.owner_path);
+        }
+        let _ = fs2::FileExt::unlock(&self.guard);
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeaseOwner {
+    pid: u32,
+    generation: String,
+}
+
+fn parse_lease_owner(contents: &str, canonical_repo: &str) -> Option<LeaseOwner> {
+    let version = lease_field(contents, "lease_version")?;
+    let generation = lease_field(contents, "generation")?;
+    let run_id = lease_field(contents, "run_id")?;
+    let pid = lease_field(contents, "pid")?.parse().ok()?;
+    let repo = lease_field(contents, "repo")?;
+    if version != "2"
+        || generation.len() != 64
+        || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || run_id.is_empty()
+        || repo != canonical_repo
+    {
+        return None;
+    }
+    Some(LeaseOwner {
+        pid,
+        generation: generation.to_string(),
+    })
+}
+
+fn parse_lease_generation(contents: &str) -> Option<String> {
+    let generation = lease_field(contents, "generation")?;
+    (generation.len() == 64 && generation.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| generation.to_string())
+}
+
+fn lease_held_error(canonical_repo: &str, holder: &str) -> QuarantineError {
+    QuarantineError::CaptureFailed(format!(
+        "repository lease for {canonical_repo} is already held ({}); refusing to touch a repo \
+         another Conductor operation may currently be using",
+        holder.trim().replace('\n', ", ")
+    ))
+}
+
+fn lease_field<'a>(contents: &'a str, name: &str) -> Option<&'a str> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+    })
+}
+
+fn lease_generation(canonical_repo: &str, holder_run_id: &str) -> String {
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{}\0{sequence}\0{nanos}\0{holder_run_id}\0{canonical_repo}",
+            std::process::id()
+        ))
+    )
+}
+
+fn remove_stale_pending_owner(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(QuarantineError::CaptureFailed(format!(
+            "failed to remove interrupted repository lease staging file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn write_pending_owner(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut file = open_private_new(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
+}
+
 /// State-directory-wide process lease for top-level dispatch. It reuses the
-/// same exclusive-create and provably-dead-holder reclaim boundary as
-/// [`RepoLease`], but has a dedicated synthetic resource identity so it never
-/// collides with a canonical repository path.
+/// same stable guard, crash-atomic owner generation, and provably-dead-holder
+/// reclaim boundary as [`RepoLease`], but has a dedicated synthetic resource
+/// identity so it never collides with a canonical repository path.
 #[derive(Debug)]
 pub(crate) struct DispatchLease {
     _lease: RepoLease,
@@ -573,6 +754,39 @@ fn parse_lease_pid(contents: &str) -> Option<u32> {
         .lines()
         .find_map(|line| line.strip_prefix("pid="))
         .and_then(|value| value.trim().parse().ok())
+}
+
+#[cfg(test)]
+fn wait_at_test_reclaim_gate() {
+    let Ok(gate_dir) = std::env::var("CONDUCTOR_TEST_LEASE_RECLAIM_GATE_DIR") else {
+        return;
+    };
+    let contender = std::env::var("CONDUCTOR_TEST_LEASE_CONTENDER")
+        .expect("lease contender id must accompany the reclaim gate");
+    let gate_dir = PathBuf::from(gate_dir);
+    std::fs::write(gate_dir.join(format!("{contender}.ready")), b"ready\n")
+        .expect("signal reclaim readiness");
+    wait_for_test_path(&gate_dir.join(format!("{contender}.go")));
+}
+
+#[cfg(test)]
+fn abort_at_test_lease_phase(phase: &str) {
+    if std::env::var("CONDUCTOR_TEST_LEASE_ABORT_AT").as_deref() == Ok(phase) {
+        std::process::exit(86);
+    }
+}
+
+#[cfg(test)]
+fn wait_for_test_path(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Probes whether `pid` still refers to a live process via `kill -0`, the
@@ -905,6 +1119,28 @@ fn stage_private_patch_file(artifact_label: &str, patch: &[u8]) -> std::io::Resu
 }
 
 #[cfg(unix)]
+fn open_private_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+#[cfg(unix)]
 fn open_private_new(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -1201,6 +1437,129 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wait_for_path(path: &Path) {
+        wait_for_test_path(path);
+    }
+
+    fn spawn_dead_pid() -> u32 {
+        let mut dead = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = dead.id();
+        dead.wait().expect("reap short-lived process");
+        pid
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestLeaseKind {
+        Repo,
+        Dispatch,
+    }
+
+    impl TestLeaseKind {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Repo => "repo",
+                Self::Dispatch => "dispatch",
+            }
+        }
+    }
+
+    enum TestHeldLease {
+        Repo(RepoLease),
+        Dispatch(DispatchLease),
+    }
+
+    fn write_lease_process_result(path: &Path, contents: impl AsRef<[u8]>) {
+        let pending = path.with_extension("result.pending");
+        std::fs::write(&pending, contents).expect("stage lease process result");
+        std::fs::rename(&pending, path).expect("commit lease process result");
+    }
+
+    fn acquire_test_lease(
+        kind: TestLeaseKind,
+        state_dir: &Path,
+        identity: &str,
+        run_id: &str,
+    ) -> Result<TestHeldLease> {
+        match kind {
+            TestLeaseKind::Repo => {
+                RepoLease::acquire(state_dir, identity, run_id).map(TestHeldLease::Repo)
+            }
+            TestLeaseKind::Dispatch => {
+                DispatchLease::acquire(state_dir, run_id).map(TestHeldLease::Dispatch)
+            }
+        }
+    }
+
+    fn spawn_lease_process(
+        state_dir: &Path,
+        gate_dir: &Path,
+        contender: &str,
+        kind: TestLeaseKind,
+        identity: &str,
+        run_id: &str,
+        abort_at: Option<&str>,
+    ) -> std::process::Child {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("quarantine::tests::repo_lease_process_helper")
+            .env("CONDUCTOR_TEST_LEASE_STATE_DIR", state_dir)
+            .env("CONDUCTOR_TEST_LEASE_RECLAIM_GATE_DIR", gate_dir)
+            .env("CONDUCTOR_TEST_LEASE_CONTENDER", contender)
+            .env("CONDUCTOR_TEST_LEASE_KIND", kind.label())
+            .env("CONDUCTOR_TEST_LEASE_IDENTITY", identity)
+            .env("CONDUCTOR_TEST_LEASE_RUN_ID", run_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(phase) = abort_at {
+            command.env("CONDUCTOR_TEST_LEASE_ABORT_AT", phase);
+        }
+        command.spawn().expect("spawn independent lease contender")
+    }
+
+    #[test]
+    #[ignore = "independent-process helper invoked by lease contention tests"]
+    fn repo_lease_process_helper() {
+        let state_dir = PathBuf::from(
+            std::env::var("CONDUCTOR_TEST_LEASE_STATE_DIR").expect("lease state dir"),
+        );
+        let gate_dir = PathBuf::from(
+            std::env::var("CONDUCTOR_TEST_LEASE_RECLAIM_GATE_DIR").expect("lease gate dir"),
+        );
+        let contender =
+            std::env::var("CONDUCTOR_TEST_LEASE_CONTENDER").expect("lease contender id");
+        let kind = match std::env::var("CONDUCTOR_TEST_LEASE_KIND")
+            .expect("lease kind")
+            .as_str()
+        {
+            "repo" => TestLeaseKind::Repo,
+            "dispatch" => TestLeaseKind::Dispatch,
+            other => panic!("unknown lease kind {other:?}"),
+        };
+        let identity = std::env::var("CONDUCTOR_TEST_LEASE_IDENTITY").expect("lease identity");
+        let run_id = std::env::var("CONDUCTOR_TEST_LEASE_RUN_ID").expect("lease run id");
+        let result_path = gate_dir.join(format!("{contender}.result"));
+        let release_path = gate_dir.join(format!("{contender}.release"));
+
+        match acquire_test_lease(kind, &state_dir, &identity, &run_id) {
+            Ok(lease) => {
+                write_lease_process_result(&result_path, b"acquired");
+                wait_for_path(&release_path);
+                drop(lease);
+            }
+            Err(error) => {
+                write_lease_process_result(&result_path, format!("refused:{error}"));
+            }
         }
     }
 
@@ -1907,9 +2266,267 @@ mod tests {
 
         drop(lease);
         assert!(
-            !stale_path.exists(),
-            "the reclaimed-then-released lease must be gone after drop"
+            stale_path.is_file(),
+            "the stable guard inode must survive clean release"
         );
+        assert_eq!(
+            std::fs::read_to_string(&stale_path).expect("read cleared legacy guard"),
+            "",
+            "reclaimed legacy holder metadata must be cleared"
+        );
+        assert!(
+            !stale_path.with_extension("owner").exists(),
+            "clean drop must remove the released owner generation"
+        );
+    }
+
+    fn lease_artifact_paths(state_dir: &Path, identity: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = state_dir.join("leases").join(lease_key(identity));
+        (
+            base.with_extension("lock"),
+            base.with_extension("owner"),
+            base.with_extension("owner.pending"),
+        )
+    }
+
+    fn seed_legacy_dead_holder(state_dir: &Path, identity: &str) -> PathBuf {
+        let (guard_path, _, _) = lease_artifact_paths(state_dir, identity);
+        std::fs::create_dir_all(guard_path.parent().expect("lease parent"))
+            .expect("mkdir leases dir");
+        let dead_pid = spawn_dead_pid();
+        std::fs::write(
+            &guard_path,
+            format!("run_id=stale-run\npid={dead_pid}\nrepo={identity}\n"),
+        )
+        .expect("seed stale lease");
+        guard_path
+    }
+
+    fn assert_single_winner_contention_round(
+        root: &Path,
+        kind: TestLeaseKind,
+        identity: &str,
+        round: usize,
+    ) {
+        let state_dir = root.join(format!("{}-{round}", kind.label()));
+        let gate_dir = state_dir.join("gate");
+        std::fs::create_dir_all(&gate_dir).expect("mkdir reclaim gate");
+        let guard_path = seed_legacy_dead_holder(&state_dir, identity);
+        let (_, owner_path, pending_path) = lease_artifact_paths(&state_dir, identity);
+        let run_a = format!("{}-{round}-a", kind.label());
+        let run_b = format!("{}-{round}-b", kind.label());
+
+        let mut contender_a =
+            spawn_lease_process(&state_dir, &gate_dir, "a", kind, identity, &run_a, None);
+        let mut contender_b =
+            spawn_lease_process(&state_dir, &gate_dir, "b", kind, identity, &run_b, None);
+        wait_for_path(&gate_dir.join("a.ready"));
+        wait_for_path(&gate_dir.join("b.ready"));
+
+        std::fs::write(gate_dir.join("a.go"), b"go\n").expect("release contender a");
+        wait_for_path(&gate_dir.join("a.result"));
+        std::fs::write(gate_dir.join("b.go"), b"go\n").expect("release contender b");
+        wait_for_path(&gate_dir.join("b.result"));
+
+        let result_a =
+            std::fs::read_to_string(gate_dir.join("a.result")).expect("read contender a result");
+        let result_b =
+            std::fs::read_to_string(gate_dir.join("b.result")).expect("read contender b result");
+        let authoritative_holder = if owner_path.is_file() {
+            &owner_path
+        } else {
+            &guard_path
+        };
+        let holder_while_a_is_live = std::fs::read_to_string(authoritative_holder)
+            .expect("read lease while the winning process holds it");
+
+        std::fs::write(gate_dir.join("a.release"), b"release\n")
+            .expect("release contender a lease");
+        std::fs::write(gate_dir.join("b.release"), b"release\n")
+            .expect("release contender b lease");
+        assert!(contender_a.wait().expect("wait contender a").success());
+        assert!(contender_b.wait().expect("wait contender b").success());
+
+        assert_eq!(result_a, "acquired", "first released contender must win");
+        assert!(
+            result_b.starts_with("refused:"),
+            "the losing contender must fail closed, got {result_b:?}"
+        );
+        assert!(
+            holder_while_a_is_live.contains(&format!("run_id={run_a}")),
+            "the loser removed or overwrote the winner's lease: {holder_while_a_is_live:?}"
+        );
+
+        {
+            let _next = acquire_test_lease(kind, &state_dir, identity, "run-after-drop")
+                .expect("winner drop makes the lease available to the next generation");
+        }
+        assert!(guard_path.is_file(), "the stable guard must persist");
+        assert_eq!(
+            std::fs::read_to_string(&guard_path).expect("read stable guard"),
+            "",
+            "legacy owner bytes must not survive reclaim"
+        );
+        assert!(
+            !owner_path.exists(),
+            "clean drop must remove its generation"
+        );
+        assert!(
+            !pending_path.exists(),
+            "successful reclaim must not strand staging state"
+        );
+    }
+
+    #[test]
+    fn concurrent_dead_holder_reclaim_has_one_real_process_winner_for_repo_and_dispatch_leases() {
+        let temp = TempDir::new("lease-stale-contention");
+        for round in 0..5 {
+            assert_single_winner_contention_round(
+                temp.path(),
+                TestLeaseKind::Repo,
+                "/repo/bursar",
+                round,
+            );
+            assert_single_winner_contention_round(
+                temp.path(),
+                TestLeaseKind::Dispatch,
+                "conductor://dispatch",
+                round,
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_reclaim_releases_guard_and_cleans_stale_staging_for_both_identities() {
+        let temp = TempDir::new("lease-interrupted-reclaim");
+        for kind in [TestLeaseKind::Repo, TestLeaseKind::Dispatch] {
+            let identity = match kind {
+                TestLeaseKind::Repo => "/repo/bursar",
+                TestLeaseKind::Dispatch => "conductor://dispatch",
+            };
+            for phase in [
+                "after_guard_lock",
+                "after_owner_stage",
+                "after_owner_remove",
+                "after_owner_commit",
+            ] {
+                let state_dir = temp.path().join(format!("{}-{phase}", kind.label()));
+                let gate_dir = state_dir.join("gate");
+                std::fs::create_dir_all(&gate_dir).expect("mkdir crash gate");
+                std::fs::write(gate_dir.join("crash.go"), b"go\n")
+                    .expect("pre-release crashing contender");
+                let guard_path = seed_legacy_dead_holder(&state_dir, identity);
+                let (_, owner_path, pending_path) = lease_artifact_paths(&state_dir, identity);
+                let mut interrupted = spawn_lease_process(
+                    &state_dir,
+                    &gate_dir,
+                    "crash",
+                    kind,
+                    identity,
+                    "interrupted-run",
+                    Some(phase),
+                );
+
+                let status = interrupted.wait().expect("wait interrupted reclaimer");
+                assert_eq!(
+                    status.code(),
+                    Some(86),
+                    "helper must exit at the requested {phase} crash point"
+                );
+                {
+                    let _recovered =
+                        acquire_test_lease(kind, &state_dir, identity, "post-interruption")
+                            .expect("next process reclaims after interrupted metadata transition");
+                }
+                assert!(guard_path.is_file(), "stable guard survives {phase}");
+                assert_eq!(
+                    std::fs::read_to_string(&guard_path).expect("read guard after recovery"),
+                    "",
+                    "legacy metadata is cleared after recovering {phase}"
+                );
+                assert!(
+                    !owner_path.exists(),
+                    "clean recovery drops owner after {phase}"
+                );
+                assert!(
+                    !pending_path.exists(),
+                    "stale staging file must be cleaned after {phase}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repo_lease_leaves_live_or_unauthenticated_unlocked_owner_records_untouched() {
+        let temp = TempDir::new("lease-owner-fail-closed");
+        let identity = "/repo/bursar";
+        for (label, contents) in [
+            ("empty", String::new()),
+            (
+                "eperm-or-live",
+                format!(
+                    "lease_version=2\ngeneration={}\nrun_id=other-user-run\npid=1\nrepo={identity}\n",
+                    "c".repeat(64)
+                ),
+            ),
+            (
+                "pid-reuse",
+                format!(
+                    "lease_version=2\ngeneration={}\nrun_id=live-run\npid={}\nrepo={identity}\n",
+                    "a".repeat(64),
+                    std::process::id()
+                ),
+            ),
+            (
+                "unauthenticated",
+                format!(
+                    "lease_version=2\ngeneration=not-a-generation\nrun_id=corrupt-run\npid={}\nrepo={identity}\n",
+                    spawn_dead_pid()
+                ),
+            ),
+        ] {
+            let state_dir = temp.path().join(label);
+            let (guard_path, owner_path, _) = lease_artifact_paths(&state_dir, identity);
+            std::fs::create_dir_all(guard_path.parent().expect("lease parent"))
+                .expect("mkdir leases");
+            std::fs::write(&guard_path, b"").expect("write stable guard");
+            std::fs::write(&owner_path, &contents).expect("write owner record");
+
+            let error = RepoLease::acquire(&state_dir, identity, "new-run")
+                .expect_err("live or unauthenticated owner must fail closed");
+
+            assert!(matches!(error, QuarantineError::CaptureFailed(_)));
+            assert_eq!(
+                std::fs::read_to_string(&owner_path).expect("read untouched owner"),
+                contents,
+                "refusal must not mutate the {label} owner record"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_lease_drop_removes_only_its_authenticated_generation() {
+        let temp = TempDir::new("lease-drop-generation");
+        let identity = "/repo/bursar";
+        let lease = RepoLease::acquire(temp.path(), identity, "owned-run")
+            .expect("acquire original generation");
+        let (_, owner_path, _) = lease_artifact_paths(temp.path(), identity);
+        let owner = std::fs::read_to_string(&owner_path).expect("read original generation");
+        let original_generation = parse_lease_generation(&owner).expect("original generation");
+        let replacement_generation = "b".repeat(64);
+        assert_ne!(original_generation, replacement_generation);
+        let replacement = owner.replace(&original_generation, &replacement_generation);
+        std::fs::write(&owner_path, &replacement).expect("replace owner generation");
+
+        drop(lease);
+
+        assert_eq!(
+            std::fs::read_to_string(&owner_path).expect("replacement generation survives"),
+            replacement,
+            "a stale Drop must never remove a different owner generation"
+        );
+        RepoLease::acquire(temp.path(), identity, "later-run")
+            .expect_err("the live replacement identity must remain fail-closed");
     }
 
     #[test]
