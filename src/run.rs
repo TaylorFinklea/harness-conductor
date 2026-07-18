@@ -160,6 +160,20 @@ pub(crate) struct WorkState {
     /// not as proof of death (mirrors `before_head`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) owner_pid: Option<u32>,
+    /// Process-group id of the currently dispatched worker, recorded via
+    /// [`RunHandle::record_worker_group`] immediately after each worker is
+    /// spawned (workers lead their own process group, so the group id equals
+    /// the worker pid) and before that worker can meaningfully mutate the
+    /// repository. A dead `conductor` owner is *not* proof that a separately
+    /// grouped worker it launched has also died: an orphaned worker survives
+    /// its parent and can keep writing. Stale-claim recovery therefore refuses
+    /// to reclaim until this worker group is provably gone, in addition to the
+    /// owner. Overwritten per fallback attempt to track the latest live
+    /// worker; absent before the first spawn (or on older manifests), where
+    /// recovery treats a missing worker identity as unprovable and fails
+    /// closed rather than reclaiming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_pgid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -436,6 +450,41 @@ impl RunHandle {
     /// process, if any (see [`WorkState::owner_pid`]).
     pub(crate) fn owner_pid(&self) -> Option<u32> {
         self.work().and_then(|work| work.owner_pid)
+    }
+
+    /// The process-group id of the most recently spawned worker, if one has
+    /// been recorded yet (see [`WorkState::worker_pgid`]).
+    pub(crate) fn worker_pgid(&self) -> Option<u32> {
+        self.work().and_then(|work| work.worker_pgid)
+    }
+
+    /// Durably binds this run to the process group of a just-spawned worker so
+    /// stale-claim recovery can later prove that worker (and every descendant
+    /// still in its group) is gone before reclaiming the bd claim. Called once
+    /// per worker attempt, immediately after the spawn and before the worker
+    /// can meaningfully mutate the repository; it overwrites any prior
+    /// attempt's group so the recorded identity always tracks the latest live
+    /// worker. Only valid while the run is still implementing — a worker is
+    /// only ever spawned in that stage — and never on a finished run.
+    pub(crate) fn record_worker_group(&mut self, pgid: u32) -> Result<()> {
+        if matches!(self.manifest.lifecycle, RunLifecycle::Finished) {
+            return Err(RunError::new(
+                "cannot record a worker group on a finished run",
+            ));
+        }
+        let work = self
+            .manifest
+            .work
+            .as_mut()
+            .ok_or_else(|| RunError::new("recording a worker group requires work state"))?;
+        if work.stage != WorkStage::Implementing {
+            return Err(RunError::new(
+                "worker group can only be recorded while implementing",
+            ));
+        }
+        work.worker_pgid = Some(pgid);
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()
     }
 
     pub(crate) fn work(&self) -> Option<&WorkState> {
@@ -774,22 +823,43 @@ pub(crate) fn find_implementing_work_run(
     find_work_run_at_stage(state_dir, cycle_id, repo, bead, WorkStage::Implementing)
 }
 
-/// Finds the single work run — at any stage, finished or not — for an exact
-/// approved cycle/repository/Bead identity. Under correct operation at most
-/// one such run can exist at a time: a fresh run can only be claimed after
-/// its predecessor's bd claim was released, and this module never releases a
-/// claim before durably finishing the run that held it. `dispatch --resume`
-/// uses this as the single, unambiguous target for a stale-claim reclaim
-/// decision — including the crash-recovery case where a prior reclaim
-/// finished the run but crashed before releasing the bd claim — so it never
-/// has to guess which of several runs is current. Finding more than one is
-/// an invariant violation and fails closed rather than picking one.
-pub(crate) fn find_work_run_for_target(
+/// The stale-claim reclaim target selected by [`find_reclaimable_work_run`]
+/// from a target's full generation history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReclaimCandidate {
+    /// The one unfinished Work run for the target — the current generation,
+    /// still mid-implementation (or otherwise not yet finished). Its liveness
+    /// and HEAD must be revalidated before it can be reclaimed.
+    Unfinished(String),
+    /// No unfinished run exists; this is the latest-generation *finished* run,
+    /// retained as audit history. Consulted only to complete a bd release that
+    /// a prior reclaim durably finished but crashed before releasing — and
+    /// only when that run's exact outcome authorizes the transition.
+    FinishedLatest(String),
+}
+
+/// Selects the stale-claim reclaim target for an exact approved
+/// cycle/repository/Bead identity from that target's *full* generation
+/// history. Repeated crashes accumulate one finished
+/// `stale_claim_reaped` run per reap plus, at most, one still-unfinished
+/// current generation; this never conflates them:
+///
+/// - Exactly one unfinished run (any stage) ⇒ [`ReclaimCandidate::Unfinished`]
+///   — the current generation to revalidate and possibly reap. Older finished
+///   generations are ignored, not counted, so an arbitrarily long crash
+///   history stays recoverable while its audit trail is preserved.
+/// - No unfinished run but some finished history ⇒
+///   [`ReclaimCandidate::FinishedLatest`] with the newest-generation finished
+///   run — the only run whose release a crash-after-finish could still owe.
+/// - More than one unfinished run ⇒ an invariant violation (a fresh run is
+///   only ever created after its predecessor was durably finished), so this
+///   fails closed with an error rather than guessing which is current.
+pub(crate) fn find_reclaimable_work_run(
     state_dir: &Path,
     cycle_id: &str,
     repo: &str,
     bead: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<ReclaimCandidate>> {
     let root = runs_dir(state_dir);
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -801,7 +871,10 @@ pub(crate) fn find_work_run_for_target(
             )));
         }
     };
-    let mut matches = Vec::new();
+    let mut unfinished = Vec::new();
+    // (created_at, run_id) of every finished generation, so the newest can be
+    // chosen deterministically for a release-retry.
+    let mut finished: Vec<(DateTime<Utc>, String)> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             RunError::new(format!("failed to read run directory entry: {error}"))
@@ -817,20 +890,35 @@ pub(crate) fn find_work_run_for_target(
         let Some(work) = manifest.work.as_ref() else {
             continue;
         };
-        if manifest.job == RunJob::Work
-            && work.cycle_id == cycle_id
-            && manifest.target.repo == repo
-            && manifest.target.bead.as_deref() == Some(bead)
+        if manifest.job != RunJob::Work
+            || work.cycle_id != cycle_id
+            || manifest.target.repo != repo
+            || manifest.target.bead.as_deref() != Some(bead)
         {
-            matches.push(manifest.run_id);
+            continue;
+        }
+        if manifest.lifecycle == RunLifecycle::Finished {
+            let created_at = parse_rfc3339(&manifest.created_at, "run created_at")?;
+            finished.push((created_at, manifest.run_id));
+        } else {
+            unfinished.push(manifest.run_id);
         }
     }
-    if matches.len() > 1 {
+    if unfinished.len() > 1 {
+        unfinished.sort();
         return Err(RunError::new(format!(
-            "multiple work runs found for {cycle_id} {repo}/{bead}"
+            "multiple unfinished work runs found for {cycle_id} {repo}/{bead}: {}",
+            unfinished.join(", ")
         )));
     }
-    Ok(matches.pop())
+    if let Some(run_id) = unfinished.pop() {
+        return Ok(Some(ReclaimCandidate::Unfinished(run_id)));
+    }
+    // Newest generation wins; the run_id tie-breaks equal timestamps (it
+    // embeds the same monotonic per-process counter used to keep run ids
+    // collision-resistant).
+    finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(finished.pop().map(|(_, run_id)| ReclaimCandidate::FinishedLatest(run_id)))
 }
 
 fn find_work_run_at_stage(
@@ -1586,6 +1674,7 @@ mod tests {
             authorization_sha256: "b".repeat(64),
             before_head: Some("d".repeat(40)),
             owner_pid: None,
+            worker_pgid: None,
             worker_profile: None,
             worker_commit: None,
             mechanical: None,
@@ -1886,6 +1975,7 @@ mod tests {
                 authorization_sha256: "b".repeat(64),
                 before_head: None,
                 owner_pid: None,
+                worker_pgid: None,
                 worker_profile: None,
                 worker_commit: None,
                 mechanical: None,
@@ -1921,6 +2011,112 @@ mod tests {
                 .expect("lookup finished bead"),
             None,
             "a finished implementing-stage run must never be reclaimable"
+        );
+    }
+
+    #[test]
+    fn run_event_find_reclaimable_selects_latest_generation_and_keeps_finished_history() {
+        let temp = TempDir::new("find-reclaimable-generations");
+        let cycle_id = "cycle-resume-generations";
+        let make_request = || {
+            let mut request = new_run_request();
+            request.target.bead = Some("gen-bead".to_string());
+            request.work = Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "b".repeat(64),
+                before_head: Some("d".repeat(40)),
+                owner_pid: Some(123),
+                worker_pgid: Some(456),
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+            });
+            request
+        };
+        let repo = "/repo/conductor";
+
+        // No runs yet.
+        assert_eq!(
+            find_reclaimable_work_run(temp.path(), cycle_id, repo, "gen-bead")
+                .expect("empty lookup"),
+            None
+        );
+
+        // Generation 1 was reaped by a prior stale-claim recovery; it is
+        // durable audit history, not a reclaim candidate.
+        let base = fixed_now();
+        let mut gen1 = RunHandle::create_at(temp.path(), RunJob::Work, make_request(), base)
+            .expect("create gen1");
+        gen1.finish("stale_claim_reaped").expect("finish gen1");
+
+        // With no unfinished generation, only the finished latest is offered
+        // — for a release retry, never a fresh reclaim.
+        assert_eq!(
+            find_reclaimable_work_run(temp.path(), cycle_id, repo, "gen-bead")
+                .expect("finished-only lookup"),
+            Some(ReclaimCandidate::FinishedLatest(gen1.run_id().to_string()))
+        );
+
+        // A second crash: generation 2 is created fresh and left unfinished.
+        let gen2 = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            make_request(),
+            base + chrono::Duration::seconds(60),
+        )
+        .expect("create gen2");
+        assert_eq!(
+            find_reclaimable_work_run(temp.path(), cycle_id, repo, "gen-bead")
+                .expect("second-generation lookup"),
+            Some(ReclaimCandidate::Unfinished(gen2.run_id().to_string())),
+            "a repeated crash must select the one unfinished generation, not error on history"
+        );
+
+        // The finished generation-1 history is still present and readable.
+        assert_eq!(
+            read_manifest(&runs_dir(temp.path()).join(gen1.run_id()).join("manifest.json"))
+                .expect("gen1 manifest survives")
+                .outcome
+                .as_deref(),
+            Some("stale_claim_reaped")
+        );
+    }
+
+    #[test]
+    fn run_event_find_reclaimable_fails_closed_on_two_unfinished_generations() {
+        let temp = TempDir::new("find-reclaimable-conflict");
+        let cycle_id = "cycle-resume-conflict";
+        let make_request = || {
+            let mut request = new_run_request();
+            request.target.bead = Some("conflict-bead".to_string());
+            request.work = Some(WorkState {
+                cycle_id: cycle_id.to_string(),
+                authorization_sha256: "b".repeat(64),
+                before_head: None,
+                owner_pid: None,
+                worker_pgid: None,
+                worker_profile: None,
+                worker_commit: None,
+                mechanical: None,
+                stage: WorkStage::Implementing,
+            });
+            request
+        };
+        RunHandle::create_at(temp.path(), RunJob::Work, make_request(), fixed_now())
+            .expect("create first unfinished");
+        RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            make_request(),
+            fixed_now() + chrono::Duration::seconds(1),
+        )
+        .expect("create second unfinished");
+
+        assert!(
+            find_reclaimable_work_run(temp.path(), cycle_id, "/repo/conductor", "conflict-bead")
+                .is_err(),
+            "two unfinished generations is an invariant violation and must fail closed"
         );
     }
 

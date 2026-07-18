@@ -134,7 +134,41 @@ pub(crate) trait ChildProcess {
     fn terminate(&mut self) -> Result<()>;
     fn kill(&mut self) -> Result<()>;
     fn wait(&mut self) -> Result<ProcessStatus>;
+    /// The child's OS pid, if it is a real process. Because workers are
+    /// spawned as the leader of their own process group (see
+    /// [`set_own_process_group`]), this pid also names that group — the durable
+    /// identity stale-claim recovery binds to via
+    /// [`WorkerHooks::on_spawn`]. In-memory test doubles return `None`, which
+    /// recovery treats as an unprovable worker identity and fails closed on.
+    fn id(&self) -> Option<u32> {
+        None
+    }
 }
+
+/// Callbacks the worker runtime invokes around a dispatched worker's lifetime.
+/// A single observer (rather than separate closures) so it can hold one
+/// exclusive borrow of the run's durable state across both the one-shot
+/// spawn hook and the repeated heartbeat ticks.
+pub(crate) trait WorkerHooks {
+    /// Invoked exactly once, immediately after the worker is spawned and
+    /// before it can meaningfully mutate the repository, with the worker's pid
+    /// (which also names its process group). Returning an `Err` fails closed:
+    /// the just-spawned worker is terminated and reaped before this error
+    /// propagates, so a worker whose identity could not be durably recorded
+    /// never runs unattended.
+    fn on_spawn(&mut self, _pid: Option<u32>) -> Result<()> {
+        Ok(())
+    }
+    /// Invoked on each heartbeat tick while the worker runs.
+    fn on_heartbeat(&mut self, _elapsed: Duration) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// No-op hooks for callers that dispatch a process needing neither durable
+/// worker-group binding nor heartbeats (e.g. the plain [`run`] wrapper and
+/// read-only reviewer probes).
+impl WorkerHooks for () {}
 
 pub(crate) trait CommitProbe {
     fn head(&self, repo: &Path) -> Result<Option<String>>;
@@ -148,9 +182,7 @@ pub(crate) fn run<E: Exec, C: CommitProbe>(
     state_dir: &Path,
     timeout: Duration,
 ) -> Result<DispatchResult> {
-    run_with_heartbeat(exec, commits, request, state_dir, timeout, timeout, |_| {
-        Ok(())
-    })
+    run_with_heartbeat(exec, commits, request, state_dir, timeout, timeout, &mut ())
 }
 
 pub(crate) fn run_readonly<E: Exec + ?Sized>(
@@ -159,7 +191,7 @@ pub(crate) fn run_readonly<E: Exec + ?Sized>(
     timeout: Duration,
 ) -> Result<()> {
     let mut child = exec.spawn(request)?;
-    let process = wait_with_timeout_and_heartbeat(child.as_mut(), timeout, timeout, |_| Ok(()))?;
+    let process = wait_with_timeout_and_heartbeat(child.as_mut(), timeout, timeout, &mut ())?;
     if process.timed_out {
         return Err(DispatchError::new("read-only process timed out"));
     }
@@ -176,25 +208,33 @@ pub(crate) fn run_readonly<E: Exec + ?Sized>(
     }
 }
 
-pub(crate) fn run_with_heartbeat<E, C, H>(
+pub(crate) fn run_with_heartbeat<E, C, K>(
     exec: &E,
     commits: &C,
     request: &DispatchRequest,
     state_dir: &Path,
     timeout: Duration,
     heartbeat_interval: Duration,
-    heartbeat: H,
+    hooks: &mut K,
 ) -> Result<DispatchResult>
 where
     E: Exec + ?Sized,
     C: CommitProbe + ?Sized,
-    H: FnMut(Duration) -> Result<()>,
+    K: WorkerHooks + ?Sized,
 {
     let before_head = commits.head(&request.repo)?;
     let spawn = spawn_request(request, state_dir)?;
     let mut child = exec.spawn(&spawn)?;
+    // Bind the run to this worker's process group before it can meaningfully
+    // mutate the repository. If that durable record fails, tear the worker
+    // (and any descendants) down rather than let a worker whose identity we
+    // cannot prove keep running unattended.
+    if let Err(error) = hooks.on_spawn(child.id()) {
+        terminate_and_reap_best_effort(child.as_mut());
+        return Err(error);
+    }
     let process =
-        wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, heartbeat)?;
+        wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
     let status = classify(
@@ -370,14 +410,14 @@ struct ProcessRun {
     timed_out: bool,
 }
 
-fn wait_with_timeout_and_heartbeat<H>(
+fn wait_with_timeout_and_heartbeat<K>(
     child: &mut dyn ChildProcess,
     timeout: Duration,
     heartbeat_interval: Duration,
-    mut heartbeat: H,
+    hooks: &mut K,
 ) -> Result<ProcessRun>
 where
-    H: FnMut(Duration) -> Result<()>,
+    K: WorkerHooks + ?Sized,
 {
     let mut elapsed = Duration::ZERO;
     let heartbeat_interval = if heartbeat_interval.is_zero() {
@@ -411,7 +451,7 @@ where
             });
         }
         elapsed = elapsed.saturating_add(wait);
-        if let Err(error) = heartbeat(elapsed) {
+        if let Err(error) = hooks.on_heartbeat(elapsed) {
             // Same reasoning as above: a heartbeat failure (e.g. the live
             // report patch call erroring) must not leave the worker running
             // unattended after this function returns an error.
@@ -576,6 +616,10 @@ impl ChildProcess for CommandChild {
             .map(ProcessStatus::from)
             .map_err(|e| DispatchError::new(format!("failed to wait for child: {e}")))
     }
+
+    fn id(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
 }
 
 /// Spawns the child as the leader of its own process group (`setpgid(0, 0)`
@@ -689,6 +733,16 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Adapts a bare heartbeat closure to the [`WorkerHooks`] trait so the
+    /// wait-loop tests can drive `on_heartbeat` without a full observer.
+    struct HeartbeatFn<F>(F);
+
+    impl<F: FnMut(Duration) -> Result<()>> WorkerHooks for HeartbeatFn<F> {
+        fn on_heartbeat(&mut self, elapsed: Duration) -> Result<()> {
+            (self.0)(elapsed)
+        }
+    }
 
     #[test]
     fn pi_backend_uses_pinned_argv_repo_cwd_and_null_stdin() {
@@ -947,7 +1001,7 @@ mod tests {
             &mut child,
             Duration::from_secs(45),
             Duration::from_secs(45),
-            |_elapsed| Ok(()),
+            &mut (),
         )
         .expect_err("a wait_for error must propagate, not be swallowed");
 
@@ -973,7 +1027,9 @@ mod tests {
             &mut child,
             Duration::from_secs(45),
             Duration::from_secs(45),
-            |_elapsed| Err(DispatchError::new("simulated heartbeat failure")),
+            &mut HeartbeatFn(|_elapsed: Duration| {
+                Err(DispatchError::new("simulated heartbeat failure"))
+            }),
         )
         .expect_err("a heartbeat error must propagate, not be swallowed");
 

@@ -563,30 +563,79 @@ fn parse_lease_pid(contents: &str) -> Option<u32> {
 /// standard POSIX existence check (mirrors the shell-out style already used
 /// by [`send_signal_to_group`](crate::dispatch) for the same reason: this
 /// crate forbids `unsafe`, so a direct `kill(2)` syscall is not an option).
-/// A failed probe (the `kill` binary itself missing, e.g.) is treated as
-/// "cannot prove death" and returns `true` — reclaim only ever fires on a
-/// confirmed-dead holder, never on an inconclusive probe. Shared with
-/// `dispatch_cycle`'s stale-claim reclaim so both recovery paths authenticate
-/// a dead owner the same, single way rather than each growing its own
-/// weaker liveness check.
+/// Fails closed on *every* ambiguous signal — the `kill` binary missing, an
+/// unreadable result, or, critically, `EPERM` (the process exists but is
+/// owned by another user, e.g. after a pid landed on someone else's daemon):
+/// only a positively confirmed `ESRCH` ("No such process") reports death.
+/// Reclaim therefore only ever fires on a *proven*-dead holder, never on an
+/// inconclusive probe. Shared with `dispatch_cycle`'s stale-claim reclaim so
+/// both recovery paths authenticate a dead owner the same, single way rather
+/// than each growing its own weaker liveness check.
 #[cfg(unix)]
 pub(crate) fn process_alive(pid: u32) -> bool {
-    match Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(_) => true,
-    }
+    !kill_probe_confirmed_absent(&pid.to_string())
 }
 
 #[cfg(not(unix))]
 pub(crate) fn process_alive(_pid: u32) -> bool {
     true
+}
+
+/// Probes whether any process in the group led by `pgid` is still alive.
+/// POSIX `kill(2)` treats a negative pid as a process-group target, so
+/// `kill -0 -<pgid>` succeeds while the group has members, reports `EPERM`
+/// when it has members we cannot signal, and only reports `ESRCH` once the
+/// group is empty. This proves an orphaned worker *and every descendant still
+/// in its group* is gone — a dead `conductor` owner is not proof its
+/// separately grouped worker died with it. Fails closed exactly like
+/// [`process_alive`]: anything short of a confirmed-empty group reads as
+/// still-alive.
+#[cfg(unix)]
+pub(crate) fn process_group_alive(pgid: u32) -> bool {
+    // Match `send_signal_to_group`'s `-<pid>` convention: the negative operand
+    // addresses the whole group.
+    !kill_probe_confirmed_absent(&format!("-{pgid}"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_group_alive(_pgid: u32) -> bool {
+    true
+}
+
+/// Runs `kill -0 <target>` under a forced `C` locale (so the errno text is
+/// the canonical `strerror` form regardless of the operator's `LANG`) and
+/// reports whether the target is *positively confirmed absent*. Only an
+/// `ESRCH` ("No such process") result qualifies; success (alive), `EPERM`
+/// (exists but not ours), a missing `kill` binary, or any unrecognized
+/// failure all report `false` (cannot prove absence) so callers fail closed.
+#[cfg(unix)]
+fn kill_probe_confirmed_absent(target: &str) -> bool {
+    let output = Command::new("kill")
+        .env("LC_ALL", "C")
+        .arg("-0")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match output {
+        Ok(output) => classify_kill_probe(output.status.success(), &output.stderr),
+        Err(_) => false,
+    }
+}
+
+/// Pure classifier for a `kill -0` result: `true` only when the probe
+/// positively confirms the target is absent (`ESRCH`). Split out from the
+/// shell-out so the `EPERM`-versus-`ESRCH` boundary can be unit-tested without
+/// spawning a real cross-user process.
+#[cfg(unix)]
+fn classify_kill_probe(success: bool, stderr: &[u8]) -> bool {
+    if success {
+        return false;
+    }
+    String::from_utf8_lossy(stderr)
+        .to_ascii_lowercase()
+        .contains("no such process")
 }
 
 /// Scans every run recorded under `state_dir` for another run — one whose
@@ -1267,6 +1316,7 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("b".repeat(40)),
                     owner_pid: None,
+                    worker_pgid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -1664,6 +1714,7 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: before_head.map(str::to_string),
                     owner_pid: None,
+                    worker_pgid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -1705,6 +1756,7 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("d".repeat(40)),
                     owner_pid: None,
+                    worker_pgid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -1755,6 +1807,7 @@ mod tests {
                     authorization_sha256: "a".repeat(64),
                     before_head: Some("c".repeat(40)),
                     owner_pid: None,
+                    worker_pgid: None,
                     worker_profile: None,
                     worker_commit: None,
                     mechanical: None,
@@ -1840,6 +1893,91 @@ mod tests {
         assert!(
             !stale_path.exists(),
             "the reclaimed-then-released lease must be gone after drop"
+        );
+    }
+
+    #[test]
+    fn classify_kill_probe_only_confirms_absence_on_esrch() {
+        // Success => the target exists and we could signal it => alive.
+        assert!(!classify_kill_probe(true, b""));
+        // ESRCH => positively confirmed absent.
+        assert!(classify_kill_probe(
+            false,
+            b"kill: (12345) - No such process\n"
+        ));
+        assert!(classify_kill_probe(false, b"kill: 12345: no such process"));
+        // EPERM => the process exists but is owned by another user; it must
+        // read as alive (fail closed), never as dead.
+        assert!(!classify_kill_probe(
+            false,
+            b"kill: (1) - Operation not permitted\n"
+        ));
+        // Any other unrecognized failure is inconclusive => alive.
+        assert!(!classify_kill_probe(false, b"kill: something unexpected\n"));
+    }
+
+    #[test]
+    fn process_alive_reports_live_and_reaped_processes_and_survives_eperm() {
+        // pid 1 (init / launchd) is always running but is owned by root, so a
+        // non-root `kill -0 1` returns EPERM rather than success — the exact
+        // ambiguity that must never be misread as death. Run as root it simply
+        // succeeds; either way pid 1 is alive.
+        assert!(process_alive(1), "pid 1 must never read as dead");
+
+        // The current test process is trivially alive.
+        assert!(process_alive(std::process::id()));
+
+        // A spawned-then-reaped process is provably gone (ESRCH).
+        let mut dead = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn short-lived process");
+        let dead_pid = dead.id();
+        dead.wait().expect("reap short-lived process");
+        assert!(
+            !process_alive(dead_pid),
+            "a reaped process must read as dead"
+        );
+    }
+
+    #[test]
+    fn process_group_alive_tracks_an_orphaned_worker_group_across_its_death() {
+        use std::os::unix::process::CommandExt;
+
+        // Mirror how `CommandExec` launches a worker: as the leader of its own
+        // process group, so the group id equals the child pid and a dead
+        // `conductor` parent would leave this group orphaned but alive.
+        let mut worker = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn worker in its own process group");
+        let pgid = worker.id();
+
+        assert!(
+            process_group_alive(pgid),
+            "a live orphaned worker group must never read as gone"
+        );
+
+        // The parent (this process, standing in for conductor) tears the whole
+        // group down and reaps it — only now is the worker provably gone.
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        worker.wait().expect("reap worker");
+
+        assert!(
+            !process_group_alive(pgid),
+            "an emptied worker group must read as gone"
         );
     }
 
