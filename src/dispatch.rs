@@ -148,8 +148,20 @@ pub(crate) trait ChildProcess {
 /// Callbacks the worker runtime invokes around a dispatched worker's lifetime.
 /// A single observer (rather than separate closures) so it can hold one
 /// exclusive borrow of the run's durable state across both the one-shot
-/// spawn hook and the repeated heartbeat ticks.
+/// spawn hooks and the repeated heartbeat ticks.
 pub(crate) trait WorkerHooks {
+    /// Invoked exactly once, immediately before the worker is spawned, to
+    /// durably invalidate any earlier attempt's recorded process-group
+    /// identity. Only after this returns `Ok` does [`run_with_heartbeat`]
+    /// spawn the new worker, so a crash between this call and the matching
+    /// [`WorkerHooks::on_spawn`] leaves the run's durable state holding no
+    /// worker identity at all — never a superseded attempt's (by-then-dead)
+    /// group, which recovery could otherwise mistake for proof this new,
+    /// still-unrecorded attempt died too. Returning `Err` prevents the spawn
+    /// entirely: nothing has started yet, so there is nothing to reap.
+    fn on_pre_spawn(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Invoked exactly once, immediately after the worker is spawned and
     /// before it can meaningfully mutate the repository, with the worker's pid
     /// (which also names its process group). Returning an `Err` fails closed:
@@ -224,6 +236,10 @@ where
 {
     let before_head = commits.head(&request.repo)?;
     let spawn = spawn_request(request, state_dir)?;
+    // Durably invalidate any earlier attempt's worker-group identity before
+    // this attempt's process exists at all. A failure here must prevent the
+    // spawn outright — see `WorkerHooks::on_pre_spawn`.
+    hooks.on_pre_spawn()?;
     let mut child = exec.spawn(&spawn)?;
     // Bind the run to this worker's process group before it can meaningfully
     // mutate the repository. If that durable record fails, tear the worker
@@ -1043,6 +1059,109 @@ mod tests {
                 ExecEvent::Kill,
                 ExecEvent::Wait,
             ]
+        );
+    }
+
+    /// Records call order across [`WorkerHooks::on_pre_spawn`] and
+    /// [`Exec::spawn`] into a single shared log, proving the invalidate step
+    /// truly happens before the worker process exists rather than merely
+    /// before `on_spawn`.
+    struct OrderingHooks {
+        log: Rc<RefCell<Vec<&'static str>>>,
+        pre_spawn_error: Option<&'static str>,
+    }
+
+    impl WorkerHooks for OrderingHooks {
+        fn on_pre_spawn(&mut self) -> Result<()> {
+            self.log.borrow_mut().push("pre_spawn");
+            match self.pre_spawn_error {
+                None => Ok(()),
+                Some(message) => Err(DispatchError::new(message)),
+            }
+        }
+    }
+
+    struct OrderingExec {
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Exec for OrderingExec {
+        fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>> {
+            self.log.borrow_mut().push("spawn");
+            std::fs::write(&request.stdout_path, b"").expect("write fake stdout");
+            std::fs::write(&request.stderr_path, b"").expect("write fake stderr");
+            Ok(Box::new(FakeChild::success(Rc::new(RefCell::new(
+                Vec::new(),
+            )))))
+        }
+    }
+
+    #[test]
+    fn on_pre_spawn_runs_before_the_worker_is_spawned() {
+        let temp = TempDir::new("pre-spawn-order");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let exec = OrderingExec {
+            log: Rc::clone(&log),
+        };
+        let commits = FakeCommits::new([Some("before"), Some("before")]);
+        let request = request(&repo, Backend::Pi, "opencode-go/glm-5.2");
+        let mut hooks = OrderingHooks {
+            log: Rc::clone(&log),
+            pre_spawn_error: None,
+        };
+
+        run_with_heartbeat(
+            &exec,
+            &commits,
+            &request,
+            temp.path(),
+            Duration::from_secs(45),
+            Duration::from_secs(45),
+            &mut hooks,
+        )
+        .expect("dispatch succeeds");
+
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["pre_spawn", "spawn"],
+            "the prior attempt's identity must be invalidated before the new worker exists"
+        );
+    }
+
+    #[test]
+    fn on_pre_spawn_failure_prevents_the_spawn_entirely() {
+        let temp = TempDir::new("pre-spawn-failure");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let exec = OrderingExec {
+            log: Rc::clone(&log),
+        };
+        let commits = FakeCommits::new([Some("before")]);
+        let request = request(&repo, Backend::Pi, "opencode-go/glm-5.2");
+        let mut hooks = OrderingHooks {
+            log: Rc::clone(&log),
+            pre_spawn_error: Some("simulated invalidate failure"),
+        };
+
+        let error = run_with_heartbeat(
+            &exec,
+            &commits,
+            &request,
+            temp.path(),
+            Duration::from_secs(45),
+            Duration::from_secs(45),
+            &mut hooks,
+        )
+        .expect_err("a failed invalidation must prevent the worker from ever running");
+
+        assert_eq!(error.to_string(), "simulated invalidate failure");
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["pre_spawn"],
+            "the worker must never spawn once identity invalidation has failed"
         );
     }
 

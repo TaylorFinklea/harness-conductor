@@ -1336,11 +1336,16 @@ fn validate_pending_approval(
     Ok(())
 }
 
-/// Worker-runtime observer for one work run: durably binds the run to each
-/// spawned worker's process group before it can mutate the repository, then
-/// heartbeats liveness and the live report while the worker runs. A single
-/// observer (rather than two closures) holds the one exclusive borrow of the
-/// run handle needed to record the worker group on spawn.
+/// Worker-runtime observer for one work run: before each attempt is spawned,
+/// durably invalidates any earlier attempt's recorded process-group identity;
+/// once the new worker exists, binds the run to its process group before it
+/// can mutate the repository; then heartbeats liveness and the live report
+/// while the worker runs. That invalidate-then-bind order (see
+/// `dispatch::WorkerHooks`) means a crash between a spawn and its matching
+/// `on_spawn` call never leaves a superseded attempt's already-dead identity
+/// standing in for the new, still-unrecorded one. A single observer (rather
+/// than separate closures) holds the one exclusive borrow of the run handle
+/// needed for both hooks.
 struct WorkRunHooks<'a, L: LiveSink + ?Sized> {
     run_artifacts: &'a mut RunHandle,
     live: &'a L,
@@ -1351,6 +1356,12 @@ struct WorkRunHooks<'a, L: LiveSink + ?Sized> {
 }
 
 impl<L: LiveSink + ?Sized> dispatch::WorkerHooks for WorkRunHooks<'_, L> {
+    fn on_pre_spawn(&mut self) -> dispatch::Result<()> {
+        self.run_artifacts
+            .invalidate_worker_group()
+            .map_err(|error| dispatch::DispatchError::new(error.into_message()))
+    }
+
     fn on_spawn(&mut self, pid: Option<u32>) -> dispatch::Result<()> {
         let Some(pid) = pid else {
             // No OS pid (e.g. an in-memory test double). Recovery treats a
@@ -4950,6 +4961,88 @@ dispatch_id = "senior-reviewer"
         assert_eq!(fixture.bd.release_count(), 1);
         assert_eq!(exec.worker_spawns(), 1);
         assert_eq!(recovered.verified, 1);
+    }
+
+    #[test]
+    fn resume_refuses_when_owner_crashes_between_fallback_spawn_and_record_leaving_prior_attempt_group_stale()
+     {
+        // Reproduces the conductor-ii7 REVISE finding: attempt one's worker
+        // group dies normally and stays recorded in the manifest until the
+        // *next* attempt's own pre-spawn invalidation clears it (see
+        // `WorkRunHooks::on_pre_spawn`). If the owning `conductor` process is
+        // killed after attempt two's worker spawns for real but before
+        // `record_worker_group` persists its identity, reclaim must never be
+        // able to reason from attempt one's already-dead group as if it were
+        // proof attempt two died too — the fixed protocol clears that stale
+        // identity *before* attempt two ever spawns, so the manifest is left
+        // holding no identity at all, and a missing identity fails closed.
+        let fixture = ResumeFixture::new("crash-between-spawn-and-record");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        // Attempt one ran, durably recorded its worker group, and that
+        // worker has since exited — its pgid is now provably dead but
+        // remains in the manifest as history until the next attempt's own
+        // pre-spawn invalidation clears it.
+        let dead_owner = spawn_dead_pid();
+        let attempt_one_pgid = spawn_dead_pid();
+        let mut run_artifacts = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_owner),
+                Some(attempt_one_pgid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run whose first attempt already recorded a now-dead worker group");
+
+        // Fallback attempt two begins: the fixed protocol durably invalidates
+        // attempt one's stale identity before attempt two's worker is ever
+        // spawned — exactly what `WorkRunHooks::on_pre_spawn` now does ahead
+        // of every attempt.
+        run_artifacts
+            .invalidate_worker_group()
+            .expect("invalidate attempt one's identity ahead of attempt two's spawn");
+
+        // Attempt two's worker spawns for real — a live process group
+        // standing in for an orphan the owning `conductor` process can no
+        // longer control — but the owner is killed right here: after the
+        // spawn returned, before `record_worker_group` could ever persist
+        // the new pgid. The manifest is left with no worker identity at all,
+        // never attempt one's now-irrelevant one.
+        let (worker, worker_pgid) = spawn_live_worker_group();
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume must not error while the new attempt's identity is unrecorded");
+        assert_eq!(
+            resumed.dispatched, 0,
+            "a missing worker identity must never let resume reason from a superseded \
+             attempt's already-dead group while a new, unrecorded orphan is alive"
+        );
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+
+        kill_worker_group(worker, worker_pgid);
     }
 
     #[test]

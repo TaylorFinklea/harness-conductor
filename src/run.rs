@@ -168,10 +168,13 @@ pub(crate) struct WorkState {
     /// grouped worker it launched has also died: an orphaned worker survives
     /// its parent and can keep writing. Stale-claim recovery therefore refuses
     /// to reclaim until this worker group is provably gone, in addition to the
-    /// owner. Overwritten per fallback attempt to track the latest live
-    /// worker; absent before the first spawn (or on older manifests), where
-    /// recovery treats a missing worker identity as unprovable and fails
-    /// closed rather than reclaiming.
+    /// owner. Cleared to `None` via [`RunHandle::invalidate_worker_group`]
+    /// immediately before each fallback attempt is spawned, then re-bound to
+    /// that attempt's pgid once it starts — so a crash between those two
+    /// calls never leaves a superseded (already-dead) attempt's identity
+    /// standing in for a new, still-unrecorded one. Absent before the first
+    /// spawn (or on older manifests), where recovery treats a missing worker
+    /// identity as unprovable and fails closed rather than reclaiming.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) worker_pgid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -458,12 +461,48 @@ impl RunHandle {
         self.work().and_then(|work| work.worker_pgid)
     }
 
+    /// Durably clears any worker-group identity recorded by an earlier
+    /// attempt, before a new attempt's worker is ever spawned (see
+    /// `WorkerHooks::on_pre_spawn`). Pairs with [`RunHandle::record_worker_group`]
+    /// to make each fallback attempt a two-phase protocol — invalidate, then
+    /// spawn, then (only on success) bind — so a crash between the spawn and
+    /// the matching `record_worker_group` call leaves the manifest holding no
+    /// identity at all, never a superseded attempt's already-dead one that
+    /// stale-claim recovery could mistake for proof this new, still-unrecorded
+    /// attempt died too (recovery already fails closed on a missing
+    /// `worker_pgid`). A no-op in effect, but still durably re-persisted, when
+    /// there is no prior identity to clear — first and later attempts share
+    /// the same protocol. Only valid while the run is still implementing, and
+    /// never on a finished run.
+    pub(crate) fn invalidate_worker_group(&mut self) -> Result<()> {
+        if matches!(self.manifest.lifecycle, RunLifecycle::Finished) {
+            return Err(RunError::new(
+                "cannot invalidate a worker group on a finished run",
+            ));
+        }
+        let work = self
+            .manifest
+            .work
+            .as_mut()
+            .ok_or_else(|| RunError::new("invalidating a worker group requires work state"))?;
+        if work.stage != WorkStage::Implementing {
+            return Err(RunError::new(
+                "worker group can only be invalidated while implementing",
+            ));
+        }
+        work.worker_pgid = None;
+        self.manifest.updated_at = Utc::now().to_rfc3339();
+        self.write_manifest()
+    }
+
     /// Durably binds this run to the process group of a just-spawned worker so
     /// stale-claim recovery can later prove that worker (and every descendant
     /// still in its group) is gone before reclaiming the bd claim. Called once
     /// per worker attempt, immediately after the spawn and before the worker
-    /// can meaningfully mutate the repository; it overwrites any prior
-    /// attempt's group so the recorded identity always tracks the latest live
+    /// can meaningfully mutate the repository, and only after
+    /// [`RunHandle::invalidate_worker_group`] has already cleared any prior
+    /// attempt's identity — it overwrites the `None` that invalidation just
+    /// persisted so the recorded identity always tracks the latest live
     /// worker. Only valid while the run is still implementing — a worker is
     /// only ever spawned in that stage — and never on a finished run.
     pub(crate) fn record_worker_group(&mut self, pgid: u32) -> Result<()> {
@@ -1879,6 +1918,112 @@ mod tests {
         .unwrap();
 
         assert!(RunHandle::open(temp.path(), &run_id).is_err());
+    }
+
+    fn implementing_request_with_worker_pgid(worker_pgid: Option<u32>) -> NewRun {
+        let mut request = new_run_request();
+        request.work = Some(WorkState {
+            cycle_id: "cycle-1".to_string(),
+            authorization_sha256: "b".repeat(64),
+            before_head: None,
+            owner_pid: None,
+            worker_pgid,
+            worker_profile: None,
+            worker_commit: None,
+            mechanical: None,
+            stage: WorkStage::Implementing,
+        });
+        request
+    }
+
+    #[test]
+    fn invalidate_worker_group_clears_a_recorded_identity_and_persists_across_reopen() {
+        let temp = TempDir::new("invalidate-clears");
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            implementing_request_with_worker_pgid(Some(111)),
+            fixed_now(),
+        )
+        .expect("create run with attempt one's identity already recorded");
+        assert_eq!(handle.worker_pgid(), Some(111));
+
+        handle
+            .invalidate_worker_group()
+            .expect("invalidate attempt one's identity ahead of attempt two's spawn");
+        assert_eq!(
+            handle.worker_pgid(),
+            None,
+            "a superseded attempt's identity must not survive invalidation"
+        );
+
+        let reopened =
+            RunHandle::open(temp.path(), handle.run_id()).expect("reopen run from disk");
+        assert_eq!(
+            reopened.worker_pgid(),
+            None,
+            "invalidation must be durable, not just in-memory"
+        );
+    }
+
+    #[test]
+    fn invalidate_worker_group_is_a_durable_no_op_before_any_attempt_has_spawned() {
+        let temp = TempDir::new("invalidate-noop");
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            implementing_request_with_worker_pgid(None),
+            fixed_now(),
+        )
+        .expect("create run before any worker has spawned");
+
+        handle
+            .invalidate_worker_group()
+            .expect("invalidating with no prior identity must still succeed");
+        assert_eq!(handle.worker_pgid(), None);
+    }
+
+    #[test]
+    fn invalidate_worker_group_then_record_binds_only_the_new_attempt() {
+        let temp = TempDir::new("invalidate-then-record");
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            implementing_request_with_worker_pgid(Some(111)),
+            fixed_now(),
+        )
+        .expect("create run with attempt one's identity already recorded");
+
+        handle
+            .invalidate_worker_group()
+            .expect("invalidate attempt one's identity ahead of attempt two's spawn");
+        handle
+            .record_worker_group(222)
+            .expect("bind attempt two's identity once it spawns");
+
+        assert_eq!(
+            handle.worker_pgid(),
+            Some(222),
+            "the manifest must only ever reflect the latest attempt's identity"
+        );
+    }
+
+    #[test]
+    fn invalidate_worker_group_fails_closed_on_a_finished_run() {
+        let temp = TempDir::new("invalidate-finished");
+        let mut handle = RunHandle::create_at(
+            temp.path(),
+            RunJob::Work,
+            implementing_request_with_worker_pgid(Some(111)),
+            fixed_now(),
+        )
+        .expect("create run");
+        handle.finish("verified").expect("finish run");
+
+        let err = handle
+            .invalidate_worker_group()
+            .expect_err("a finished run's worker identity must never be mutated");
+        assert!(err.to_string().contains("finished run"));
     }
 
     #[test]
