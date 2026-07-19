@@ -21,13 +21,12 @@ const DELIMITERS: [&str; 2] = [
     "=== END TASK DATA ===",
 ];
 
-const RULE_PHRASES: [&str; 6] = [
+const RULE_PHRASES: [&str; 5] = [
     "ONE git commit",
     "NEVER git push",
     "NEVER run bd",
     "NEVER run chezmoi",
     "FAILED: ",
-    "CONDUCTOR_WORKER_COMMIT: <full git HEAD>",
 ];
 
 // Rule 8 phrases that distinguish the default-deny path (`.beads/`
@@ -78,4 +77,15 @@ fn worker_prompt_template_has_required_content() {
             "template missing rule 8 phrase: {phrase}"
         );
     }
+}
+
+#[test]
+fn worker_prompt_does_not_delegate_commit_attestation_to_worker_stdout() {
+    let contents = std::fs::read_to_string(TEMPLATE_PATH)
+        .unwrap_or_else(|e| panic!("failed to read {TEMPLATE_PATH}: {e}"));
+
+    assert!(
+        !contents.contains("CONDUCTOR_WORKER_COMMIT"),
+        "the parent must attest an isolated attempt checkout instead of trusting a worker marker"
+    );
 }

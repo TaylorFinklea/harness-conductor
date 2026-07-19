@@ -495,6 +495,167 @@ enum WorkerChainOutcome {
     Deferred { summary: String, attempts: u64 },
 }
 
+struct AttemptCheckout {
+    canonical_repo: PathBuf,
+    path: PathBuf,
+    active: bool,
+}
+
+impl AttemptCheckout {
+    fn create(
+        canonical_repo: &Path,
+        run_dir: &Path,
+        attempt_id: &str,
+        before_head: Option<&str>,
+    ) -> std::result::Result<Self, DispatchCycleError> {
+        let before_head = before_head.ok_or_else(|| {
+            DispatchCycleError::message(
+                "worker attempt isolation requires a repository with a born HEAD",
+            )
+        })?;
+        let root = run_dir.join("attempt-checkouts");
+        std::fs::create_dir_all(&root).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "create worker attempt checkout root {}: {error}",
+                root.display()
+            ))
+        })?;
+        let path = root.join(attempt_id);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(canonical_repo)
+            .args(["worktree", "add", "--detach"])
+            .arg(&path)
+            .arg(before_head)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|error| {
+                DispatchCycleError::message(format!(
+                    "create isolated worker attempt checkout {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(DispatchCycleError::message(format!(
+                "create isolated worker attempt checkout {} failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(Self {
+            canonical_repo: canonical_repo.to_path_buf(),
+            path,
+            active: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(&mut self) -> std::result::Result<(), DispatchCycleError> {
+        if !self.active {
+            return Ok(());
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.canonical_repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|error| {
+                DispatchCycleError::message(format!(
+                    "remove isolated worker attempt checkout {}: {error}",
+                    self.path.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(DispatchCycleError::message(format!(
+                "remove isolated worker attempt checkout {} failed: {}",
+                self.path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for AttemptCheckout {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.canonical_repo)
+                .args(["worktree", "remove", "--force"])
+                .arg(&self.path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+fn promote_attempt_commit<C: CommitProbe + ?Sized>(
+    commits: &C,
+    canonical_repo: &Path,
+    before_head: Option<&str>,
+    worker_commit: &str,
+) -> std::result::Result<(), DispatchCycleError> {
+    let current_head = commits
+        .head(canonical_repo)
+        .map_err(|error| DispatchCycleError::message(format!("promotion git head: {error}")))?;
+    if current_head.as_deref() != before_head {
+        return Err(DispatchCycleError::message(format!(
+            "canonical repository HEAD changed during worker attempt: expected {}, found {}",
+            before_head.unwrap_or("<none>"),
+            current_head.as_deref().unwrap_or("<none>")
+        )));
+    }
+    if !commits
+        .is_clean(canonical_repo)
+        .map_err(|error| DispatchCycleError::message(format!("promotion git status: {error}")))?
+    {
+        return Err(DispatchCycleError::message(
+            "canonical repository became dirty during worker attempt",
+        ));
+    }
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(canonical_repo)
+        .args(["merge", "--ff-only", "--no-edit", worker_commit])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| {
+            DispatchCycleError::message(format!("promote isolated worker commit: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(DispatchCycleError::message(format!(
+            "promote isolated worker commit failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let promoted_head = commits
+        .head(canonical_repo)
+        .map_err(|error| DispatchCycleError::message(format!("promoted git head: {error}")))?;
+    if promoted_head.as_deref() != Some(worker_commit) {
+        return Err(DispatchCycleError::message(format!(
+            "promoted HEAD mismatch: expected {worker_commit}, found {}",
+            promoted_head.as_deref().unwrap_or("<none>")
+        )));
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -845,7 +1006,6 @@ fn dispatch_one<
         }
     }
 
-    let prompt = render_worker_prompt(&claimed, &repo_path, &extracted.verify_cmd);
     let worker_step = format!("worker {}/{}", item.repo, item.issue_id);
     let worker_outcome = run_worker_chain(
         cfg,
@@ -863,7 +1023,6 @@ fn dispatch_one<
         &claimed,
         &extracted,
         &repo_path,
-        &prompt,
         &worker_step,
         progress,
         bursar,
@@ -1494,7 +1653,6 @@ fn run_worker_chain<E, C, L, U>(
     issue: &Issue,
     fields: &ExtractedFields,
     repo_path: &Path,
-    prompt: &str,
     worker_step: &str,
     progress: Option<f64>,
     bursar_client: &U,
@@ -1587,27 +1745,41 @@ where
         }
 
         attempts += 1;
+        let attempt_id = format!("{attempts:03}-{}", sanitize_artifact_piece(&roster.name));
+        let Some(base_head) = before_head else {
+            return Err(DispatchCycleError::message(
+                "worker attempt isolation requires a repository with a born HEAD",
+            ));
+        };
+        if !head_matches_clean(commits, repo_path, base_head)? {
+            return Err(DispatchCycleError::message(
+                "canonical repository changed before isolated worker attempt",
+            ));
+        }
+        let mut attempt_checkout =
+            AttemptCheckout::create(repo_path, run_artifacts.dir(), &attempt_id, before_head)?;
         run_artifacts
             .append_event(
                 EventKind::AttemptStarted,
                 EventInput {
                     profile_id: Some(roster.name.clone()),
-                    outcome: Some("running".to_string()),
+                    outcome: Some(format!("running:{attempt_id}")),
                     ..EventInput::default()
                 },
             )
             .map_err(run_artifact_error)?;
+        let prompt = render_worker_prompt(issue, attempt_checkout.path(), &fields.verify_cmd);
         let request = DispatchRequest {
-            repo: repo_path.to_path_buf(),
+            repo: attempt_checkout.path().to_path_buf(),
             before_head: before_head.map(str::to_string),
-            worker_identity: run_artifacts.run_id().to_string(),
+            attempt_id: attempt_id.clone(),
             cycle_id: cycle_id.to_string(),
             bead_id: item.issue_id.clone(),
             backend: roster.backend,
             dispatch_id: roster.dispatch_id.clone(),
             reasoning_effort: roster.reasoning_effort,
             prompt: attempt_prompt_with_capture_note(
-                prompt,
+                &prompt,
                 prior_capture.as_ref(),
                 run_artifacts.dir(),
             ),
@@ -1644,9 +1816,9 @@ where
                     state_dir,
                     cycle_id,
                     &item.issue_id,
-                    attempts,
-                    &roster.name,
+                    &attempt_id,
                 )?;
+                let cleanup = attempt_checkout.cleanup();
                 run_artifacts
                     .append_event(
                         EventKind::AttemptFinished,
@@ -1657,26 +1829,39 @@ where
                         },
                     )
                     .map_err(run_artifact_error)?;
+                cleanup?;
                 return Err(DispatchCycleError::message(error.to_string()));
             }
         };
-        let mut artifact_refs =
-            capture_dispatch_result(run_artifacts, attempts, &roster.name, &result)?;
+        let mut result = result;
+        let mut artifact_refs = capture_dispatch_result(run_artifacts, &attempt_id, &result)?;
         let mut outcome_label = dispatch_status_label(&result.status);
+        let worker_succeeded = matches!(result.status, dispatch::DispatchStatus::Success);
+        if worker_succeeded {
+            let worker_commit = result.worker_commit.as_deref().ok_or_else(|| {
+                DispatchCycleError::message("successful isolated worker has no observed commit")
+            })?;
+            if let Err(error) =
+                promote_attempt_commit(commits, repo_path, before_head, worker_commit)
+            {
+                outcome_label = format!("unauthenticated_commit; promotion refused: {error}");
+                result.status = dispatch::DispatchStatus::Failed(
+                    dispatch::DispatchFailure::UnauthenticatedCommit,
+                );
+                result.worker_commit = None;
+            }
+        }
         // Any non-success attempt may have left tracked or untracked
         // changes behind without an accepted commit. Quarantine those now,
         // before deciding whether to fail over to the next roster entry or
         // stop here, so every subsequent attempt — fallback or terminal —
         // always starts from the exact clean state the chain began with.
-        if !matches!(result.status, dispatch::DispatchStatus::Success) {
-            let quarantine_label = format!(
-                "{attempts:03}-{}-quarantine",
-                sanitize_artifact_piece(&roster.name)
-            );
+        if !worker_succeeded {
+            let quarantine_label = format!("{attempt_id}-quarantine");
             let canonical_repo = run_artifacts.manifest().target.repo.clone();
             match quarantine::quarantine_dirty_attempt_under_lease(
                 attempt_lease,
-                repo_path,
+                attempt_checkout.path(),
                 &canonical_repo,
                 state_dir,
                 commits,
@@ -1713,6 +1898,7 @@ where
                 }
             }
         }
+        attempt_checkout.cleanup()?;
         run_artifacts
             .append_event(
                 EventKind::AttemptFinished,
@@ -1911,11 +2097,10 @@ fn qualitative_verifier_label(cfg: &Config) -> Option<String> {
 
 fn capture_dispatch_result(
     run_artifacts: &RunHandle,
-    attempt: u64,
-    profile: &str,
+    attempt_id: &str,
     result: &dispatch::DispatchResult,
 ) -> std::result::Result<Vec<crate::run::ArtifactRef>, DispatchCycleError> {
-    let directory = format!("attempts/{attempt:03}-{}", sanitize_artifact_piece(profile));
+    let directory = format!("attempts/{attempt_id}");
     Ok(vec![
         run_artifacts
             .capture_artifact(
@@ -2160,18 +2345,20 @@ fn capture_worker_logs_if_present(
     state_dir: &Path,
     cycle_id: &str,
     bead_id: &str,
-    attempt: u64,
-    profile: &str,
+    attempt_id: &str,
 ) -> std::result::Result<Vec<crate::run::ArtifactRef>, DispatchCycleError> {
-    let log_dir = state_dir.join("logs").join(cycle_id);
-    let directory = PathBuf::from(format!(
-        "attempts/{attempt:03}-{}",
-        sanitize_artifact_piece(profile)
-    ));
+    let log_dir = state_dir.join("logs").join(cycle_id).join(bead_id);
+    let directory = PathBuf::from(format!("attempts/{attempt_id}"));
     let mut refs = Vec::new();
     for (source, name) in [
-        (log_dir.join(format!("{bead_id}.out")), "worker.stdout.log"),
-        (log_dir.join(format!("{bead_id}.err")), "worker.stderr.log"),
+        (
+            log_dir.join(format!("{attempt_id}.out")),
+            "worker.stdout.log",
+        ),
+        (
+            log_dir.join(format!("{attempt_id}.err")),
+            "worker.stderr.log",
+        ),
     ] {
         if source.is_file() {
             refs.push(
@@ -3663,9 +3850,9 @@ dispatch_id = "fake-worker"
         assert!(worker_prompt.contains("sandbox description"));
         assert!(worker_prompt.contains("worker.txt exists"));
         assert!(worker_prompt.contains("tier_floor: junior"));
-        assert!(worker_prompt.contains(&repo.display().to_string()));
+        assert!(worker_prompt.contains(&spawns[0].cwd.display().to_string()));
         assert!(worker_prompt.contains("test -f worker.txt"));
-        assert_eq!(spawns[0].cwd, repo);
+        assert_ne!(spawns[0].cwd, repo);
 
         let head = git(&fleet.join("sandbox-repo"), &["log", "--oneline", "-1"]);
         assert!(head.contains("worker: complete sandbox bead"));
@@ -4488,6 +4675,69 @@ dispatch_id = "senior-reviewer"
     }
 
     #[test]
+    fn inherited_git_identity_and_matching_stdout_marker_cannot_authenticate_a_foreign_commit() {
+        let fixture = ResumeFixture::new("forged-worker-identity");
+        let exec = ForeignCanonicalCommitExec::new(fixture.repo.clone());
+
+        let result = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("foreign commit refusal is isolated to the planned item");
+
+        assert_eq!(result.verified, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(exec.review_spawns(), 0);
+        let worker = exec.worker_spawn();
+        assert_ne!(
+            worker.cwd, fixture.repo,
+            "the worker must run in its parent-created attempt checkout"
+        );
+    }
+
+    #[test]
+    fn stale_first_attempt_commit_and_stdout_cannot_authenticate_fallback_attempt() {
+        let mut fixture = ResumeFixture::new("stale-fallback-attempt");
+        fixture.cfg.review.enabled = false;
+        fixture.cfg.roster[0].fallback = vec!["fallback-worker".to_string()];
+        let mut fallback = fixture.cfg.roster[0].clone();
+        fallback.name = "fallback-worker".to_string();
+        fallback.dispatch_id = "fallback-worker".to_string();
+        fallback.fallback.clear();
+        fixture.cfg.roster.push(fallback);
+        write_plan_with_proposal(
+            &fixture.state,
+            &fixture.repo,
+            &fixture.cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker", "fallback-worker"],
+            &fixture.cfg.roster,
+            &sandbox_issue(),
+        );
+        let exec = StaleFirstAttemptExec::new(fixture.repo.clone());
+
+        let result = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("stale fallback output is a normal worker failure");
+
+        assert_eq!(result.dispatched, 2);
+        assert_eq!(result.verified, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(fixture.bd.close_count(), 0);
+        let spawns = exec.spawns();
+        assert_eq!(spawns.len(), 2);
+        assert_ne!(spawns[0].cwd, spawns[1].cwd);
+        assert_ne!(spawns[0].stdout_path, spawns[1].stdout_path);
+    }
+
+    #[test]
     fn foreign_head_between_cycle_base_and_attempt_snapshot_is_rejected() {
         struct ForeignBeforeAttemptSnapshot {
             head_calls: RefCell<usize>,
@@ -4514,14 +4764,13 @@ dispatch_id = "senior-reviewer"
                 GitCommitProbe.is_clean(repo)
             }
 
-            fn is_worker_commit(
+            fn is_direct_child(
                 &self,
                 repo: &Path,
                 before: Option<&str>,
                 commit: &str,
-                committer_email: &str,
             ) -> crate::dispatch::Result<bool> {
-                GitCommitProbe.is_worker_commit(repo, before, commit, committer_email)
+                GitCommitProbe.is_direct_child(repo, before, commit)
             }
         }
 
@@ -5952,7 +6201,11 @@ provider = "codex"
         assert_eq!(spawns.len(), 3, "primary worker + fallback worker + verify");
         assert!(spawns[0].argv.contains(&"primary-worker".to_string()));
         assert!(spawns[1].argv.contains(&"fallback-worker".to_string()));
-        assert_eq!(spawns[1].cwd, repo);
+        assert_ne!(spawns[0].cwd, repo);
+        assert_ne!(spawns[1].cwd, repo);
+        assert_ne!(spawns[0].cwd, spawns[1].cwd);
+        assert_ne!(spawns[0].stdout_path, spawns[1].stdout_path);
+        assert_ne!(spawns[0].stderr_path, spawns[1].stderr_path);
 
         let observations = bursar.observations();
         assert_eq!(observations.len(), 1);
@@ -7922,28 +8175,8 @@ dispatch_id = "fake-worker"
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    fn write_worker_commit_stdout(request: &SpawnRequest, summary: &str) {
-        let output = Command::new("git")
-            .args(["commit", "--amend", "--no-edit"])
-            .current_dir(&request.cwd)
-            .envs(request.env.iter().map(|(key, value)| (key, value)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("spawn git commit --amend");
-        assert!(
-            output.status.success(),
-            "git commit --amend failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let commit = git(&request.cwd, &["rev-parse", "HEAD"]);
-        std::fs::write(
-            &request.stdout_path,
-            format!("{summary}\nCONDUCTOR_WORKER_COMMIT: {}\n", commit.trim()),
-        )
-        .expect("write worker stdout");
+    fn write_worker_stdout(request: &SpawnRequest, summary: &str) {
+        std::fs::write(&request.stdout_path, format!("{summary}\n")).expect("write worker stdout");
     }
 
     fn prompt_arg(spawn: &SpawnRequest) -> &str {
@@ -8080,12 +8313,11 @@ dispatch_id = "fake-worker"
             panic!("commit probe should not run")
         }
 
-        fn is_worker_commit(
+        fn is_direct_child(
             &self,
             _repo: &Path,
             _before: Option<&str>,
             _commit: &str,
-            _committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
             panic!("commit probe should not run")
         }
@@ -8123,14 +8355,13 @@ dispatch_id = "fake-worker"
             }
         }
 
-        fn is_worker_commit(
+        fn is_direct_child(
             &self,
             repo: &Path,
             before: Option<&str>,
             commit: &str,
-            committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
-            GitCommitProbe.is_worker_commit(repo, before, commit, committer_email)
+            GitCommitProbe.is_direct_child(repo, before, commit)
         }
     }
 
@@ -8408,7 +8639,7 @@ dispatch_id = "fake-worker"
                     "git",
                     &["commit", "-m", "worker: complete sandbox bead"],
                 );
-                write_worker_commit_stdout(request, "worker ran");
+                write_worker_stdout(request, "worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
@@ -8513,7 +8744,7 @@ dispatch_id = "fake-worker"
                         &["commit", "-m", "worker: verified bursar-d6r artifact"],
                     );
                 }
-                write_worker_commit_stdout(request, "worker ran");
+                write_worker_stdout(request, "worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
@@ -8530,6 +8761,143 @@ dispatch_id = "fake-worker"
                 return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(
                     output.status.code().unwrap_or(1),
                 ))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    struct ForeignCanonicalCommitExec {
+        canonical_repo: PathBuf,
+        worker_spawn: RefCell<Option<SpawnRequest>>,
+        review_spawns: RefCell<usize>,
+    }
+
+    impl ForeignCanonicalCommitExec {
+        fn new(canonical_repo: PathBuf) -> Self {
+            Self {
+                canonical_repo,
+                worker_spawn: RefCell::new(None),
+                review_spawns: RefCell::new(0),
+            }
+        }
+
+        fn worker_spawn(&self) -> SpawnRequest {
+            self.worker_spawn
+                .borrow()
+                .as_ref()
+                .expect("worker spawned")
+                .clone()
+        }
+
+        fn review_spawns(&self) -> usize {
+            *self.review_spawns.borrow()
+        }
+    }
+
+    impl Exec for ForeignCanonicalCommitExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            if request.argv.iter().any(|arg| arg == "senior-reviewer") {
+                *self.review_spawns.borrow_mut() += 1;
+                std::fs::write(&request.stdout_path, br#"{"verdict":"ship","findings":[]}"#)
+                    .expect("write review stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write review stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(0))));
+            }
+            if request.argv.first().map(String::as_str) == Some("pi") {
+                *self.worker_spawn.borrow_mut() = Some(request.clone());
+                std::fs::write(self.canonical_repo.join("worker.txt"), b"foreign\n")
+                    .expect("write foreign change");
+                run(&self.canonical_repo, "git", &["add", "worker.txt"]);
+                let output = Command::new("git")
+                    .args(["commit", "-m", "foreign: forge worker completion"])
+                    .current_dir(&self.canonical_repo)
+                    .envs(request.env.iter().map(|(key, value)| (key, value)))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("spawn forged git commit");
+                assert!(
+                    output.status.success(),
+                    "forged git commit failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let commit = git(&self.canonical_repo, &["rev-parse", "HEAD"]);
+                std::fs::write(
+                    &request.stdout_path,
+                    format!(
+                        "forged worker output\nCONDUCTOR_WORKER_COMMIT: {}\n",
+                        commit.trim()
+                    ),
+                )
+                .expect("write forged worker stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
+                return Ok(Box::new(FakeChild::delayed_success()));
+            }
+            if request.argv.first().map(String::as_str) == Some("sh") {
+                let output = Command::new(&request.argv[0])
+                    .args(&request.argv[1..])
+                    .current_dir(&request.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("spawn verify shell");
+                std::fs::write(&request.stdout_path, &output.stdout).expect("write verify stdout");
+                std::fs::write(&request.stderr_path, &output.stderr).expect("write verify stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(
+                    output.status.code().unwrap_or(1),
+                ))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    struct StaleFirstAttemptExec {
+        canonical_repo: PathBuf,
+        spawns: RefCell<Vec<SpawnRequest>>,
+    }
+
+    impl StaleFirstAttemptExec {
+        fn new(canonical_repo: PathBuf) -> Self {
+            Self {
+                canonical_repo,
+                spawns: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn spawns(&self) -> Vec<SpawnRequest> {
+            self.spawns.borrow().clone()
+        }
+    }
+
+    impl Exec for StaleFirstAttemptExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            self.spawns.borrow_mut().push(request.clone());
+            if request.argv.iter().any(|arg| arg == "fake-worker") {
+                std::fs::write(&request.stdout_path, b"").expect("write primary stdout");
+                std::fs::write(&request.stderr_path, b"HTTP 429 capacity exhausted\n")
+                    .expect("write primary stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
+            }
+            if request.argv.iter().any(|arg| arg == "fallback-worker") {
+                let first = self.spawns.borrow()[0].clone();
+                std::fs::write(self.canonical_repo.join("worker.txt"), b"stale attempt\n")
+                    .expect("write stale change");
+                run(&self.canonical_repo, "git", &["add", "worker.txt"]);
+                run(
+                    &self.canonical_repo,
+                    "git",
+                    &["commit", "-m", "stale: late primary completion"],
+                );
+                let commit = git(&self.canonical_repo, &["rev-parse", "HEAD"]);
+                std::fs::write(
+                    &first.stdout_path,
+                    format!("CONDUCTOR_WORKER_COMMIT: {}\n", commit.trim()),
+                )
+                .expect("write stale primary stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
+                return Ok(Box::new(FakeChild::delayed_success()));
             }
             panic!("unexpected spawn argv: {:?}", request.argv)
         }
@@ -8640,7 +9008,7 @@ dispatch_id = "fake-worker"
                     "git",
                     &["commit", "-m", "worker: fallback complete sandbox bead"],
                 );
-                write_worker_commit_stdout(request, "fallback worker ran");
+                write_worker_stdout(request, "fallback worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
@@ -8745,7 +9113,7 @@ dispatch_id = "fake-worker"
                     "git",
                     &["commit", "-m", "worker: fallback complete sandbox bead"],
                 );
-                write_worker_commit_stdout(request, "fallback worker ran");
+                write_worker_stdout(request, "fallback worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {

@@ -2276,12 +2276,11 @@ mod tests {
             Ok(true)
         }
 
-        fn is_worker_commit(
+        fn is_direct_child(
             &self,
             _repo: &Path,
             _before: Option<&str>,
             _commit: &str,
-            _committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
             Ok(true)
         }

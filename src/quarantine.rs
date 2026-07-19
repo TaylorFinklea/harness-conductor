@@ -448,12 +448,12 @@ where
 }
 
 /// Holds an exclusive, repo-scoped advisory lease for the duration of a
-/// capture/restore. A stable guard file in the checkout's Git directory (or
-/// under `<state_dir>/leases/` for synthetic identities) carries a kernel
-/// whole-file lock, so exactly one process can inspect or replace the separately
-/// committed owner generation. Keeping the guard inode stable is what makes
-/// dead-holder reclaim single-winner: no contender ever unlinks the path another
-/// holder has locked.
+/// capture/restore. A stable guard file in the repository's common Git
+/// directory (or under `<state_dir>/leases/` for synthetic identities) carries
+/// a kernel whole-file lock, so exactly one process can inspect or replace the
+/// separately committed owner generation across state directories and linked
+/// worktrees. Keeping the guard inode stable is what makes dead-holder reclaim
+/// single-winner: no contender ever unlinks the path another holder has locked.
 ///
 /// The owner record is written to a private staging file and atomically
 /// renamed into place only after it is complete. A process crash releases the
@@ -489,14 +489,16 @@ impl RepoLease {
         canonical_repo: &str,
         holder_run_id: &str,
     ) -> Result<Self> {
-        let leases_dir = lease_storage_dir(state_dir, canonical_repo)?;
-        std::fs::create_dir_all(&leases_dir).map_err(|error| {
+        let location = lease_location(state_dir, canonical_repo)?;
+        let leases_dir = &location.leases_dir;
+        let lease_identity = &location.identity;
+        std::fs::create_dir_all(leases_dir).map_err(|error| {
             QuarantineError::CaptureFailed(format!(
                 "failed to create leases dir {}: {error}",
                 leases_dir.display()
             ))
         })?;
-        let key = lease_key(canonical_repo);
+        let key = lease_key(lease_identity);
         let path = leases_dir.join(format!("{key}.lock"));
         let owner_path = leases_dir.join(format!("{key}.owner"));
         let pending_path = leases_dir.join(format!("{key}.owner.pending"));
@@ -556,7 +558,7 @@ impl RepoLease {
 
         let holder_pid = if owner_exists {
             Some(
-                parse_lease_owner(&holder, canonical_repo)
+                parse_lease_owner(&holder, lease_identity)
                     .ok_or_else(|| lease_held_error(canonical_repo, &holder))?
                     .pid,
             )
@@ -573,9 +575,9 @@ impl RepoLease {
         }
 
         remove_stale_pending_owner(&pending_path)?;
-        let generation = lease_generation(canonical_repo, holder_run_id);
+        let generation = lease_generation(lease_identity, holder_run_id);
         let contents = format!(
-            "lease_version=2\ngeneration={generation}\nrun_id={holder_run_id}\npid={}\nrepo={canonical_repo}\n",
+            "lease_version=2\ngeneration={generation}\nrun_id={holder_run_id}\npid={}\nrepo={lease_identity}\n",
             std::process::id()
         );
         if let Err(error) = write_pending_owner(&pending_path, &contents) {
@@ -634,38 +636,73 @@ impl RepoLease {
     }
 }
 
-fn lease_storage_dir(state_dir: &Path, canonical_repo: &str) -> Result<PathBuf> {
+struct LeaseLocation {
+    leases_dir: PathBuf,
+    identity: String,
+}
+
+fn lease_location(state_dir: &Path, canonical_repo: &str) -> Result<LeaseLocation> {
     let repo = Path::new(canonical_repo);
     if !repo.is_dir() {
-        return Ok(state_dir.join("leases"));
+        return Ok(LeaseLocation {
+            leases_dir: state_dir.join("leases"),
+            identity: canonical_repo.to_string(),
+        });
     }
 
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["rev-parse", "--absolute-git-dir"])
+        .args(["rev-parse", "--git-common-dir"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|error| {
             QuarantineError::CaptureFailed(format!(
-                "failed to resolve checkout-scoped lease directory for {canonical_repo}: {error}"
+                "failed to resolve repository-scoped lease directory for {canonical_repo}: {error}"
             ))
         })?;
     if !output.status.success() {
         return Err(QuarantineError::CaptureFailed(format!(
-            "failed to resolve checkout-scoped lease directory for {canonical_repo}: {}",
+            "failed to resolve repository-scoped lease directory for {canonical_repo}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if git_dir.is_empty() {
+    let git_common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if git_common_dir.is_empty() {
         return Err(QuarantineError::CaptureFailed(format!(
-            "git returned an empty checkout-scoped lease directory for {canonical_repo}"
+            "git returned an empty repository-scoped lease directory for {canonical_repo}"
         )));
     }
-    Ok(PathBuf::from(git_dir).join("conductor").join("leases"))
+    let git_common_dir = PathBuf::from(git_common_dir);
+    let git_common_dir = if git_common_dir.is_absolute() {
+        git_common_dir
+    } else {
+        repo.join(git_common_dir)
+    };
+    let git_common_dir = std::fs::canonicalize(&git_common_dir).map_err(|error| {
+        QuarantineError::CaptureFailed(format!(
+            "failed to canonicalize repository-scoped lease directory {}: {error}",
+            git_common_dir.display()
+        ))
+    })?;
+    let identity_path = if git_common_dir.file_name().and_then(|name| name.to_str()) == Some(".git")
+    {
+        git_common_dir.parent().unwrap_or(&git_common_dir)
+    } else {
+        &git_common_dir
+    };
+    let identity = identity_path.to_str().ok_or_else(|| {
+        QuarantineError::CaptureFailed(format!(
+            "repository-scoped lease identity is not UTF-8: {}",
+            identity_path.display()
+        ))
+    })?;
+    Ok(LeaseLocation {
+        leases_dir: git_common_dir.join("conductor").join("leases"),
+        identity: identity.to_string(),
+    })
 }
 
 impl Drop for RepoLease {
@@ -1692,12 +1729,11 @@ mod tests {
             Ok(self.cleans.borrow_mut().remove(0))
         }
 
-        fn is_worker_commit(
+        fn is_direct_child(
             &self,
             _repo: &Path,
             _before: Option<&str>,
             _commit: &str,
-            _committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
             Ok(true)
         }
@@ -2343,6 +2379,89 @@ mod tests {
         let temp = TempDir::new("lease-different-repos");
         let _a = RepoLease::acquire(temp.path(), "/repo/bursar", "run-a").expect("lease a");
         let _b = RepoLease::acquire(temp.path(), "/repo/other", "run-b").expect("lease b");
+    }
+
+    #[test]
+    fn independent_processes_with_distinct_state_dirs_share_checkout_and_linked_worktree_lease() {
+        let temp = TempDir::new("lease-real-checkout-cross-state");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        git_ok(&repo, &["init", "-b", "main"]);
+        git_ok(&repo, &["config", "user.name", "Conductor Test"]);
+        git_ok(
+            &repo,
+            &["config", "user.email", "conductor@example.invalid"],
+        );
+        std::fs::write(repo.join("README.md"), b"base\n").expect("write base");
+        git_ok(&repo, &["add", "README.md"]);
+        git_ok(&repo, &["commit", "-m", "initial"]);
+        let linked = temp.path().join("linked");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().expect("utf8 linked path"),
+            ],
+        );
+
+        for (label, contender_repo) in [("same", repo.as_path()), ("linked", linked.as_path())] {
+            let gate = temp.path().join(format!("gate-{label}"));
+            let first_state = temp.path().join(format!("state-a-{label}"));
+            let second_state = temp.path().join(format!("state-b-{label}"));
+            std::fs::create_dir_all(&gate).expect("mkdir gate");
+            let repo_text = repo.to_str().expect("utf8 repo");
+            let contender_text = contender_repo.to_str().expect("utf8 contender repo");
+
+            let mut first = spawn_lease_process(
+                &first_state,
+                &gate,
+                "a",
+                TestLeaseKind::Repo,
+                repo_text,
+                "run-a",
+                None,
+            );
+            std::fs::write(gate.join("a.go"), b"go\n").expect("release first contender");
+            wait_for_path(&gate.join("a.result"));
+            let first_result =
+                std::fs::read_to_string(gate.join("a.result")).expect("read first result");
+            assert_eq!(first_result, "acquired");
+
+            let mut second = spawn_lease_process(
+                &second_state,
+                &gate,
+                "b",
+                TestLeaseKind::Repo,
+                contender_text,
+                "run-b",
+                None,
+            );
+            std::fs::write(gate.join("b.go"), b"go\n").expect("release second contender");
+            wait_for_path(&gate.join("b.result"));
+            let second_result =
+                std::fs::read_to_string(gate.join("b.result")).expect("read second result");
+
+            std::fs::write(gate.join("a.release"), b"release\n").expect("drop first lease");
+            std::fs::write(gate.join("b.release"), b"release\n").expect("drop second lease");
+            assert!(first.wait().expect("wait first contender").success());
+            assert!(second.wait().expect("wait second contender").success());
+            assert!(
+                second_result.starts_with("refused:"),
+                "{label} checkout used a second lease domain: {second_result}"
+            );
+        }
+    }
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let output = run_git(repo, args).expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

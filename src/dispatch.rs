@@ -9,8 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
-
 use crate::config::{Backend, ReasoningEffort};
 
 const PI_THINKING: &str = "xhigh";
@@ -44,7 +42,7 @@ impl std::error::Error for DispatchError {}
 pub(crate) struct DispatchRequest {
     pub(crate) repo: PathBuf,
     pub(crate) before_head: Option<String>,
-    pub(crate) worker_identity: String,
+    pub(crate) attempt_id: String,
     pub(crate) cycle_id: String,
     pub(crate) bead_id: String,
     pub(crate) backend: Backend,
@@ -192,17 +190,11 @@ impl WorkerHooks for () {}
 pub(crate) trait CommitProbe {
     fn head(&self, repo: &Path) -> Result<Option<String>>;
     fn is_clean(&self, repo: &Path) -> Result<bool>;
-    /// Proves `commit` is the single commit immediately after `before` and
-    /// carries the per-run committer identity injected into the worker's
-    /// process environment. The stdout announcement alone is never ownership
-    /// evidence.
-    fn is_worker_commit(
-        &self,
-        repo: &Path,
-        before: Option<&str>,
-        commit: &str,
-        committer_email: &str,
-    ) -> Result<bool>;
+    /// Proves `commit` is the single commit immediately after `before`.
+    /// Dispatch only invokes this against a parent-created, attempt-specific
+    /// checkout, so the observed checkout HEAD — not worker-controlled stdout
+    /// or Git identity metadata — is the ownership boundary.
+    fn is_direct_child(&self, repo: &Path, before: Option<&str>, commit: &str) -> Result<bool>;
 }
 
 pub(crate) fn run<E: Exec, C: CommitProbe>(
@@ -281,13 +273,10 @@ where
         wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
-    let announced_commit = worker_commit_from_stdout(&spawn.stdout_path)?;
     let (status, worker_commit) = classify(
         process,
         stdout_bytes,
         request.before_head.as_deref(),
-        announced_commit.as_deref(),
-        &worker_committer_email(&request.worker_identity),
         commits,
         &request.repo,
     )?;
@@ -310,8 +299,15 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
             log_dir.display()
         ))
     })?;
-    let stdout_path = log_dir.join(format!("{}.out", request.bead_id));
-    let stderr_path = log_dir.join(format!("{}.err", request.bead_id));
+    let attempt_log_dir = log_dir.join(&request.bead_id);
+    fs::create_dir_all(&attempt_log_dir).map_err(|e| {
+        DispatchError::new(format!(
+            "failed to create attempt log dir {}: {e}",
+            attempt_log_dir.display()
+        ))
+    })?;
+    let stdout_path = attempt_log_dir.join(format!("{}.out", request.attempt_id));
+    let stderr_path = attempt_log_dir.join(format!("{}.err", request.attempt_id));
     File::create(&stdout_path).map_err(|e| {
         DispatchError::new(format!(
             "failed to create stdout log {}: {e}",
@@ -334,27 +330,11 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
             &request.repo,
         )?,
         cwd: request.repo.clone(),
-        env: vec![
-            (
-                "GIT_COMMITTER_NAME".to_string(),
-                "Conductor Worker".to_string(),
-            ),
-            (
-                "GIT_COMMITTER_EMAIL".to_string(),
-                worker_committer_email(&request.worker_identity),
-            ),
-        ],
+        env: Vec::new(),
         stdin: StdinMode::Null,
         stdout_path,
         stderr_path,
     })
-}
-
-fn worker_committer_email(worker_identity: &str) -> String {
-    format!(
-        "conductor-worker+{:x}@invalid",
-        Sha256::digest(worker_identity.as_bytes())
-    )
 }
 
 pub(crate) fn argv_for_backend(
@@ -559,8 +539,6 @@ fn classify<C: CommitProbe + ?Sized>(
     process: ProcessRun,
     stdout_bytes: u64,
     before_head: Option<&str>,
-    announced_commit: Option<&str>,
-    worker_committer_email: &str,
     commits: &C,
     repo: &Path,
 ) -> Result<(DispatchStatus, Option<String>)> {
@@ -578,13 +556,9 @@ fn classify<C: CommitProbe + ?Sized>(
 
     let after_head = commits.head(repo)?;
     if after_head.as_deref() != before_head {
-        if after_head.as_deref() == announced_commit
-            && commits.is_worker_commit(
-                repo,
-                before_head,
-                announced_commit.expect("matched commit"),
-                worker_committer_email,
-            )?
+        if let Some(commit) = after_head.as_deref()
+            && commits.is_direct_child(repo, before_head, commit)?
+            && commits.is_clean(repo)?
         {
             return Ok((DispatchStatus::Success, after_head));
         }
@@ -601,28 +575,6 @@ fn classify<C: CommitProbe + ?Sized>(
     } else {
         Ok((DispatchStatus::Failed(DispatchFailure::NoNewCommit), None))
     }
-}
-
-fn worker_commit_from_stdout(path: &Path) -> Result<Option<String>> {
-    let stdout = fs::read(path).map_err(|e| {
-        DispatchError::new(format!(
-            "failed to read worker stdout {}: {e}",
-            path.display()
-        ))
-    })?;
-    Ok(parse_worker_commit(&String::from_utf8_lossy(&stdout)))
-}
-
-fn parse_worker_commit(stdout: &str) -> Option<String> {
-    const MARKER: &str = "CONDUCTOR_WORKER_COMMIT: ";
-    let line = stdout.lines().rev().find(|line| !line.trim().is_empty())?;
-    let commit = line.strip_prefix(MARKER)?;
-    let valid_len = commit.len() == 40 || commit.len() == 64;
-    (valid_len
-        && commit
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    .then(|| commit.to_string())
 }
 
 fn file_len(path: &Path) -> Result<u64> {
@@ -831,13 +783,7 @@ impl CommitProbe for GitCommitProbe {
         Ok(output.stdout.is_empty())
     }
 
-    fn is_worker_commit(
-        &self,
-        repo: &Path,
-        before: Option<&str>,
-        commit: &str,
-        committer_email: &str,
-    ) -> Result<bool> {
+    fn is_direct_child(&self, repo: &Path, before: Option<&str>, commit: &str) -> Result<bool> {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo)
@@ -860,30 +806,10 @@ impl CommitProbe for GitCommitProbe {
         if fields.next() != Some(commit) {
             return Ok(false);
         }
-        let is_direct_child = match before {
+        Ok(match before {
             Some(parent) => fields.next() == Some(parent) && fields.next().is_none(),
             None => fields.next().is_none(),
-        };
-        if !is_direct_child {
-            return Ok(false);
-        }
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["show", "-s", "--format=%ce", commit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| {
-                DispatchError::new(format!(
-                    "failed to inspect commit identity in {}: {e}",
-                    repo.display()
-                ))
-            })?;
-        Ok(output.status.success()
-            && String::from_utf8_lossy(&output.stdout).trim() == committer_email)
+        })
     }
 }
 
@@ -898,8 +824,7 @@ mod tests {
 
     const BEFORE_COMMIT: &str = "1111111111111111111111111111111111111111";
     const WORKER_COMMIT: &str = "2222222222222222222222222222222222222222";
-    const WORKER_STDOUT: &str =
-        "worker stdout\nCONDUCTOR_WORKER_COMMIT: 2222222222222222222222222222222222222222\n";
+    const WORKER_STDOUT: &str = "worker stdout\n";
 
     /// Adapts a bare heartbeat closure to the [`WorkerHooks`] trait so the
     /// wait-loop tests can drive `on_heartbeat` without a full observer.
@@ -954,12 +879,13 @@ mod tests {
         assert_eq!(spawn.stdin, StdinMode::Null);
         assert_eq!(
             spawn.stdout_path,
-            temp.path().join("logs/cycle-1/bead-1.out")
+            temp.path().join("logs/cycle-1/bead-1/001-worker.out")
         );
         assert_eq!(
             spawn.stderr_path,
-            temp.path().join("logs/cycle-1/bead-1.err")
+            temp.path().join("logs/cycle-1/bead-1/001-worker.err")
         );
+        assert!(spawn.env.is_empty());
     }
 
     #[test]
@@ -1357,11 +1283,11 @@ mod tests {
 
         assert_eq!(
             result.stdout_path,
-            temp.path().join("logs/cycle-1/bead-1.out")
+            temp.path().join("logs/cycle-1/bead-1/001-worker.out")
         );
         assert_eq!(
             result.stderr_path,
-            temp.path().join("logs/cycle-1/bead-1.err")
+            temp.path().join("logs/cycle-1/bead-1/001-worker.err")
         );
         assert_eq!(
             std::fs::read_to_string(&result.stdout_path).unwrap(),
@@ -1461,8 +1387,8 @@ mod tests {
     }
 
     #[test]
-    fn worker_that_only_announces_a_foreign_direct_child_is_unauthenticated() {
-        let temp = TempDir::new("foreign-announced-direct-child");
+    fn parent_observes_a_clean_direct_child_in_the_attempt_checkout() {
+        let temp = TempDir::new("observed-direct-child");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         git(&repo, &["init"]);
@@ -1483,7 +1409,7 @@ mod tests {
         );
 
         let result = run(
-            &ForeignOnlyExec,
+            &DirectChildExec,
             &GitCommitProbe,
             &request,
             temp.path(),
@@ -1491,12 +1417,11 @@ mod tests {
         )
         .expect("dispatch result");
 
+        assert_eq!(result.status, DispatchStatus::Success);
         assert_eq!(
-            result.status,
-            DispatchStatus::Failed(DispatchFailure::UnauthenticatedCommit),
-            "announcing a foreign sole direct child must not prove worker ownership"
+            result.worker_commit.as_deref(),
+            Some(git(&repo, &["rev-parse", "HEAD"]).as_str())
         );
-        assert_eq!(result.worker_commit, None);
     }
 
     #[test]
@@ -1547,7 +1472,7 @@ mod tests {
         DispatchRequest {
             repo: repo.to_path_buf(),
             before_head: before_head.map(str::to_string),
-            worker_identity: "run-1".to_string(),
+            attempt_id: "001-worker".to_string(),
             cycle_id: "cycle-1".to_string(),
             bead_id: "bead-1".to_string(),
             backend,
@@ -1624,9 +1549,9 @@ mod tests {
 
     struct ForeignThenWorkerExec;
 
-    struct ForeignOnlyExec;
+    struct DirectChildExec;
 
-    impl Exec for ForeignOnlyExec {
+    impl Exec for DirectChildExec {
         fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>> {
             std::fs::write(request.cwd.join("foreign.txt"), b"foreign\n")
                 .expect("write foreign change");
@@ -1635,12 +1560,8 @@ mod tests {
                 &request.cwd,
                 &["commit", "-m", "foreign: concurrent change"],
             );
-            let foreign_commit = git(&request.cwd, &["rev-parse", "HEAD"]);
-            std::fs::write(
-                &request.stdout_path,
-                format!("CONDUCTOR_WORKER_COMMIT: {foreign_commit}\n"),
-            )
-            .expect("write worker stdout");
+            std::fs::write(&request.stdout_path, b"worker complete\n")
+                .expect("write worker stdout");
             std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
             Ok(Box::new(FakeChild::success(Rc::new(RefCell::new(
                 Vec::new(),
@@ -1818,14 +1739,13 @@ mod tests {
             Ok(true)
         }
 
-        fn is_worker_commit(
+        fn is_direct_child(
             &self,
             _repo: &Path,
             _before: Option<&str>,
-            _commit: &str,
-            _committer_email: &str,
+            commit: &str,
         ) -> Result<bool> {
-            Ok(true)
+            Ok(matches!(commit, WORKER_COMMIT | "after"))
         }
     }
 
