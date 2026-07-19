@@ -20,13 +20,26 @@ pub(crate) type Result<T> = std::result::Result<T, DispatchError>;
 #[derive(Debug, Clone)]
 pub(crate) struct DispatchError {
     message: String,
+    worker_state_uncertain: bool,
 }
 
 impl DispatchError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            worker_state_uncertain: false,
         }
+    }
+
+    fn worker_state_uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            worker_state_uncertain: true,
+        }
+    }
+
+    pub(crate) const fn leaves_worker_state_uncertain(&self) -> bool {
+        self.worker_state_uncertain
     }
 }
 
@@ -148,6 +161,15 @@ pub(crate) trait ChildProcess {
     fn id(&self) -> Option<u32> {
         None
     }
+    /// Proves that the worker's process group has no surviving descendants
+    /// after the direct child exits. A real worker may fork background tools
+    /// that outlive the harness process; those descendants must be terminated
+    /// before an attempt checkout is removed or a fallback checkout is
+    /// created. Test doubles without an OS pid have no recorded group to
+    /// prove.
+    fn ensure_process_group_quiescent(&mut self) -> Result<()> {
+        self.id().map_or(Ok(()), ensure_process_group_quiescent)
+    }
 }
 
 /// Callbacks the worker runtime invokes around a dispatched worker's lifetime.
@@ -266,8 +288,12 @@ where
     // (and any descendants) down rather than let a worker whose identity we
     // cannot prove keep running unattended.
     if let Err(error) = hooks.on_spawn(child.id()) {
-        terminate_and_reap_best_effort(child.as_mut());
-        return Err(error);
+        if terminate_and_reap_best_effort(child.as_mut()) {
+            return Err(error);
+        }
+        return Err(DispatchError::worker_state_uncertain(format!(
+            "{error}; spawned worker process group could not be proven quiescent"
+        )));
     }
     let process =
         wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
@@ -485,11 +511,16 @@ where
                 // running and writing to the repository. Terminate and reap
                 // the whole group before propagating so no orphaned writer
                 // can outlive the `dispatch_error` this returns.
-                terminate_and_reap_best_effort(child);
-                return Err(error);
+                if terminate_and_reap_best_effort(child) {
+                    return Err(error);
+                }
+                return Err(DispatchError::worker_state_uncertain(format!(
+                    "{error}; worker process group could not be proven quiescent"
+                )));
             }
         };
         if let Some(status) = status {
+            ensure_child_process_group_quiescent(child)?;
             return Ok(ProcessRun {
                 status,
                 timed_out: false,
@@ -500,13 +531,18 @@ where
             // Same reasoning as above: a heartbeat failure (e.g. the live
             // report patch call erroring) must not leave the worker running
             // unattended after this function returns an error.
-            terminate_and_reap_best_effort(child);
-            return Err(error);
+            if terminate_and_reap_best_effort(child) {
+                return Err(error);
+            }
+            return Err(DispatchError::worker_state_uncertain(format!(
+                "{error}; worker process group could not be proven quiescent"
+            )));
         }
     }
 
     let _ = child.terminate();
     if let Ok(Some(status)) = child.wait_for(KILL_GRACE) {
+        ensure_child_process_group_quiescent(child)?;
         return Ok(ProcessRun {
             status,
             timed_out: true,
@@ -515,6 +551,7 @@ where
 
     let _ = child.kill();
     let status = child.wait()?;
+    ensure_child_process_group_quiescent(child)?;
     Ok(ProcessRun {
         status,
         timed_out: true,
@@ -528,11 +565,20 @@ where
 /// about to propagate a different error and cannot usefully report this
 /// one too — an orphaned worker that keeps writing after Conductor has
 /// moved on is worse than losing a diagnostic about noisy termination.
-fn terminate_and_reap_best_effort(child: &mut dyn ChildProcess) {
+fn terminate_and_reap_best_effort(child: &mut dyn ChildProcess) -> bool {
     let _ = child.terminate();
     let _ = child.wait_for(KILL_GRACE);
     let _ = child.kill();
     let _ = child.wait();
+    child.ensure_process_group_quiescent().is_ok()
+}
+
+fn ensure_child_process_group_quiescent(child: &mut dyn ChildProcess) -> Result<()> {
+    child.ensure_process_group_quiescent().map_err(|error| {
+        DispatchError::worker_state_uncertain(format!(
+            "worker process-group quiescence could not be proven: {error}"
+        ))
+    })
 }
 
 fn classify<C: CommitProbe + ?Sized>(
@@ -726,6 +772,48 @@ fn send_signal_to_group(_pid: u32, _signal: &str) -> Result<()> {
     Err(DispatchError::new(
         "process-group signal handling is only implemented on Unix",
     ))
+}
+
+#[cfg(unix)]
+fn ensure_process_group_quiescent(pgid: u32) -> Result<()> {
+    if !crate::quarantine::process_group_alive(pgid) {
+        return Ok(());
+    }
+
+    let _ = send_signal_to_group(pgid, "-TERM");
+    if wait_for_process_group_exit(pgid, KILL_GRACE) {
+        return Ok(());
+    }
+
+    let _ = send_signal_to_group(pgid, "-KILL");
+    if wait_for_process_group_exit(pgid, KILL_GRACE) {
+        Ok(())
+    } else {
+        Err(DispatchError::worker_state_uncertain(format!(
+            "worker process group {pgid} remained alive after TERM/KILL escalation"
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_process_group_quiescent(_pgid: u32) -> Result<()> {
+    Err(DispatchError::worker_state_uncertain(
+        "worker process-group quiescence is only implemented on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_exit(pgid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !crate::quarantine::process_group_alive(pgid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(WAIT_POLL);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

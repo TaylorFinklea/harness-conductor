@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,20 @@ pub(crate) struct DispatchCycleOptions {
     resume: bool,
     #[cfg(test)]
     interrupt_before_review: bool,
+    #[cfg(test)]
+    promotion_interruption: Option<PromotionInterruption>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "each variant is named for the promotion step it interrupts after"
+)]
+enum PromotionInterruption {
+    AfterMergeBeforeReceipt,
+    AfterReceiptBeforeCleanup,
+    AfterCleanupBeforeAttemptFinished,
 }
 
 impl DispatchCycleOptions {
@@ -58,6 +73,8 @@ impl DispatchCycleOptions {
             resume,
             #[cfg(test)]
             interrupt_before_review: false,
+            #[cfg(test)]
+            promotion_interruption: None,
         }
     }
 
@@ -68,6 +85,7 @@ impl DispatchCycleOptions {
             heartbeat_interval,
             resume: false,
             interrupt_before_review: false,
+            promotion_interruption: None,
         }
     }
 
@@ -80,6 +98,12 @@ impl DispatchCycleOptions {
     #[cfg(test)]
     pub(crate) const fn resume(mut self) -> Self {
         self.resume = true;
+        self
+    }
+
+    #[cfg(test)]
+    const fn interrupt_promotion_at(mut self, boundary: PromotionInterruption) -> Self {
+        self.promotion_interruption = Some(boundary);
         self
     }
 }
@@ -109,6 +133,7 @@ pub(crate) struct DispatchCycleResult {
 pub(crate) enum DispatchCycleError {
     NotAnswered,
     Message(String),
+    RecoveryRequired(String),
 }
 
 impl DispatchCycleError {
@@ -119,13 +144,21 @@ impl DispatchCycleError {
     fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
     }
+
+    fn recovery_required(message: impl Into<String>) -> Self {
+        Self::RecoveryRequired(message.into())
+    }
+
+    const fn preserves_claim(&self) -> bool {
+        matches!(self, Self::RecoveryRequired(_))
+    }
 }
 
 impl fmt::Display for DispatchCycleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotAnswered => f.write_str("dispatch-plan not yet answered"),
-            Self::Message(message) => f.write_str(message),
+            Self::Message(message) | Self::RecoveryRequired(message) => f.write_str(message),
         }
     }
 }
@@ -501,6 +534,103 @@ struct AttemptCheckout {
     active: bool,
 }
 
+const PROMOTION_SCHEMA: &str = "conductor/promotion@1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PromotionPhase {
+    Intent,
+    Promoted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromotionRecord {
+    schema: String,
+    cycle_id: String,
+    repo: String,
+    bead: String,
+    attempt_id: String,
+    worker_profile: String,
+    before_head: String,
+    worker_commit: String,
+    phase: PromotionPhase,
+}
+
+fn promotion_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("promotion.json")
+}
+
+fn write_promotion_record(
+    run_dir: &Path,
+    record: &PromotionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    let path = promotion_path(run_dir);
+    let pending = run_dir.join("promotion.json.pending");
+    let mut bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+        DispatchCycleError::message(format!("serialize promotion record: {error}"))
+    })?;
+    bytes.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&pending)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "open pending promotion record {}: {error}",
+                pending.display()
+            ))
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "write pending promotion record {}: {error}",
+            pending.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        DispatchCycleError::message(format!(
+            "sync pending promotion record {}: {error}",
+            pending.display()
+        ))
+    })?;
+    std::fs::rename(&pending, &path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "commit promotion record {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_promotion_record(
+    run_dir: &Path,
+) -> std::result::Result<Option<PromotionRecord>, DispatchCycleError> {
+    let path = promotion_path(run_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(DispatchCycleError::message(format!(
+                "read promotion record {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let record: PromotionRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "parse promotion record {}: {error}",
+            path.display()
+        ))
+    })?;
+    if record.schema != PROMOTION_SCHEMA {
+        return Err(DispatchCycleError::message(format!(
+            "unsupported promotion schema {:?}",
+            record.schema
+        )));
+    }
+    Ok(Some(record))
+}
+
 impl AttemptCheckout {
     fn create(
         canonical_repo: &Path,
@@ -584,6 +714,10 @@ impl AttemptCheckout {
         self.active = false;
         Ok(())
     }
+
+    fn preserve_for_recovery(&mut self) {
+        self.active = false;
+    }
 }
 
 impl Drop for AttemptCheckout {
@@ -602,11 +736,115 @@ impl Drop for AttemptCheckout {
     }
 }
 
+fn cleanup_run_attempt_worktrees(
+    canonical_repo: &Path,
+    run_dir: &Path,
+) -> std::result::Result<(), DispatchCycleError> {
+    let canonical_run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize stale run directory {}: {error}",
+            run_dir.display()
+        ))
+    })?;
+    let attempt_root = canonical_run_dir.join("attempt-checkouts");
+    let listed = git_worktree_paths(canonical_repo)?;
+    for worktree in listed {
+        let comparable = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
+        if !comparable.starts_with(&attempt_root) {
+            continue;
+        }
+        if worktree.exists() {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(canonical_repo)
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .map_err(|error| {
+                    DispatchCycleError::message(format!(
+                        "remove stale attempt worktree {}: {error}",
+                        worktree.display()
+                    ))
+                })?;
+            if !output.status.success() {
+                return Err(DispatchCycleError::message(format!(
+                    "remove stale attempt worktree {} failed: {}",
+                    worktree.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+    }
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(canonical_repo)
+        .args(["worktree", "prune"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| DispatchCycleError::message(format!("prune stale worktrees: {error}")))?;
+    if !output.status.success() {
+        return Err(DispatchCycleError::message(format!(
+            "prune stale worktrees failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if git_worktree_paths(canonical_repo)?.into_iter().any(|worktree| {
+        std::fs::canonicalize(&worktree)
+            .unwrap_or(worktree)
+            .starts_with(&attempt_root)
+    }) {
+        return Err(DispatchCycleError::message(format!(
+            "stale attempt worktrees remain registered under {}",
+            attempt_root.display()
+        )));
+    }
+    Ok(())
+}
+
+fn git_worktree_paths(
+    canonical_repo: &Path,
+) -> std::result::Result<Vec<PathBuf>, DispatchCycleError> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(canonical_repo)
+        .args(["worktree", "list", "--porcelain"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| DispatchCycleError::message(format!("list git worktrees: {error}")))?;
+    if !output.status.success() {
+        return Err(DispatchCycleError::message(format!(
+            "list git worktrees failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "promotion binds the worker commit to its leased attempt and durable receipt explicitly"
+)]
 fn promote_attempt_commit<C: CommitProbe + ?Sized>(
     commits: &C,
     canonical_repo: &Path,
     before_head: Option<&str>,
     worker_commit: &str,
+    attempt_id: &str,
+    worker_profile: &str,
+    run_artifacts: &RunHandle,
+    options: &DispatchCycleOptions,
 ) -> std::result::Result<(), DispatchCycleError> {
     let current_head = commits
         .head(canonical_repo)
@@ -627,6 +865,31 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         ));
     }
 
+    let work = run_artifacts
+        .work()
+        .ok_or_else(|| DispatchCycleError::message("promotion requires work run state"))?;
+    let bead = run_artifacts
+        .manifest()
+        .target
+        .bead
+        .clone()
+        .ok_or_else(|| DispatchCycleError::message("promotion requires a Bead target"))?;
+    let before_head = before_head.ok_or_else(|| {
+        DispatchCycleError::message("promotion requires a recorded before_head")
+    })?;
+    let mut promotion = PromotionRecord {
+        schema: PROMOTION_SCHEMA.to_string(),
+        cycle_id: work.cycle_id.clone(),
+        repo: run_artifacts.manifest().target.repo.clone(),
+        bead,
+        attempt_id: attempt_id.to_string(),
+        worker_profile: worker_profile.to_string(),
+        before_head: before_head.to_string(),
+        worker_commit: worker_commit.to_string(),
+        phase: PromotionPhase::Intent,
+    };
+    write_promotion_record(run_artifacts.dir(), &promotion)?;
+
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(canonical_repo)
@@ -644,6 +907,17 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+    if interrupt_after_promotion_merge(options) {
+        return Err(DispatchCycleError::recovery_required(
+            "simulated process interruption after promotion merge before receipt",
+        ));
+    }
+    promotion.phase = PromotionPhase::Promoted;
+    write_promotion_record(run_artifacts.dir(), &promotion).map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "canonical promotion completed but receipt persistence failed: {error}"
+        ))
+    })?;
     let promoted_head = commits
         .head(canonical_repo)
         .map_err(|error| DispatchCycleError::message(format!("promoted git head: {error}")))?;
@@ -654,6 +928,85 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         )));
     }
     Ok(())
+}
+
+fn interrupt_after_promotion_merge(options: &DispatchCycleOptions) -> bool {
+    #[cfg(test)]
+    {
+        options.promotion_interruption
+            == Some(PromotionInterruption::AfterMergeBeforeReceipt)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        false
+    }
+}
+
+fn interrupt_after_promotion_receipt(options: &DispatchCycleOptions) -> bool {
+    #[cfg(test)]
+    {
+        options.promotion_interruption
+            == Some(PromotionInterruption::AfterReceiptBeforeCleanup)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        false
+    }
+}
+
+fn interrupt_before_attempt_finished(options: &DispatchCycleOptions) -> bool {
+    #[cfg(test)]
+    {
+        options.promotion_interruption
+            == Some(PromotionInterruption::AfterCleanupBeforeAttemptFinished)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        false
+    }
+}
+
+fn find_promoted_work_run<C: CommitProbe + ?Sized>(
+    commits: &C,
+    state_dir: &Path,
+    cycle_id: &str,
+    canonical_repo: &str,
+    repo_path: &Path,
+    bead: &str,
+) -> std::result::Result<Option<(String, PromotionRecord)>, DispatchCycleError> {
+    let Some(run_id) = crate::run::find_implementing_work_run(
+        state_dir,
+        cycle_id,
+        canonical_repo,
+        bead,
+    )
+    .map_err(run_artifact_error)?
+    else {
+        return Ok(None);
+    };
+    let run_artifacts = RunHandle::open(state_dir, &run_id).map_err(run_artifact_error)?;
+    let Some(promotion) = read_promotion_record(run_artifacts.dir())? else {
+        return Ok(None);
+    };
+    if promotion.cycle_id != cycle_id
+        || promotion.repo != canonical_repo
+        || promotion.bead != bead
+    {
+        return Err(DispatchCycleError::message(
+            "promotion record does not match its implementing run target",
+        ));
+    }
+    let head = commits
+        .head(repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("promotion recovery head: {error}")))?;
+    if head.as_deref() == Some(promotion.worker_commit.as_str()) {
+        Ok(Some((run_id, promotion)))
+    } else {
+        Ok(None)
+    }
 }
 
 #[expect(
@@ -712,6 +1065,41 @@ fn dispatch_one<
             });
         }
     };
+    if let Some((run_id, promotion)) = find_promoted_work_run(
+        commits,
+        state_dir,
+        cycle_id,
+        &canonical_repo,
+        &repo_path,
+        &item.issue_id,
+    )? {
+        if !options.resume {
+            return Err(DispatchCycleError::message(
+                "promoted worker recovery requires explicit dispatch --resume",
+            ));
+        }
+        return resume_promoted_work(
+            cfg,
+            bd,
+            exec,
+            commits,
+            state_dir,
+            ledger_path,
+            cycle_id,
+            options,
+            live,
+            report_path,
+            cycle_start,
+            item,
+            progress,
+            roster,
+            &repo_path,
+            &canonical_repo,
+            &current,
+            &run_id,
+            &promotion,
+        );
+    }
     let pending_run =
         crate::run::find_pending_work_run(state_dir, cycle_id, &canonical_repo, &item.issue_id)
             .map_err(run_artifact_error)?;
@@ -1033,6 +1421,7 @@ fn dispatch_one<
     );
     let worker_outcome = match worker_outcome {
         Ok(outcome) => outcome,
+        Err(error) if error.preserves_claim() => return Err(error),
         Err(error) => {
             let _ = bd.release(&repo_path, &item.issue_id);
             let _ = bd.comment(
@@ -1094,6 +1483,64 @@ fn dispatch_one<
             });
         }
     };
+    complete_worker_verification(
+        cfg,
+        bd,
+        exec,
+        commits,
+        state_dir,
+        ledger_path,
+        cycle_id,
+        options,
+        live,
+        report_path,
+        cycle_start,
+        item,
+        progress,
+        roster,
+        &repo_path,
+        &canonical_repo,
+        &claimed,
+        &extracted,
+        before_head,
+        run_artifacts,
+        worker_attempt,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "shared fresh/recovered promotion verification preserves one audited close path"
+)]
+fn complete_worker_verification<
+    B: BdClient + ?Sized,
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+    L: LiveSink + ?Sized,
+>(
+    cfg: &Config,
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    state_dir: &Path,
+    ledger_path: &Path,
+    cycle_id: &str,
+    options: &DispatchCycleOptions,
+    live: &L,
+    report_path: &Path,
+    cycle_start: Instant,
+    item: &PlannedItem,
+    progress: Option<f64>,
+    selected_roster: &RosterEntry,
+    repo_path: &Path,
+    canonical_repo: &str,
+    claimed: &Issue,
+    extracted: &ExtractedFields,
+    before_head: Option<String>,
+    mut run_artifacts: RunHandle,
+    worker_attempt: WorkerAttempt,
+) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
     let active_roster = worker_attempt.roster;
 
     if let Err(error) = patch_live(
@@ -1105,7 +1552,7 @@ fn dispatch_one<
     ) {
         return Err(finish_and_release_claim(
             bd,
-            &repo_path,
+            repo_path,
             &item.issue_id,
             &mut run_artifacts,
             "report_update_error",
@@ -1113,7 +1560,7 @@ fn dispatch_one<
         ));
     }
     let mut verify_request = VerifyRequest {
-        repo: repo_path.clone(),
+        repo: repo_path.to_path_buf(),
         state_dir: state_dir.to_path_buf(),
         cycle_id: cycle_id.to_string(),
         issue: claimed.clone(),
@@ -1134,7 +1581,7 @@ fn dispatch_one<
         Err(error) => {
             return Err(finish_and_release_claim(
                 bd,
-                &repo_path,
+                repo_path,
                 &item.issue_id,
                 &mut run_artifacts,
                 "verify_error",
@@ -1158,8 +1605,8 @@ fn dispatch_one<
                 cfg,
                 ledger_path,
                 &item.repo,
-                &claimed,
-                &extracted,
+                claimed,
+                extracted,
                 &active_roster,
                 cycle_id,
                 &outcome,
@@ -1176,7 +1623,7 @@ fn dispatch_one<
             Err(error) => {
                 return Err(finish_and_release_claim(
                     bd,
-                    &repo_path,
+                    repo_path,
                     &item.issue_id,
                     &mut run_artifacts,
                     "post_verify_error",
@@ -1192,7 +1639,7 @@ fn dispatch_one<
     ) {
         return Err(finish_and_release_claim(
             bd,
-            &repo_path,
+            repo_path,
             &item.issue_id,
             &mut run_artifacts,
             "checkpoint_error",
@@ -1230,7 +1677,7 @@ fn dispatch_one<
             "simulated process interruption before qualitative review",
         ));
     }
-    let review_issue = bd.show(&repo_path, &item.issue_id).map_err(|error| {
+    let review_issue = bd.show(repo_path, &item.issue_id).map_err(|error| {
         DispatchCycleError::message(format!("qualitative-review claim re-fetch: {error}"))
     })?;
     if review_issue.status != "in_progress"
@@ -1240,14 +1687,14 @@ fn dispatch_one<
             "qualitative-review claim is no longer held by conductor",
         ));
     }
-    validate_item_authorization(cfg, item, roster, &canonical_repo, &review_issue).map_err(
+    validate_item_authorization(cfg, item, selected_roster, canonical_repo, &review_issue).map_err(
         |reason| {
             DispatchCycleError::message(format!(
                 "qualitative-review approval changed after checkpoint: {reason}"
             ))
         },
     )?;
-    if !head_matches_clean(commits, &repo_path, &worker_commit)? {
+    if !head_matches_clean(commits, repo_path, &worker_commit)? {
         return Err(DispatchCycleError::message(
             "repository changed after the pending-review checkpoint",
         ));
@@ -1274,7 +1721,7 @@ fn dispatch_one<
             ledger_path,
             &item.repo,
             &verify_request.issue,
-            &extracted,
+            extracted,
             cycle_id,
             &outcome,
         )?;
@@ -1284,7 +1731,7 @@ fn dispatch_one<
             ledger_path,
             &item.repo,
             &verify_request.issue,
-            &extracted,
+            extracted,
             &active_roster,
             cycle_id,
             &outcome,
@@ -1294,6 +1741,256 @@ fn dispatch_one<
         decision: Some(outcome.decision),
         dispatches: worker_attempt.attempts + outcome.review_dispatches,
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "promotion recovery revalidates every durable identity before verification"
+)]
+fn resume_promoted_work<
+    B: BdClient + ?Sized,
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+    L: LiveSink + ?Sized,
+>(
+    cfg: &Config,
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    state_dir: &Path,
+    ledger_path: &Path,
+    cycle_id: &str,
+    options: &DispatchCycleOptions,
+    live: &L,
+    report_path: &Path,
+    cycle_start: Instant,
+    item: &PlannedItem,
+    progress: Option<f64>,
+    selected_roster: &RosterEntry,
+    repo_path: &Path,
+    canonical_repo: &str,
+    current: &Issue,
+    run_id: &str,
+    preflight_promotion: &PromotionRecord,
+) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
+    if !options.resume {
+        return Err(DispatchCycleError::message(
+            "promoted worker recovery requires explicit dispatch --resume",
+        ));
+    }
+    if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
+        return Err(DispatchCycleError::message(
+            "promoted worker claim is no longer held by conductor",
+        ));
+    }
+
+    let preflight_run = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    validate_promoted_work(
+        &preflight_run,
+        item,
+        cycle_id,
+        canonical_repo,
+        preflight_promotion,
+    )?;
+    authenticate_pending_review_owner(&preflight_run)?;
+    drop(preflight_run);
+
+    let _promotion_lease = quarantine::RepoLease::acquire(state_dir, canonical_repo, run_id)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "promoted worker repository lease unavailable: {error}"
+            ))
+        })?;
+    let current = bd.show(repo_path, &item.issue_id).map_err(|error| {
+        DispatchCycleError::message(format!("promoted worker claim re-fetch: {error}"))
+    })?;
+    if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
+        return Err(DispatchCycleError::message(
+            "promoted worker claim is no longer held by conductor",
+        ));
+    }
+    let extracted = validate_item_authorization(
+        cfg,
+        item,
+        selected_roster,
+        canonical_repo,
+        &current,
+    )
+    .map_err(|reason| {
+        DispatchCycleError::message(format!("promoted worker approval is stale: {reason}"))
+    })?;
+    let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    let mut promotion = read_promotion_record(run_artifacts.dir())?.ok_or_else(|| {
+        DispatchCycleError::message("promoted worker run lost its promotion record")
+    })?;
+    let work = validate_promoted_work(
+        &run_artifacts,
+        item,
+        cycle_id,
+        canonical_repo,
+        &promotion,
+    )?;
+    authenticate_pending_review_owner(&run_artifacts)?;
+    validate_pending_approval(
+        &run_artifacts.approval().map_err(run_artifact_error)?,
+        item,
+        cycle_id,
+        canonical_repo,
+    )?;
+
+    let current_head = commits
+        .head(repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("promotion resume head: {error}")))?;
+    if current_head.as_deref() != Some(promotion.worker_commit.as_str()) {
+        return Err(DispatchCycleError::message(format!(
+            "promoted worker HEAD changed: expected {}, found {}",
+            promotion.worker_commit,
+            current_head.as_deref().unwrap_or("<none>")
+        )));
+    }
+    if !commits
+        .is_clean(repo_path)
+        .map_err(|error| DispatchCycleError::message(format!("promotion resume status: {error}")))?
+    {
+        return Err(DispatchCycleError::message(
+            "promoted worker repository is dirty",
+        ));
+    }
+    if !commits
+        .is_direct_child(
+            repo_path,
+            Some(promotion.before_head.as_str()),
+            &promotion.worker_commit,
+        )
+        .map_err(|error| {
+            DispatchCycleError::message(format!("promotion resume parent check: {error}"))
+        })?
+    {
+        return Err(DispatchCycleError::message(
+            "promoted worker commit is not the recorded base's direct child",
+        ));
+    }
+
+    if promotion.phase == PromotionPhase::Intent {
+        promotion.phase = PromotionPhase::Promoted;
+        write_promotion_record(run_artifacts.dir(), &promotion).map_err(|error| {
+            DispatchCycleError::recovery_required(format!(
+                "promoted HEAD is authenticated but receipt persistence still fails: {error}"
+            ))
+        })?;
+    }
+    cleanup_run_attempt_worktrees(repo_path, run_artifacts.dir())?;
+
+    let events = crate::run::read_events(&run_artifacts.events_path()).map_err(run_artifact_error)?;
+    let finished_attempts = events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::AttemptFinished
+                && event.profile_id.as_deref() == Some(promotion.worker_profile.as_str())
+        })
+        .count();
+    if finished_attempts == 0 {
+        run_artifacts
+            .append_event(
+                EventKind::AttemptFinished,
+                EventInput {
+                    profile_id: Some(promotion.worker_profile.clone()),
+                    outcome: Some(format!(
+                        "success_recovered:{}:{}",
+                        promotion.attempt_id, promotion.worker_commit
+                    )),
+                    ..EventInput::default()
+                },
+            )
+            .map_err(run_artifact_error)?;
+    } else if finished_attempts != 1 {
+        return Err(DispatchCycleError::message(
+            "promoted worker run has duplicate attempt-finished events",
+        ));
+    }
+
+    let approved_chain = fallback_chain(
+        &cfg.roster,
+        selected_roster,
+        item.approved_route.as_ref(),
+        cfg.budgets.use_bursar,
+    )?;
+    let active_roster = approved_chain
+        .into_iter()
+        .find(|entry| entry.name == promotion.worker_profile)
+        .ok_or_else(|| {
+            DispatchCycleError::message(
+                "promoted worker profile is outside the approved provider envelope",
+            )
+        })?;
+    let log_dir = state_dir.join("logs").join(cycle_id).join(&item.issue_id);
+    let worker_attempt = WorkerAttempt {
+        roster: active_roster,
+        result: dispatch::DispatchResult {
+            status: dispatch::DispatchStatus::Success,
+            worker_commit: Some(promotion.worker_commit.clone()),
+            stdout_path: log_dir.join(format!("{}.out", promotion.attempt_id)),
+            stderr_path: log_dir.join(format!("{}.err", promotion.attempt_id)),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        },
+        attempts: 0,
+    };
+    complete_worker_verification(
+        cfg,
+        bd,
+        exec,
+        commits,
+        state_dir,
+        ledger_path,
+        cycle_id,
+        options,
+        live,
+        report_path,
+        cycle_start,
+        item,
+        progress,
+        selected_roster,
+        repo_path,
+        canonical_repo,
+        &current,
+        &extracted,
+        work.before_head,
+        run_artifacts,
+        worker_attempt,
+    )
+}
+
+fn validate_promoted_work(
+    run_artifacts: &RunHandle,
+    item: &PlannedItem,
+    cycle_id: &str,
+    canonical_repo: &str,
+    promotion: &PromotionRecord,
+) -> std::result::Result<WorkState, DispatchCycleError> {
+    let work = run_artifacts
+        .work()
+        .cloned()
+        .ok_or_else(|| DispatchCycleError::message("promoted run has no work state"))?;
+    if work.stage != WorkStage::Implementing
+        || work.cycle_id != cycle_id
+        || work.authorization_sha256 != item.authorization_sha256
+        || work.before_head.as_deref() != Some(promotion.before_head.as_str())
+        || run_artifacts.manifest().target.repo != canonical_repo
+        || run_artifacts.manifest().target.bead.as_deref() != Some(item.issue_id.as_str())
+        || promotion.schema != PROMOTION_SCHEMA
+        || promotion.cycle_id != cycle_id
+        || promotion.repo != canonical_repo
+        || promotion.bead != item.issue_id
+        || promotion.attempt_id.trim().is_empty()
+        || promotion.worker_profile.trim().is_empty()
+    {
+        return Err(DispatchCycleError::message(
+            "promoted run does not match the approved cycle item",
+        ));
+    }
+    Ok(work)
 }
 
 #[expect(
@@ -1818,6 +2515,22 @@ where
                     &item.issue_id,
                     &attempt_id,
                 )?;
+                if error.leaves_worker_state_uncertain() {
+                    attempt_checkout.preserve_for_recovery();
+                    let _ = run_artifacts.append_event(
+                        EventKind::AttemptFinished,
+                        EventInput {
+                            profile_id: Some(roster.name.clone()),
+                            artifact_refs,
+                            outcome: Some(format!(
+                                "worker_state_uncertain; recovery required: {error}"
+                            )),
+                        },
+                    );
+                    return Err(DispatchCycleError::recovery_required(format!(
+                        "worker process-group quiescence is unproven; claim and attempt checkout retained for dispatch --resume: {error}"
+                    )));
+                }
                 let cleanup = attempt_checkout.cleanup();
                 run_artifacts
                     .append_event(
@@ -1836,19 +2549,34 @@ where
         let mut result = result;
         let mut artifact_refs = capture_dispatch_result(run_artifacts, &attempt_id, &result)?;
         let mut outcome_label = dispatch_status_label(&result.status);
-        let worker_succeeded = matches!(result.status, dispatch::DispatchStatus::Success);
+        let mut worker_succeeded = matches!(result.status, dispatch::DispatchStatus::Success);
         if worker_succeeded {
             let worker_commit = result.worker_commit.as_deref().ok_or_else(|| {
                 DispatchCycleError::message("successful isolated worker has no observed commit")
             })?;
-            if let Err(error) =
-                promote_attempt_commit(commits, repo_path, before_head, worker_commit)
-            {
-                outcome_label = format!("unauthenticated_commit; promotion refused: {error}");
-                result.status = dispatch::DispatchStatus::Failed(
-                    dispatch::DispatchFailure::UnauthenticatedCommit,
-                );
-                result.worker_commit = None;
+            match promote_attempt_commit(
+                commits,
+                repo_path,
+                before_head,
+                worker_commit,
+                &attempt_id,
+                &roster.name,
+                run_artifacts,
+                options,
+            ) {
+                Ok(()) => {}
+                Err(error) if error.preserves_claim() => {
+                    attempt_checkout.preserve_for_recovery();
+                    return Err(error);
+                }
+                Err(error) => {
+                    outcome_label = format!("unauthenticated_commit; promotion refused: {error}");
+                    result.status = dispatch::DispatchStatus::Failed(
+                        dispatch::DispatchFailure::UnauthenticatedCommit,
+                    );
+                    result.worker_commit = None;
+                    worker_succeeded = false;
+                }
             }
         }
         // Any non-success attempt may have left tracked or untracked
@@ -1898,17 +2626,42 @@ where
                 }
             }
         }
-        attempt_checkout.cleanup()?;
-        run_artifacts
-            .append_event(
-                EventKind::AttemptFinished,
-                EventInput {
-                    profile_id: Some(roster.name.clone()),
-                    artifact_refs,
-                    outcome: Some(outcome_label),
-                },
-            )
-            .map_err(run_artifact_error)?;
+        if worker_succeeded && interrupt_after_promotion_receipt(options) {
+            attempt_checkout.preserve_for_recovery();
+            return Err(DispatchCycleError::recovery_required(
+                "simulated process interruption after promotion receipt before checkout cleanup",
+            ));
+        }
+        if let Err(error) = attempt_checkout.cleanup() {
+            if worker_succeeded {
+                attempt_checkout.preserve_for_recovery();
+                return Err(DispatchCycleError::recovery_required(format!(
+                    "promoted worker checkout cleanup failed; recovery required: {error}"
+                )));
+            }
+            return Err(error);
+        }
+        if worker_succeeded && interrupt_before_attempt_finished(options) {
+            return Err(DispatchCycleError::recovery_required(
+                "simulated process interruption after checkout cleanup before attempt-finished event",
+            ));
+        }
+        if let Err(error) = run_artifacts.append_event(
+            EventKind::AttemptFinished,
+            EventInput {
+                profile_id: Some(roster.name.clone()),
+                artifact_refs,
+                outcome: Some(outcome_label),
+            },
+        ) {
+            if worker_succeeded {
+                return Err(DispatchCycleError::recovery_required(format!(
+                    "promoted worker attempt-finished event failed; recovery required: {}",
+                    error.into_message()
+                )));
+            }
+            return Err(run_artifact_error(error));
+        }
 
         let Some(failure) = retryable_failure_reason(&result)? else {
             return Ok(WorkerChainOutcome::Ran(WorkerAttempt {
@@ -2639,6 +3392,8 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
             if quarantine::process_group_alive(worker_pgid) {
                 return Ok(None);
             }
+
+            cleanup_run_attempt_worktrees(repo_path, run_artifacts.dir())?;
 
             let Some(expected_head) = work.before_head.as_deref() else {
                 // No recorded before_head (predates that field): same "weaker
@@ -4695,6 +5450,26 @@ dispatch_id = "senior-reviewer"
             worker.cwd, fixture.repo,
             "the worker must run in its parent-created attempt checkout"
         );
+        let forged_commit = exec.forged_commit();
+        let formerly_trusted_email = exec.formerly_trusted_email();
+        assert_eq!(
+            git(
+                &fixture.repo,
+                &["show", "-s", "--format=%ce", &forged_commit]
+            )
+            .trim(),
+            formerly_trusted_email,
+            "the foreign canonical commit must recreate the identity the prior baseline trusted"
+        );
+        let stdout = std::fs::read_to_string(worker.stdout_path).expect("read forged stdout");
+        assert!(
+            stdout.contains(&format!("CONDUCTOR_WORKER_COMMIT: {forged_commit}")),
+            "the forged stdout must carry the formerly trusted matching marker"
+        );
+        assert!(
+            !fixture.pending_run_dir().join("promotion.json").exists(),
+            "the foreign canonical commit must never reach promotion"
+        );
     }
 
     #[test]
@@ -4735,6 +5510,165 @@ dispatch_id = "senior-reviewer"
         assert_eq!(spawns.len(), 2);
         assert_ne!(spawns[0].cwd, spawns[1].cwd);
         assert_ne!(spawns[0].stdout_path, spawns[1].stdout_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn descendant_from_failed_attempt_cannot_forge_fallback_checkout_success() {
+        let mut fixture = ResumeFixture::new("descendant-forges-fallback");
+        fixture.cfg.review.enabled = false;
+        fixture.cfg.roster[0].fallback = vec!["fallback-worker".to_string()];
+        let mut fallback = fixture.cfg.roster[0].clone();
+        fallback.name = "fallback-worker".to_string();
+        fallback.dispatch_id = "fallback-worker".to_string();
+        fallback.fallback.clear();
+        fixture.cfg.roster.push(fallback);
+        write_plan_with_proposal(
+            &fixture.state,
+            &fixture.repo,
+            &fixture.cycle_id,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker", "fallback-worker"],
+            &fixture.cfg.roster,
+            &sandbox_issue(),
+        );
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let exec = DescendantForgeryExec::new();
+
+        let result = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(10)),
+            )
+            .expect("descendant forgery is rejected as a normal worker failure");
+        let report = std::fs::read_to_string(
+            deck::report_run_dir(&fixture.reports, &fixture.cycle_id)
+                .expect("report dir")
+                .join("report.json"),
+        )
+        .expect("read report");
+
+        assert_eq!(result.dispatched, 2, "{report}");
+        assert_eq!(result.verified, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            before_head
+        );
+    }
+
+    #[test]
+    fn unprovable_worker_group_preserves_claim_and_attempt_checkout() {
+        let mut fixture = ResumeFixture::new("unprovable-worker-group");
+        fixture.cfg.review.enabled = false;
+        let exec = UnquiescedWorkerExec;
+
+        let result = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("quiescence refusal is isolated to the planned item");
+
+        assert_eq!(result.verified, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(
+            fixture.bd.release_count(),
+            0,
+            "an unproven worker group must keep the claim held for recovery"
+        );
+        let worktrees = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            worktrees.contains("attempt-checkouts/001-fake-worker"),
+            "the checkout must remain registered until the worker group is proven dead:\n{worktrees}"
+        );
+    }
+
+    #[test]
+    fn promotion_intent_recovers_a_crash_after_merge_before_receipt() {
+        assert_promotion_boundary_recovers(
+            "promotion-after-merge",
+            PromotionInterruption::AfterMergeBeforeReceipt,
+            "intent",
+            true,
+        );
+    }
+
+    #[test]
+    fn promotion_receipt_recovers_a_failure_during_checkout_cleanup() {
+        assert_promotion_boundary_recovers(
+            "promotion-during-cleanup",
+            PromotionInterruption::AfterReceiptBeforeCleanup,
+            "promoted",
+            true,
+        );
+    }
+
+    #[test]
+    fn promotion_receipt_recovers_a_failure_before_attempt_finished_event() {
+        assert_promotion_boundary_recovers(
+            "promotion-before-attempt-finished",
+            PromotionInterruption::AfterCleanupBeforeAttemptFinished,
+            "promoted",
+            false,
+        );
+    }
+
+    fn assert_promotion_boundary_recovers(
+        label: &str,
+        boundary: PromotionInterruption,
+        expected_phase: &str,
+        checkout_survives: bool,
+    ) {
+        let mut fixture = ResumeFixture::new(label);
+        fixture.cfg.review.enabled = false;
+        let exec = PendingReviewExec::ship_immediately();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"]);
+
+        let interrupted = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_promotion_at(boundary),
+            )
+            .expect("promotion interruption is isolated to the item");
+
+        assert_eq!(interrupted.verified, 0);
+        assert_eq!(interrupted.failed, 1);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_ne!(git(&fixture.repo, &["rev-parse", "HEAD"]), before_head);
+        let run_dir = fixture.pending_run_dir();
+        let promotion: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run_dir.join("promotion.json")).expect("read promotion journal"),
+        )
+        .expect("parse promotion journal");
+        assert_eq!(promotion["phase"], expected_phase);
+        let checkout = run_dir
+            .join("attempt-checkouts")
+            .join("001-fake-worker");
+        assert_eq!(checkout.exists(), checkout_survives);
+
+        fixture.mark_pending_review_recoverable();
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume verifies the recorded promoted HEAD");
+
+        assert_eq!(resumed.verified, 1);
+        assert_eq!(exec.worker_spawns(), 1, "resume must not redispatch a worker");
+        assert_eq!(fixture.bd.close_count(), 1);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert!(!checkout.exists());
     }
 
     #[test]
@@ -5247,6 +6181,75 @@ dispatch_id = "senior-reviewer"
         assert_eq!(exec.worker_spawns(), 1);
         assert_eq!(resumed.verified, 1);
         assert_eq!(fixture.bd.close_count(), 1);
+    }
+
+    #[test]
+    fn stale_reclaim_removes_the_dead_run_generations_attempt_worktrees() {
+        let fixture = ResumeFixture::new("stale-attempt-worktree-cleanup");
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        let stale_run = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+                Some(dead_pid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("simulate a run stranded after registering an attempt checkout");
+        let stale_checkout = stale_run
+            .dir()
+            .join("attempt-checkouts")
+            .join("001-fake-worker");
+        std::fs::create_dir_all(stale_checkout.parent().expect("checkout parent"))
+            .expect("mkdir checkout parent");
+        run(
+            &fixture.repo,
+            "git",
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                stale_checkout.to_str().expect("utf8 checkout"),
+                &before_head,
+            ],
+        );
+        drop(stale_run);
+        assert!(
+            git(&fixture.repo, &["worktree", "list", "--porcelain"])
+                .contains(stale_checkout.to_str().expect("utf8 checkout"))
+        );
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume cleans the stale checkout and redispatches");
+
+        assert_eq!(resumed.verified, 1);
+        let worktrees = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !worktrees.contains(stale_checkout.to_str().expect("utf8 checkout")),
+            "stale generation worktree survived reclaim:\n{worktrees}"
+        );
     }
 
     #[test]
@@ -8768,15 +9771,29 @@ dispatch_id = "fake-worker"
 
     struct ForeignCanonicalCommitExec {
         canonical_repo: PathBuf,
+        formerly_trusted_email: String,
         worker_spawn: RefCell<Option<SpawnRequest>>,
+        forged_commit: RefCell<Option<String>>,
         review_spawns: RefCell<usize>,
     }
 
     impl ForeignCanonicalCommitExec {
         fn new(canonical_repo: PathBuf) -> Self {
+            // The identity a naive committer-email check would have trusted:
+            // the canonical repo's own configured author. The rejected baseline
+            // authenticated worker success on any HEAD change, so a foreign
+            // actor that recreates this identity — plus the stdout marker —
+            // could forge a "clean" cycle. Capture it so the regression can
+            // prove the forged commit really does carry the formerly trusted
+            // identity yet is still refused.
+            let formerly_trusted_email = git(&canonical_repo, &["config", "user.email"])
+                .trim()
+                .to_string();
             Self {
                 canonical_repo,
+                formerly_trusted_email,
                 worker_spawn: RefCell::new(None),
+                forged_commit: RefCell::new(None),
                 review_spawns: RefCell::new(0),
             }
         }
@@ -8791,6 +9808,17 @@ dispatch_id = "fake-worker"
 
         fn review_spawns(&self) -> usize {
             *self.review_spawns.borrow()
+        }
+
+        fn forged_commit(&self) -> String {
+            self.forged_commit
+                .borrow()
+                .clone()
+                .expect("foreign canonical commit forged")
+        }
+
+        fn formerly_trusted_email(&self) -> String {
+            self.formerly_trusted_email.clone()
         }
     }
 
@@ -8808,10 +9836,16 @@ dispatch_id = "fake-worker"
                 std::fs::write(self.canonical_repo.join("worker.txt"), b"foreign\n")
                     .expect("write foreign change");
                 run(&self.canonical_repo, "git", &["add", "worker.txt"]);
+                // Explicitly recreate the formerly trusted identity via the same
+                // GIT_*_EMAIL env vars a real worker inherits, proving the
+                // commit's committer is exactly what the rejected baseline keyed
+                // on — not something the fix can distinguish by identity alone.
                 let output = Command::new("git")
                     .args(["commit", "-m", "foreign: forge worker completion"])
                     .current_dir(&self.canonical_repo)
                     .envs(request.env.iter().map(|(key, value)| (key, value)))
+                    .env("GIT_AUTHOR_EMAIL", &self.formerly_trusted_email)
+                    .env("GIT_COMMITTER_EMAIL", &self.formerly_trusted_email)
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -8822,16 +9856,16 @@ dispatch_id = "fake-worker"
                     "forged git commit failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                let commit = git(&self.canonical_repo, &["rev-parse", "HEAD"]);
+                let commit = git(&self.canonical_repo, &["rev-parse", "HEAD"])
+                    .trim()
+                    .to_string();
                 std::fs::write(
                     &request.stdout_path,
-                    format!(
-                        "forged worker output\nCONDUCTOR_WORKER_COMMIT: {}\n",
-                        commit.trim()
-                    ),
+                    format!("forged worker output\nCONDUCTOR_WORKER_COMMIT: {commit}\n"),
                 )
                 .expect("write forged worker stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
+                *self.forged_commit.borrow_mut() = Some(commit);
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
@@ -8850,6 +9884,229 @@ dispatch_id = "fake-worker"
                 ))));
             }
             panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    #[cfg(unix)]
+    struct DescendantForgeryExec {
+        worker_spawns: RefCell<usize>,
+        attempt_one_pgid: RefCell<Option<u32>>,
+    }
+
+    #[cfg(unix)]
+    impl DescendantForgeryExec {
+        fn new() -> Self {
+            Self {
+                worker_spawns: RefCell::new(0),
+                attempt_one_pgid: RefCell::new(None),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Exec for DescendantForgeryExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            if request.argv.iter().any(|arg| arg == "fake-worker") {
+                use std::os::unix::process::CommandExt;
+
+                *self.worker_spawns.borrow_mut() += 1;
+                let fallback_checkout = request
+                    .cwd
+                    .parent()
+                    .expect("attempt checkout parent")
+                    .join("002-fallback-worker");
+                let stdout = std::fs::File::create(&request.stdout_path)
+                    .expect("create attempt-one stdout");
+                let stderr = std::fs::File::create(&request.stderr_path)
+                    .expect("create attempt-one stderr");
+                let script = r#"
+                    (
+                        trap '' HUP
+                        while [ ! -e "$1/.git" ]; do sleep 0.01; done
+                        cd "$1" || exit 1
+                        printf 'forged by stale descendant\n' > worker.txt
+                        git add worker.txt
+                        git commit -m 'forged: stale descendant direct child'
+                    ) &
+                    printf 'HTTP 429 capacity exhausted\n' >&2
+                    exit 1
+                "#;
+                let child = Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .arg("descendant-forgery")
+                    .arg(&fallback_checkout)
+                    .current_dir(&request.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(stdout))
+                    .stderr(Stdio::from(stderr))
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn failed worker with background descendant");
+                *self.attempt_one_pgid.borrow_mut() = Some(child.id());
+                return Ok(Box::new(RealProcessGroupChild { child }));
+            }
+            if request.argv.iter().any(|arg| arg == "fallback-worker") {
+                *self.worker_spawns.borrow_mut() += 1;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline
+                    && git(&request.cwd, &["log", "-1", "--format=%s"])
+                        != "forged: stale descendant direct child"
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::fs::write(&request.stdout_path, b"fallback exited without a commit\n")
+                    .expect("write fallback stdout");
+                std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
+                return Ok(Box::new(FakeChild::delayed_success()));
+            }
+            if request.argv.first().map(String::as_str) == Some("sh") {
+                let output = Command::new(&request.argv[0])
+                    .args(&request.argv[1..])
+                    .current_dir(&request.cwd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("spawn verify shell");
+                std::fs::write(&request.stdout_path, &output.stdout).expect("write verify stdout");
+                std::fs::write(&request.stderr_path, &output.stderr).expect("write verify stderr");
+                return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(
+                    output.status.code().unwrap_or(1),
+                ))));
+            }
+            panic!("unexpected spawn argv: {:?}", request.argv)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DescendantForgeryExec {
+        fn drop(&mut self) {
+            if let Some(pgid) = *self.attempt_one_pgid.borrow() {
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(format!("-{pgid}"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct RealProcessGroupChild {
+        child: std::process::Child,
+    }
+
+    #[cfg(unix)]
+    impl ChildProcess for RealProcessGroupChild {
+        fn wait_for(
+            &mut self,
+            timeout: Duration,
+        ) -> crate::dispatch::Result<Option<ProcessStatus>> {
+            let start = Instant::now();
+            loop {
+                if let Some(status) = self.child.try_wait().map_err(|error| {
+                    crate::dispatch::DispatchError::new(format!(
+                        "poll real worker child: {error}"
+                    ))
+                })? {
+                    return Ok(Some(status.into()));
+                }
+                if start.elapsed() >= timeout {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn terminate(&mut self) -> crate::dispatch::Result<()> {
+            signal_test_process_group(self.child.id(), "-TERM")
+        }
+
+        fn kill(&mut self) -> crate::dispatch::Result<()> {
+            signal_test_process_group(self.child.id(), "-KILL")
+        }
+
+        fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
+            self.child
+                .wait()
+                .map(ProcessStatus::from)
+                .map_err(|error| crate::dispatch::DispatchError::new(format!("wait child: {error}")))
+        }
+
+        fn id(&self) -> Option<u32> {
+            Some(self.child.id())
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal_test_process_group(pgid: u32, signal: &str) -> crate::dispatch::Result<()> {
+        let status = Command::new("kill")
+            .arg(signal)
+            .arg(format!("-{pgid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| {
+                crate::dispatch::DispatchError::new(format!("spawn kill {signal}: {error}"))
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(crate::dispatch::DispatchError::new(format!(
+                "kill {signal} -{pgid} failed"
+            )))
+        }
+    }
+
+    struct UnquiescedWorkerExec;
+
+    impl Exec for UnquiescedWorkerExec {
+        fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+            assert!(
+                request.argv.iter().any(|arg| arg == "fake-worker"),
+                "verification must not run after unproven worker quiescence"
+            );
+            std::fs::write(&request.stdout_path, b"").expect("write worker stdout");
+            std::fs::write(&request.stderr_path, b"HTTP 429 capacity exhausted\n")
+                .expect("write worker stderr");
+            Ok(Box::new(UnquiescedWorkerChild))
+        }
+    }
+
+    struct UnquiescedWorkerChild;
+
+    impl ChildProcess for UnquiescedWorkerChild {
+        fn wait_for(
+            &mut self,
+            _timeout: Duration,
+        ) -> crate::dispatch::Result<Option<ProcessStatus>> {
+            Ok(Some(ProcessStatus::code(1)))
+        }
+
+        fn terminate(&mut self) -> crate::dispatch::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&mut self) -> crate::dispatch::Result<()> {
+            Ok(())
+        }
+
+        fn wait(&mut self) -> crate::dispatch::Result<ProcessStatus> {
+            Ok(ProcessStatus::code(1))
+        }
+
+        fn id(&self) -> Option<u32> {
+            Some(424_242)
+        }
+
+        fn ensure_process_group_quiescent(&mut self) -> crate::dispatch::Result<()> {
+            Err(crate::dispatch::DispatchError::new(
+                "simulated inability to prove worker process-group quiescence",
+            ))
         }
     }
 
