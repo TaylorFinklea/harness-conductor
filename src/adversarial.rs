@@ -1319,6 +1319,7 @@ fn run_judge_attempt<E: Exec>(
     let spawn = SpawnRequest {
         argv,
         cwd: authorized.review_dir.clone(),
+        env: Vec::new(),
         stdin: StdinMode::Null,
         stdout_path: stdout_path.clone(),
         stderr_path: stderr_path.clone(),
@@ -2025,6 +2026,7 @@ fn run_reviewer_attempt<E: Exec + Sync>(
     let spawn = SpawnRequest {
         argv,
         cwd: review_dir.to_path_buf(),
+        env: Vec::new(),
         stdin: StdinMode::Null,
         stdout_path: stdout_path.clone(),
         stderr_path: stderr_path.clone(),

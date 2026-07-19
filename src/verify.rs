@@ -510,6 +510,7 @@ fn spawn_request(request: &VerifyRequest, suffix: &str, argv: Vec<String>) -> Re
     Ok(SpawnRequest {
         argv,
         cwd: request.repo.clone(),
+        env: Vec::new(),
         stdin: StdinMode::Null,
         stdout_path,
         stderr_path,
@@ -2275,11 +2276,12 @@ mod tests {
             Ok(true)
         }
 
-        fn is_direct_child(
+        fn is_worker_commit(
             &self,
             _repo: &Path,
             _before: Option<&str>,
             _commit: &str,
+            _committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
             Ok(true)
         }

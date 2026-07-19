@@ -448,11 +448,12 @@ where
 }
 
 /// Holds an exclusive, repo-scoped advisory lease for the duration of a
-/// capture/restore. A stable guard file under `<state_dir>/leases/` carries a
-/// kernel whole-file lock, so exactly one process can inspect or replace the
-/// separately committed owner generation. Keeping the guard inode stable is
-/// what makes dead-holder reclaim single-winner: no contender ever unlinks the
-/// path another holder has locked.
+/// capture/restore. A stable guard file in the checkout's Git directory (or
+/// under `<state_dir>/leases/` for synthetic identities) carries a kernel
+/// whole-file lock, so exactly one process can inspect or replace the separately
+/// committed owner generation. Keeping the guard inode stable is what makes
+/// dead-holder reclaim single-winner: no contender ever unlinks the path another
+/// holder has locked.
 ///
 /// The owner record is written to a private staging file and atomically
 /// renamed into place only after it is complete. A process crash releases the
@@ -488,7 +489,7 @@ impl RepoLease {
         canonical_repo: &str,
         holder_run_id: &str,
     ) -> Result<Self> {
-        let leases_dir = state_dir.join("leases");
+        let leases_dir = lease_storage_dir(state_dir, canonical_repo)?;
         std::fs::create_dir_all(&leases_dir).map_err(|error| {
             QuarantineError::CaptureFailed(format!(
                 "failed to create leases dir {}: {error}",
@@ -631,6 +632,40 @@ impl RepoLease {
             generation,
         })
     }
+}
+
+fn lease_storage_dir(state_dir: &Path, canonical_repo: &str) -> Result<PathBuf> {
+    let repo = Path::new(canonical_repo);
+    if !repo.is_dir() {
+        return Ok(state_dir.join("leases"));
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            QuarantineError::CaptureFailed(format!(
+                "failed to resolve checkout-scoped lease directory for {canonical_repo}: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(QuarantineError::CaptureFailed(format!(
+            "failed to resolve checkout-scoped lease directory for {canonical_repo}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if git_dir.is_empty() {
+        return Err(QuarantineError::CaptureFailed(format!(
+            "git returned an empty checkout-scoped lease directory for {canonical_repo}"
+        )));
+    }
+    Ok(PathBuf::from(git_dir).join("conductor").join("leases"))
 }
 
 impl Drop for RepoLease {
@@ -952,7 +987,40 @@ where
     C: CommitProbe + ?Sized,
     R: RepoRecovery + ?Sized,
 {
-    let _lease = RepoLease::acquire(state_dir, canonical_repo, run_artifacts.run_id())?;
+    let lease = RepoLease::acquire(state_dir, canonical_repo, run_artifacts.run_id())?;
+    quarantine_dirty_attempt_under_lease(
+        &lease,
+        repo,
+        canonical_repo,
+        state_dir,
+        commits,
+        recovery,
+        run_artifacts,
+        before_head,
+        artifact_label,
+    )
+}
+
+/// Captures/restores while the caller keeps the canonical checkout lease held
+/// across a larger worker/verify/checkpoint transaction. Taking the guard by
+/// reference makes the no-reacquire boundary explicit and prevents the
+/// dispatch path from self-deadlocking on its own lease.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quarantine_dirty_attempt_under_lease<C, R>(
+    _lease: &RepoLease,
+    repo: &Path,
+    canonical_repo: &str,
+    state_dir: &Path,
+    commits: &C,
+    recovery: &R,
+    run_artifacts: &RunHandle,
+    before_head: Option<&str>,
+    artifact_label: &str,
+) -> Result<QuarantineCapture>
+where
+    C: CommitProbe + ?Sized,
+    R: RepoRecovery + ?Sized,
+{
     if let Some(conflicting_run_id) =
         running_run_conflict(state_dir, canonical_repo, run_artifacts.run_id())?
     {
@@ -1624,11 +1692,12 @@ mod tests {
             Ok(self.cleans.borrow_mut().remove(0))
         }
 
-        fn is_direct_child(
+        fn is_worker_commit(
             &self,
             _repo: &Path,
             _before: Option<&str>,
             _commit: &str,
+            _committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
             Ok(true)
         }

@@ -581,15 +581,27 @@ fn dispatch_one<
             &run_id,
         );
     }
-    // Held across a stale-claim reclaim so the whole serialized transition —
-    // revalidate, release, re-claim, and fresh-run creation — is atomic
-    // against concurrent `--resume` invocations. Dropped before the worker
-    // spawn: by then the replacement run is durable and freshly heartbeated,
-    // so its own staleness window (not the lease) guards the writer handoff,
-    // and the worker's own quarantine path is free to re-acquire this
-    // repo-scoped lease without self-deadlock.
-    let mut resume_lease: Option<quarantine::RepoLease> = None;
+    let mut attempt_lease = Some(
+        quarantine::RepoLease::acquire(state_dir, &canonical_repo, cycle_id).map_err(|error| {
+            DispatchCycleError::message(format!("worker repository lease unavailable: {error}"))
+        })?,
+    );
+    current = match bd.show(&repo_path, &item.issue_id) {
+        Ok(issue) => issue,
+        Err(error) => {
+            record_replan_required(
+                report_path,
+                item,
+                &format!("bd show under repository lease failed: {error}"),
+            )?;
+            return Ok(DispatchOneResult {
+                decision: None,
+                dispatches: 0,
+            });
+        }
+    };
     if current.status != "open" {
+        drop(attempt_lease.take());
         let reclaimed = if options.resume {
             reclaim_stale_claim(
                 bd,
@@ -606,7 +618,7 @@ fn dispatch_one<
         };
         if let Some(reclaim) = reclaimed {
             current = reclaim.issue;
-            resume_lease = Some(reclaim.lease);
+            attempt_lease = Some(reclaim.lease);
         } else {
             record_replan_required(report_path, item, "issue is no longer open")?;
             return Ok(DispatchOneResult {
@@ -615,6 +627,7 @@ fn dispatch_one<
             });
         }
     }
+    let attempt_lease = attempt_lease.expect("new dispatch holds a repository lease");
     let ready = match bd.ready(&repo_path) {
         Ok(issues) => issues,
         Err(error) => {
@@ -773,16 +786,10 @@ fn dispatch_one<
         }
     };
 
-    // The replacement generation is now durable (Implementing, owned by this
-    // process, freshly heartbeated), so a concurrent resume would see a
-    // non-stale run and refuse. Release the serialization lease here — holding
-    // it into the worker's own quarantine path would self-deadlock this
-    // repo-scoped lease.
-    drop(resume_lease.take());
-
     let mut legacy_capture: Option<quarantine::QuarantineCapture> = None;
     if legacy_adopt_head.is_some() {
-        match quarantine::quarantine_dirty_attempt_with_lease(
+        match quarantine::quarantine_dirty_attempt_under_lease(
+            &attempt_lease,
             &repo_path,
             &canonical_repo,
             state_dir,
@@ -860,6 +867,7 @@ fn dispatch_one<
         &worker_step,
         progress,
         bursar,
+        &attempt_lease,
         &mut run_artifacts,
         before_head.as_deref(),
         legacy_capture,
@@ -1063,14 +1071,6 @@ fn dispatch_one<
             "simulated process interruption before qualitative review",
         ));
     }
-    let _review_lease = quarantine::RepoLease::acquire(
-        state_dir,
-        &canonical_repo,
-        run_artifacts.run_id(),
-    )
-    .map_err(|error| {
-        DispatchCycleError::message(format!("qualitative-review repository lease: {error}"))
-    })?;
     let review_issue = bd.show(&repo_path, &item.issue_id).map_err(|error| {
         DispatchCycleError::message(format!("qualitative-review claim re-fetch: {error}"))
     })?;
@@ -1498,6 +1498,7 @@ fn run_worker_chain<E, C, L, U>(
     worker_step: &str,
     progress: Option<f64>,
     bursar_client: &U,
+    attempt_lease: &quarantine::RepoLease,
     run_artifacts: &mut RunHandle,
     before_head: Option<&str>,
     legacy_capture: Option<quarantine::QuarantineCapture>,
@@ -1598,6 +1599,8 @@ where
             .map_err(run_artifact_error)?;
         let request = DispatchRequest {
             repo: repo_path.to_path_buf(),
+            before_head: before_head.map(str::to_string),
+            worker_identity: run_artifacts.run_id().to_string(),
             cycle_id: cycle_id.to_string(),
             bead_id: item.issue_id.clone(),
             backend: roster.backend,
@@ -1671,7 +1674,8 @@ where
                 sanitize_artifact_piece(&roster.name)
             );
             let canonical_repo = run_artifacts.manifest().target.repo.clone();
-            match quarantine::quarantine_dirty_attempt_with_lease(
+            match quarantine::quarantine_dirty_attempt_under_lease(
+                attempt_lease,
                 repo_path,
                 &canonical_repo,
                 state_dir,
@@ -4453,6 +4457,104 @@ dispatch_id = "senior-reviewer"
         assert_eq!(exec.review_spawns(), 0);
         assert_eq!(fixture.bd.close_count(), 0);
         assert_eq!(fixture.bd.release_count(), 0);
+    }
+
+    #[test]
+    fn writable_dispatches_with_distinct_state_dirs_cannot_overlap_the_same_checkout() {
+        let fixture = ResumeFixture::new("cross-state-repo-lease");
+        let exec = PendingReviewExec::ship_immediately();
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize repo")
+            .to_str()
+            .expect("utf8 repo")
+            .to_string();
+        let other_state = fixture.state.join("other-state");
+        let _held = quarantine::RepoLease::acquire(&other_state, &canonical_repo, "other-dispatch")
+            .expect("first writable dispatch holds the canonical checkout lease");
+
+        let result = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("repo-lease conflict is isolated to the planned item");
+
+        assert_eq!(result.verified, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(exec.worker_spawns(), 0, "the second worker must not start");
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.claim_count(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+    }
+
+    #[test]
+    fn foreign_head_between_cycle_base_and_attempt_snapshot_is_rejected() {
+        struct ForeignBeforeAttemptSnapshot {
+            head_calls: RefCell<usize>,
+        }
+
+        impl CommitProbe for ForeignBeforeAttemptSnapshot {
+            fn head(&self, repo: &Path) -> crate::dispatch::Result<Option<String>> {
+                let call = *self.head_calls.borrow();
+                *self.head_calls.borrow_mut() += 1;
+                if call == 1 {
+                    std::fs::write(repo.join("foreign-before-attempt.txt"), b"foreign\n")
+                        .expect("write foreign change");
+                    run(repo, "git", &["add", "foreign-before-attempt.txt"]);
+                    run(
+                        repo,
+                        "git",
+                        &["commit", "-m", "foreign: moved before attempt snapshot"],
+                    );
+                }
+                GitCommitProbe.head(repo)
+            }
+
+            fn is_clean(&self, repo: &Path) -> crate::dispatch::Result<bool> {
+                GitCommitProbe.is_clean(repo)
+            }
+
+            fn is_worker_commit(
+                &self,
+                repo: &Path,
+                before: Option<&str>,
+                commit: &str,
+                committer_email: &str,
+            ) -> crate::dispatch::Result<bool> {
+                GitCommitProbe.is_worker_commit(repo, before, commit, committer_email)
+            }
+        }
+
+        let fixture = ResumeFixture::new("foreign-before-attempt-snapshot");
+        let exec = PendingReviewExec::ship_immediately();
+        let commits = ForeignBeforeAttemptSnapshot {
+            head_calls: RefCell::new(0),
+        };
+
+        let result = run_dispatch_cycle(
+            &fixture.cfg,
+            &fixture.bd,
+            &exec,
+            &commits,
+            &fixture.reports,
+            &fixture.state,
+            &fixture.ledger,
+            &fixture.cycle_id,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("foreign attempt-base drift is isolated to the planned item");
+
+        assert_eq!(result.verified, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(
+            exec.worker_spawns(),
+            0,
+            "worker must not start on a moved base"
+        );
+        assert_eq!(exec.review_spawns(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
     }
 
     #[test]
@@ -7821,6 +7923,21 @@ dispatch_id = "fake-worker"
     }
 
     fn write_worker_commit_stdout(request: &SpawnRequest, summary: &str) {
+        let output = Command::new("git")
+            .args(["commit", "--amend", "--no-edit"])
+            .current_dir(&request.cwd)
+            .envs(request.env.iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn git commit --amend");
+        assert!(
+            output.status.success(),
+            "git commit --amend failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let commit = git(&request.cwd, &["rev-parse", "HEAD"]);
         std::fs::write(
             &request.stdout_path,
@@ -7963,11 +8080,12 @@ dispatch_id = "fake-worker"
             panic!("commit probe should not run")
         }
 
-        fn is_direct_child(
+        fn is_worker_commit(
             &self,
             _repo: &Path,
             _before: Option<&str>,
             _commit: &str,
+            _committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
             panic!("commit probe should not run")
         }
@@ -8005,13 +8123,14 @@ dispatch_id = "fake-worker"
             }
         }
 
-        fn is_direct_child(
+        fn is_worker_commit(
             &self,
             repo: &Path,
             before: Option<&str>,
             commit: &str,
+            committer_email: &str,
         ) -> crate::dispatch::Result<bool> {
-            GitCommitProbe.is_direct_child(repo, before, commit)
+            GitCommitProbe.is_worker_commit(repo, before, commit, committer_email)
         }
     }
 
