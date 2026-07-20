@@ -465,6 +465,7 @@ fn backend_from_harness(harness: &str) -> Result<crate::config::Backend> {
     match harness {
         "claude-code" => Ok(crate::config::Backend::Claude),
         "pi" => Ok(crate::config::Backend::Pi),
+        "omp" => Ok(crate::config::Backend::Omp),
         "agy" => Ok(crate::config::Backend::Agy),
         "codex" => Ok(crate::config::Backend::Codex),
         _ => Err(BursarError::json(format!(
@@ -1360,6 +1361,18 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn backend_mapping_keeps_pi_and_omp_distinct() {
+        assert_eq!(
+            backend_from_harness("pi").expect("Pi maps"),
+            crate::config::Backend::Pi
+        );
+        assert_eq!(
+            backend_from_harness("omp").expect("OMP maps"),
+            crate::config::Backend::Omp
+        );
     }
 
     #[test]

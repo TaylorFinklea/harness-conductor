@@ -2726,6 +2726,7 @@ fn backend_label(backend: Backend) -> &'static str {
     match backend {
         Backend::Claude => "claude",
         Backend::Pi => "pi",
+        Backend::Omp => "omp",
         Backend::Agy => "agy",
         Backend::Codex => "codex",
     }

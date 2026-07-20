@@ -110,6 +110,7 @@ impl FromStr for Efficiency {
 pub(crate) enum Backend {
     Claude,
     Pi,
+    Omp,
     Agy,
     Codex,
 }
@@ -238,10 +239,11 @@ impl FromStr for Backend {
         match s {
             "claude" => Ok(Backend::Claude),
             "pi" => Ok(Backend::Pi),
+            "omp" => Ok(Backend::Omp),
             "agy" => Ok(Backend::Agy),
             "codex" => Ok(Backend::Codex),
             _ => Err(ConfigError::new(format!(
-                "unknown backend {s:?} (expected claude|pi|agy|codex)"
+                "unknown backend {s:?} (expected claude|pi|omp|agy|codex)"
             ))),
         }
     }
@@ -1248,9 +1250,12 @@ fn parse_arena_profiles(node: Option<&Node>) -> Result<Vec<ArenaProfile>> {
         }
         let name = get_required_str_at("arena_profile", t, i, "name")?;
         let harness = get_required_str_at("arena_profile", t, i, "harness")?;
-        if !matches!(harness.as_str(), "claude" | "codex" | "opencode" | "pi") {
+        if !matches!(
+            harness.as_str(),
+            "claude" | "codex" | "opencode" | "pi" | "omp"
+        ) {
             return Err(ConfigError::new(format!(
-                "arena_profile entry {i} unknown harness {harness:?} (expected claude|codex|opencode|pi)"
+                "arena_profile entry {i} unknown harness {harness:?} (expected claude|codex|opencode|pi|omp)"
             )));
         }
         let model = get_required_str_at("arena_profile", t, i, "model")?;
@@ -1259,6 +1264,7 @@ fn parse_arena_profiles(node: Option<&Node>) -> Result<Vec<ArenaProfile>> {
         validate_reasoning_effort(
             "arena_profile",
             i,
+            matches!(harness.as_str(), "codex" | "omp"),
             harness == "codex",
             &model,
             reasoning_effort,
@@ -1309,6 +1315,7 @@ fn parse_arena_judges(node: Option<&Node>) -> Result<Vec<ArenaJudge>> {
         validate_reasoning_effort(
             "arena_judge",
             i,
+            matches!(backend, Backend::Codex | Backend::Omp),
             backend == Backend::Codex,
             &dispatch_id,
             reasoning_effort,
@@ -1370,6 +1377,7 @@ fn parse_roster(node: Option<&Node>) -> Result<Vec<RosterEntry>> {
         validate_reasoning_effort(
             "roster",
             i,
+            matches!(backend, Backend::Codex | Backend::Omp),
             backend == Backend::Codex,
             &dispatch_id,
             reasoning_effort,
@@ -1490,14 +1498,15 @@ fn parse_reasoning_effort(
 fn validate_reasoning_effort(
     table: &str,
     i: usize,
-    uses_codex: bool,
+    uses_explicit_reasoning: bool,
+    allows_ultra: bool,
     model: &str,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<()> {
-    if !uses_codex {
+    if !uses_explicit_reasoning {
         if reasoning_effort.is_some() {
             return Err(ConfigError::new(format!(
-                "{table} entry {i} reasoning_effort is only valid for Codex"
+                "{table} entry {i} reasoning_effort is only valid for Codex or OMP"
             )));
         }
         return Ok(());
@@ -1505,9 +1514,14 @@ fn validate_reasoning_effort(
 
     let effort = reasoning_effort.ok_or_else(|| {
         ConfigError::new(format!(
-            "{table} entry {i} Codex dispatch requires reasoning_effort"
+            "{table} entry {i} Codex/OMP dispatch requires reasoning_effort"
         ))
     })?;
+    if effort == ReasoningEffort::Ultra && !allows_ultra {
+        return Err(ConfigError::new(format!(
+            "{table} entry {i} OMP does not support reasoning_effort ultra"
+        )));
+    }
     if model == "gpt-5.6-luna" && effort == ReasoningEffort::Ultra {
         return Err(ConfigError::new(format!(
             "{table} entry {i} model gpt-5.6-luna does not support reasoning_effort ultra"
@@ -1770,6 +1784,15 @@ mod tests {
         });
         format!(
             "[[roster]]\nname = \"{model}\"\ntier = \"lead\"\nceiling = \"XL\"\nefficiency = \"heavy\"\nbackend = \"codex\"\ndispatch_id = \"{model}\"\n{effort}"
+        )
+    }
+
+    fn omp_roster_entry(model: &str, reasoning_effort: Option<&str>) -> String {
+        let effort = reasoning_effort.map_or_else(String::new, |value| {
+            format!("reasoning_effort = \"{value}\"\n")
+        });
+        format!(
+            "[[roster]]\nname = \"omp-{model}\"\ntier = \"lead\"\nceiling = \"XL\"\nefficiency = \"heavy\"\nbackend = \"omp\"\ndispatch_id = \"{model}\"\n{effort}"
         )
     }
 
@@ -2334,9 +2357,10 @@ dispatch_id = "provider/senior"
         for (exp, s) in effs {
             assert_eq!(s.parse::<Efficiency>().unwrap(), exp);
         }
-        let backs: [(Backend, &str); 4] = [
+        let backs: [(Backend, &str); 5] = [
             (Backend::Claude, "claude"),
             (Backend::Pi, "pi"),
+            (Backend::Omp, "omp"),
             (Backend::Agy, "agy"),
             (Backend::Codex, "codex"),
         ];
@@ -2502,6 +2526,33 @@ dispatch_id = "provider/senior"
             (
                 "unknown effort is rejected",
                 codex_roster_entry("gpt-5.6-sol", Some("maximum")),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                parse_str(&source).is_ok(),
+                should_parse,
+                "unexpected result for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_reasoning_effort_is_explicit_and_rejects_unsupported_ultra() {
+        for (label, source, should_parse) in [
+            (
+                "OMP accepts max",
+                omp_roster_entry("openai-codex/gpt-5.6-sol", Some("max")),
+                true,
+            ),
+            (
+                "OMP requires effort",
+                omp_roster_entry("openai-codex/gpt-5.6-sol", None),
+                false,
+            ),
+            (
+                "OMP rejects ultra",
+                omp_roster_entry("openai-codex/gpt-5.6-sol", Some("ultra")),
                 false,
             ),
         ] {

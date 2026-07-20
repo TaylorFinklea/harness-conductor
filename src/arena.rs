@@ -28,6 +28,7 @@ pub(crate) enum ArenaHarness {
     Codex,
     Opencode,
     Pi,
+    Omp,
 }
 
 impl TryFrom<&str> for ArenaHarness {
@@ -39,6 +40,7 @@ impl TryFrom<&str> for ArenaHarness {
             "codex" => Ok(Self::Codex),
             "opencode" => Ok(Self::Opencode),
             "pi" => Ok(Self::Pi),
+            "omp" => Ok(Self::Omp),
             other => Err(ArenaError::new(format!("unknown arena harness {other:?}"))),
         }
     }
@@ -52,6 +54,7 @@ impl ArenaHarness {
             ArenaHarness::Codex => "codex",
             ArenaHarness::Opencode => "opencode",
             ArenaHarness::Pi => "pi",
+            ArenaHarness::Omp => "omp",
         }
     }
 
@@ -62,6 +65,7 @@ impl ArenaHarness {
             ArenaHarness::Codex => "RALPH_CODEX_MODEL",
             ArenaHarness::Opencode => "RALPH_OPENCODE_MODEL",
             ArenaHarness::Pi => "RALPH_PI_MODEL",
+            ArenaHarness::Omp => "RALPH_OMP_MODEL",
         }
     }
 
@@ -69,6 +73,7 @@ impl ArenaHarness {
     pub(crate) const fn reasoning_env(self) -> Option<&'static str> {
         match self {
             Self::Codex => Some("RALPH_CODEX_REASONING_EFFORT"),
+            Self::Omp => Some("RALPH_OMP_THINKING"),
             Self::Claude | Self::Opencode | Self::Pi => None,
         }
     }
@@ -2263,6 +2268,26 @@ mod tests {
                 ),
             ]
         );
+
+        let omp_profile = ArenaProfile {
+            name: "omp-gpt56-terra".to_string(),
+            harness: ArenaHarness::Omp,
+            model: "openai-codex/gpt-5.6-terra".to_string(),
+            provider_group: "openai-codex".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Xhigh),
+        };
+        let omp_spawn = ralph_spawn_request(&omp_profile, std::path::Path::new("/repo"));
+        assert_eq!(omp_spawn.argv, vec!["ralph", "-n", "1", "-t", "omp"]);
+        assert_eq!(
+            omp_spawn.env,
+            vec![
+                (
+                    "RALPH_OMP_MODEL".to_string(),
+                    "openai-codex/gpt-5.6-terra".to_string(),
+                ),
+                ("RALPH_OMP_THINKING".to_string(), "xhigh".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -2666,6 +2691,7 @@ mod tests {
         let throwaway = ctx.work_root.join("judge-cwd");
         for (backend, reasoning_effort) in [
             (crate::config::Backend::Pi, None),
+            (crate::config::Backend::Omp, Some(ReasoningEffort::Xhigh)),
             (crate::config::Backend::Claude, None),
             (crate::config::Backend::Agy, None),
             (crate::config::Backend::Codex, Some(ReasoningEffort::Max)),

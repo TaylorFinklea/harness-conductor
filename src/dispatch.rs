@@ -474,6 +474,22 @@ pub(crate) fn argv_for_backend(
             "-p",
             prompt,
         ]),
+        Backend::Omp => {
+            let effort = reasoning_effort.ok_or_else(|| {
+                DispatchError::new("OMP dispatch requires an explicit reasoning_effort")
+            })?;
+            vec![
+                "omp".to_string(),
+                "--model".to_string(),
+                dispatch_id.to_string(),
+                "--thinking".to_string(),
+                effort.as_str().to_string(),
+                "--auto-approve".to_string(),
+                "--no-session".to_string(),
+                "-p".to_string(),
+                prompt.to_string(),
+            ]
+        }
         Backend::Codex => {
             let effort = reasoning_effort.ok_or_else(|| {
                 DispatchError::new("Codex dispatch requires an explicit reasoning_effort")
@@ -520,6 +536,22 @@ pub(crate) fn readonly_argv_for_backend(
             "-p",
             prompt,
         ]),
+        Backend::Omp => {
+            let effort = reasoning_effort.ok_or_else(|| {
+                DispatchError::new("OMP dispatch requires an explicit reasoning_effort")
+            })?;
+            vec![
+                "omp".to_string(),
+                "--model".to_string(),
+                dispatch_id.to_string(),
+                "--thinking".to_string(),
+                effort.as_str().to_string(),
+                "--no-tools".to_string(),
+                "--no-session".to_string(),
+                "-p".to_string(),
+                prompt.to_string(),
+            ]
+        }
         Backend::Codex => {
             let effort = reasoning_effort.ok_or_else(|| {
                 DispatchError::new("Codex dispatch requires an explicit reasoning_effort")
@@ -1470,6 +1502,27 @@ mod tests {
         );
         assert_eq!(
             readonly_argv_for_backend(
+                Backend::Omp,
+                "openai-codex/gpt-5.6-terra",
+                Some(ReasoningEffort::Xhigh),
+                PROMPT,
+                repo,
+            )
+            .expect("OMP readonly argv"),
+            vec![
+                "omp",
+                "--model",
+                "openai-codex/gpt-5.6-terra",
+                "--thinking",
+                "xhigh",
+                "--no-tools",
+                "--no-session",
+                "-p",
+                PROMPT,
+            ]
+        );
+        assert_eq!(
+            readonly_argv_for_backend(
                 Backend::Codex,
                 "gpt-5.6-terra",
                 Some(ReasoningEffort::Xhigh),
@@ -1521,6 +1574,42 @@ mod tests {
                 "--tools",
                 "",
             ]
+        );
+    }
+
+    #[test]
+    fn omp_backend_uses_explicit_ephemeral_unattended_argv() {
+        assert_eq!(
+            argv_for_backend(
+                Backend::Omp,
+                "openai-codex/gpt-5.6-luna",
+                Some(ReasoningEffort::Medium),
+                PROMPT,
+                Path::new("/tmp/repo"),
+            )
+            .expect("OMP argv"),
+            vec![
+                "omp",
+                "--model",
+                "openai-codex/gpt-5.6-luna",
+                "--thinking",
+                "medium",
+                "--auto-approve",
+                "--no-session",
+                "-p",
+                PROMPT,
+            ]
+        );
+        assert!(
+            argv_for_backend(
+                Backend::Omp,
+                "openai-codex/gpt-5.6-luna",
+                None,
+                PROMPT,
+                Path::new("/tmp/repo"),
+            )
+            .is_err(),
+            "OMP dispatch must not inherit a global thinking level"
         );
     }
 

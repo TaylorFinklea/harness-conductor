@@ -350,8 +350,10 @@ pub(crate) fn route(
 
                 // Step 4 + invariant 4/7: apply every budget as a hard
                 // ceiling; excess is skipped(budget), never silently dropped.
-                let is_external =
-                    matches!(chosen.backend, Backend::Pi | Backend::Agy | Backend::Codex);
+                let is_external = matches!(
+                    chosen.backend,
+                    Backend::Pi | Backend::Omp | Backend::Agy | Backend::Codex
+                );
                 let repo_count = *dispatch_count_by_repo.get(repo_name).unwrap_or(&0);
                 let over_cycle_ceiling = global_dispatch_count >= budgets.max_dispatches_per_cycle;
                 let over_repo_ceiling = repo_count >= budgets.max_active_per_repo;

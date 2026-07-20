@@ -3568,7 +3568,7 @@ fn head_matches_clean<C: CommitProbe + ?Sized>(
 fn is_metered_worker_backend(backend: Backend) -> bool {
     matches!(
         backend,
-        Backend::Claude | Backend::Pi | Backend::Agy | Backend::Codex
+        Backend::Claude | Backend::Pi | Backend::Omp | Backend::Agy | Backend::Codex
     )
 }
 
@@ -10849,6 +10849,7 @@ provider = \"openai-codex\"
 
         assert!(is_metered_worker_backend(Backend::Claude));
         assert!(is_metered_worker_backend(Backend::Pi));
+        assert!(is_metered_worker_backend(Backend::Omp));
         assert!(is_metered_worker_backend(Backend::Agy));
         assert!(is_metered_worker_backend(Backend::Codex));
         assert_eq!(bursar_provider_for(&cfg.roster[0]), "codex");
