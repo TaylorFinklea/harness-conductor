@@ -2582,6 +2582,7 @@ where
             // spawned, so no earlier attempt's process — however it escaped —
             // can author a commit this attempt will be credited with.
             attempt_identity: dispatch::attempt_commit_identity(),
+            lineage_lease_path: dispatch::worker_lineage_lease_path(run_artifacts.dir()),
         };
         let result = {
             // Reborrow the run handle for the duration of the worker so both
@@ -2630,7 +2631,7 @@ where
                         },
                     );
                     return Err(DispatchCycleError::recovery_required(format!(
-                        "worker process-group quiescence is unproven; claim and attempt checkout retained for dispatch --resume: {error}"
+                        "worker process-group or lineage quiescence is unproven; claim and attempt checkout retained for dispatch --resume: {error}"
                     )));
                 }
                 let cleanup = attempt_checkout.cleanup();
@@ -3346,10 +3347,11 @@ struct StaleClaimReclaim {
 ///   finished `stale_claim_reaped` history that stays auditable and is never
 ///   miscounted — and it has gone heartbeat-silent past
 ///   [`STALE_CLAIM_THRESHOLD`] with *both* its recorded owner pid and its
-///   worker process group provably dead. A dead owner is not proof its
-///   separately grouped worker died: an orphaned worker still writing keeps
-///   the claim. Unknown, `EPERM`, pid-reuse-ambiguous, or missing identity all
-///   fail closed;
+///   worker process group provably dead and its durable lineage FIFO has no
+///   inherited readers. A dead owner and empty process group do not prove a
+///   descendant that called `setsid(2)` died: an escaped worker still holding
+///   the FIFO keeps the claim. Unknown, `EPERM`, pid-reuse-ambiguous, missing
+///   identity, or an unreadable/missing lease all fail closed;
 /// - the repository HEAD still equals the generation's `before_head` exactly
 ///   and the tree is clean — any committed, dirty, missing-head, or foreign
 ///   state fails closed instead of silently adopting unreviewed work.
@@ -3493,6 +3495,11 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
             };
             if quarantine::process_group_alive(worker_pgid) {
                 return Ok(None);
+            }
+            let lineage_lease = dispatch::worker_lineage_lease_path(run_artifacts.dir());
+            match dispatch::worker_lineage_active(&lineage_lease) {
+                Ok(false) => {}
+                Ok(true) | Err(_) => return Ok(None),
             }
 
             cleanup_run_attempt_worktrees(repo_path, run_artifacts.dir())?;
@@ -4362,7 +4369,7 @@ mod tests {
     use crate::config;
     use crate::deck::{Block, Report, ReportStatus};
     use crate::dispatch::{
-        ChildProcess, CommitProbe, Exec, GitCommitProbe, ProcessStatus, SpawnRequest,
+        ChildProcess, CommitProbe, Exec, GitCommitProbe, ProcessStatus, SpawnRequest, StdinMode,
     };
     use crate::plan::{
         ApprovalScope, ApprovalScopeKind, CyclePlan, ItemAuthorizationRecord, ProposalEntry,
@@ -5654,10 +5661,12 @@ dispatch_id = "senior-reviewer"
         )
         .expect("read report");
 
-        // Both attempts really ran: the escaped descendant reached — and
-        // committed inside — the second attempt's checkout, so this RED
-        // exercises the forgery rather than merely failing earlier.
-        assert_eq!(exec.worker_spawns(), 2, "{report}");
+        assert_eq!(
+            exec.worker_spawns(),
+            1,
+            "an escaped descendant keeps attempt one unquiesced, so a fallback \
+             checkout must never be created:\n{report}"
+        );
         assert_eq!(
             result.verified, 0,
             "a commit authored by an escaped descendant of an earlier attempt \
@@ -5665,6 +5674,20 @@ dispatch_id = "senior-reviewer"
         );
         assert_eq!(result.failed, 1);
         assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(
+            fixture.bd.release_count(),
+            0,
+            "unproven worker-lineage quiescence must preserve the claim"
+        );
+        let worktrees = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            worktrees.contains("attempt-checkouts/001-fake-worker"),
+            "attempt one must remain registered for recovery:\n{worktrees}"
+        );
+        assert!(
+            !worktrees.contains("attempt-checkouts/002-fallback-worker"),
+            "the escaped descendant must never receive a later checkout to target:\n{worktrees}"
+        );
         assert_eq!(
             git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
             before_head,
@@ -6209,6 +6232,16 @@ dispatch_id = "senior-reviewer"
         pid
     }
 
+    fn create_inactive_worker_lineage_lease(run: &RunHandle) {
+        let path = dispatch::worker_lineage_lease_path(run.dir());
+        dispatch::prepare_worker_lineage_lease(&path)
+            .expect("create an inactive worker-lineage lease");
+        assert!(
+            !dispatch::worker_lineage_active(&path).expect("probe inactive lineage lease"),
+            "a simulated dead worker must leave no lineage reader"
+        );
+    }
+
     fn set_pending_review_owner(state_dir: &Path, owner_pid: u32, last_seen: DateTime<Utc>) {
         let run_dir = single_contract_run(state_dir);
         let manifest_path = run_dir.join("manifest.json");
@@ -6289,7 +6322,7 @@ dispatch_id = "senior-reviewer"
             .trim()
             .to_string();
         let dead_pid = spawn_dead_pid();
-        RunHandle::create_at(
+        let stale_run = RunHandle::create_at(
             &fixture.state,
             RunJob::Work,
             implementing_run_request(
@@ -6302,6 +6335,7 @@ dispatch_id = "senior-reviewer"
             Utc::now() - ChronoDuration::seconds(120),
         )
         .expect("simulate a run stranded mid-worker by a killed conductor process");
+        create_inactive_worker_lineage_lease(&stale_run);
 
         let plain = fixture
             .dispatch(
@@ -6359,6 +6393,7 @@ dispatch_id = "senior-reviewer"
             Utc::now() - ChronoDuration::seconds(120),
         )
         .expect("simulate a run stranded after registering an attempt checkout");
+        create_inactive_worker_lineage_lease(&stale_run);
         let stale_checkout = stale_run
             .dir()
             .join("attempt-checkouts")
@@ -6468,6 +6503,7 @@ dispatch_id = "senior-reviewer"
             Utc::now(),
         )
         .expect("simulate a run with at least one prior heartbeat tick");
+        create_inactive_worker_lineage_lease(&run_artifacts);
         std::fs::write(
             run_artifacts.dir().join("heartbeat"),
             (Utc::now() - ChronoDuration::seconds(120)).to_rfc3339(),
@@ -6823,7 +6859,7 @@ dispatch_id = "senior-reviewer"
         // writing). A dead owner is not proof the worker died with it.
         let dead_owner = spawn_dead_pid();
         let (worker, worker_pgid) = spawn_live_worker_group();
-        RunHandle::create_at(
+        let orphaned_run = RunHandle::create_at(
             &fixture.state,
             RunJob::Work,
             implementing_run_request(
@@ -6836,6 +6872,7 @@ dispatch_id = "senior-reviewer"
             Utc::now() - ChronoDuration::seconds(120),
         )
         .expect("simulate a run whose conductor owner died but whose worker was orphaned alive");
+        create_inactive_worker_lineage_lease(&orphaned_run);
 
         let blocked = fixture
             .dispatch(
@@ -6859,6 +6896,96 @@ dispatch_id = "senior-reviewer"
                 &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
             )
             .expect("resume reclaims once the worker group is confirmed gone");
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(exec.worker_spawns(), 1);
+        assert_eq!(recovered.verified, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resume_refuses_a_re_sessioned_descendant_after_the_recorded_group_dies() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let fixture = ResumeFixture::new("escaped-worker-lineage");
+        let exec = PendingReviewExec::ship_immediately();
+        fixture
+            .bd
+            .claim(&fixture.repo, "sandbox-1", "conductor")
+            .expect("simulate a prior dispatch claiming the bead");
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonicalize sandbox repo")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let dead_pid = spawn_dead_pid();
+        let stale_run = RunHandle::create_at(
+            &fixture.state,
+            RunJob::Work,
+            implementing_run_request(
+                &fixture.cycle_id,
+                canonical_repo,
+                Some(&before_head),
+                Some(dead_pid),
+                Some(dead_pid),
+            ),
+            Utc::now() - ChronoDuration::seconds(120),
+        )
+        .expect("create a stale run with a dead recorded process group");
+        create_inactive_worker_lineage_lease(&stale_run);
+        let lineage_path = dispatch::worker_lineage_lease_path(stale_run.dir());
+        let lineage_stdin = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&lineage_path)
+            .expect("open inherited worker-lineage reader");
+        let ready = stale_run.dir().join("escaped.ready");
+        let mut escaped = Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import os,sys,time; os.setsid(); open(sys.argv[1], 'w').close(); time.sleep(30)",
+            )
+            .arg(&ready)
+            .stdin(Stdio::from(lineage_stdin))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a descendant that escapes into a new session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "escaped descendant was not ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            dispatch::worker_lineage_active(&lineage_path)
+                .expect("probe the escaped descendant's lineage lease")
+        );
+        drop(stale_run);
+
+        let blocked = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("an escaped descendant blocks reclaim without erroring the cycle");
+        assert_eq!(blocked.dispatched, 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(exec.worker_spawns(), 0);
+
+        escaped.kill().expect("kill escaped descendant");
+        escaped.wait().expect("reap escaped descendant");
+        assert!(
+            !dispatch::worker_lineage_active(&lineage_path)
+                .expect("prove the escaped descendant released its lease")
+        );
+        let recovered = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("resume reclaims only after the escaped lineage is empty");
         assert_eq!(fixture.bd.release_count(), 1);
         assert_eq!(exec.worker_spawns(), 1);
         assert_eq!(recovered.verified, 1);
@@ -6985,7 +7112,7 @@ dispatch_id = "senior-reviewer"
         // A second crash left generation 2 stranded mid-implementation with a
         // dead owner and dead worker group.
         let dead_pid = spawn_dead_pid();
-        RunHandle::create_at(
+        let gen2 = RunHandle::create_at(
             &fixture.state,
             RunJob::Work,
             implementing_run_request(
@@ -6998,6 +7125,7 @@ dispatch_id = "senior-reviewer"
             Utc::now() - ChronoDuration::seconds(120),
         )
         .expect("create stranded generation 2");
+        create_inactive_worker_lineage_lease(&gen2);
 
         let resumed = fixture
             .dispatch(
@@ -7209,7 +7337,7 @@ dispatch_id = "senior-reviewer"
             .trim()
             .to_string();
         let dead_pid = spawn_dead_pid();
-        RunHandle::create_at(
+        let stale_run = RunHandle::create_at(
             &fixture.state,
             RunJob::Work,
             implementing_run_request(
@@ -7222,6 +7350,7 @@ dispatch_id = "senior-reviewer"
             Utc::now() - ChronoDuration::seconds(120),
         )
         .expect("simulate a stale run recovered by the first resume");
+        create_inactive_worker_lineage_lease(&stale_run);
 
         let first = fixture
             .dispatch(
@@ -10097,6 +10226,19 @@ dispatch_id = "fake-worker"
                 .expect("attempt checkout parent")
                 .join("descendant-handoff")
         }
+
+        fn lineage_stdin(request: &SpawnRequest) -> std::fs::File {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let StdinMode::WorkerLineageLease(path) = &request.stdin else {
+                panic!("worker must receive a lineage lease")
+            };
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .expect("open worker-lineage lease as stdin")
+        }
     }
 
     #[cfg(unix)]
@@ -10123,10 +10265,12 @@ dispatch_id = "fake-worker"
                     .expect("create attempt-one stdout");
                 let stderr = std::fs::File::create(&request.stderr_path)
                     .expect("create attempt-one stderr");
+                let lineage_stdin = Self::lineage_stdin(request);
                 // The descendant leaves attempt one's process group entirely,
                 // publishes its readiness *before* attempt one exits, and only
                 // then predicts and writes attempt two's checkout.
                 let script = r#"
+                    exec 3<&0
                     python3 -c '
 import os, subprocess, sys, time
 os.setsid()
@@ -10159,7 +10303,7 @@ subprocess.run(
                     .arg(&escaped_pid)
                     .arg(&fallback_started)
                     .current_dir(&request.cwd)
-                    .stdin(Stdio::null())
+                    .stdin(Stdio::from(lineage_stdin))
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr))
                     .process_group(0)

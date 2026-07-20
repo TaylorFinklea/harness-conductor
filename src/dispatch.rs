@@ -66,6 +66,13 @@ pub(crate) struct DispatchRequest {
     /// The git committer identity this attempt's worker — and only this
     /// attempt's worker — runs under. See [`attempt_commit_identity`].
     pub(crate) attempt_identity: String,
+    /// Durable FIFO whose read end replaces `/dev/null` for this worker's
+    /// stdin and is duplicated onto an inherited descriptor before exec.
+    /// Descendants retain that descriptor across process-group changes and
+    /// `setsid(2)`, so Conductor can prove the worker lineage released it
+    /// before creating a later attempt checkout. The fixed per-run path also
+    /// survives an owner crash for stale-claim recovery.
+    pub(crate) lineage_lease_path: PathBuf,
 }
 
 /// Mints the unguessable git identity a single worker attempt commits under.
@@ -153,9 +160,10 @@ pub(crate) struct SpawnRequest {
     pub(crate) stderr_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StdinMode {
     Null,
+    WorkerLineageLease(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +231,13 @@ pub(crate) trait ChildProcess {
     /// prove.
     fn ensure_process_group_quiescent(&mut self) -> Result<()> {
         self.id().map_or(Ok(()), ensure_process_group_quiescent)
+    }
+    /// Proves both process-group and cross-session descendant quiescence.
+    /// Real worker children are wrapped with a durable inherited FIFO lease;
+    /// test doubles retain the process-group-only default unless they model
+    /// that lease explicitly.
+    fn ensure_worker_quiescent(&mut self) -> Result<()> {
+        self.ensure_process_group_quiescent()
     }
 }
 
@@ -344,25 +359,29 @@ where
             stderr_bytes: 0,
         });
     }
+    prepare_worker_lineage_lease(&request.lineage_lease_path)?;
     // Durably invalidate any earlier attempt's worker-group identity before
     // this attempt's process exists at all. A failure here must prevent the
     // spawn outright — see `WorkerHooks::on_pre_spawn`.
     hooks.on_pre_spawn()?;
-    let mut child = exec.spawn(&spawn)?;
+    let child = exec.spawn(&spawn)?;
+    let mut child = WorkerLineageChild {
+        child,
+        lineage_lease_path: request.lineage_lease_path.clone(),
+    };
     // Bind the run to this worker's process group before it can meaningfully
     // mutate the repository. If that durable record fails, tear the worker
     // (and any descendants) down rather than let a worker whose identity we
     // cannot prove keep running unattended.
     if let Err(error) = hooks.on_spawn(child.id()) {
-        if terminate_and_reap_best_effort(child.as_mut()) {
+        if terminate_and_reap_best_effort(&mut child) {
             return Err(error);
         }
         return Err(DispatchError::worker_state_uncertain(format!(
             "{error}; spawned worker process group could not be proven quiescent"
         )));
     }
-    let process =
-        wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
+    let process = wait_with_timeout_and_heartbeat(&mut child, timeout, heartbeat_interval, hooks)?;
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
     let (status, worker_commit) = classify(
@@ -431,7 +450,7 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
             ("GIT_COMMITTER_NAME".to_string(), ATTEMPT_IDENTITY_NAME.to_string()),
             ("GIT_COMMITTER_EMAIL".to_string(), request.attempt_identity.clone()),
         ],
-        stdin: StdinMode::Null,
+        stdin: StdinMode::WorkerLineageLease(request.lineage_lease_path.clone()),
         stdout_path,
         stderr_path,
     })
@@ -594,7 +613,7 @@ where
             }
         };
         if let Some(status) = status {
-            ensure_child_process_group_quiescent(child)?;
+            ensure_child_worker_quiescent(child)?;
             return Ok(ProcessRun {
                 status,
                 timed_out: false,
@@ -616,7 +635,7 @@ where
 
     let _ = child.terminate();
     if let Ok(Some(status)) = child.wait_for(KILL_GRACE) {
-        ensure_child_process_group_quiescent(child)?;
+        ensure_child_worker_quiescent(child)?;
         return Ok(ProcessRun {
             status,
             timed_out: true,
@@ -625,7 +644,7 @@ where
 
     let _ = child.kill();
     let status = child.wait()?;
-    ensure_child_process_group_quiescent(child)?;
+    ensure_child_worker_quiescent(child)?;
     Ok(ProcessRun {
         status,
         timed_out: true,
@@ -644,13 +663,13 @@ fn terminate_and_reap_best_effort(child: &mut dyn ChildProcess) -> bool {
     let _ = child.wait_for(KILL_GRACE);
     let _ = child.kill();
     let _ = child.wait();
-    child.ensure_process_group_quiescent().is_ok()
+    child.ensure_worker_quiescent().is_ok()
 }
 
-fn ensure_child_process_group_quiescent(child: &mut dyn ChildProcess) -> Result<()> {
-    child.ensure_process_group_quiescent().map_err(|error| {
+fn ensure_child_worker_quiescent(child: &mut dyn ChildProcess) -> Result<()> {
+    child.ensure_worker_quiescent().map_err(|error| {
         DispatchError::worker_state_uncertain(format!(
-            "worker process-group quiescence could not be proven: {error}"
+            "worker process-group and lineage quiescence could not be proven: {error}"
         ))
     })
 }
@@ -710,6 +729,215 @@ fn file_len(path: &Path) -> Result<u64> {
         .map_err(|e| DispatchError::new(format!("failed to stat {}: {e}", path.display())))
 }
 
+const WORKER_LINEAGE_LEASE_FILE: &str = "worker-lineage.fifo";
+
+/// The stable per-run lease path used both by live dispatch and crash
+/// recovery. Reusing one path across fallback attempts makes lease handoff
+/// serial: a later attempt cannot start until every reader inherited from the
+/// prior attempt has disappeared.
+pub(crate) fn worker_lineage_lease_path(run_dir: &Path) -> PathBuf {
+    run_dir.join(WORKER_LINEAGE_LEASE_FILE)
+}
+
+#[cfg(unix)]
+pub(crate) fn prepare_worker_lineage_lease(path: &Path) -> Result<()> {
+    use std::io::ErrorKind;
+
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_worker_lineage_fifo(path)?;
+            if worker_lineage_active(path)? {
+                return Err(DispatchError::worker_state_uncertain(format!(
+                    "earlier worker lineage still holds {}",
+                    path.display()
+                )));
+            }
+            fs::remove_file(path).map_err(|error| {
+                DispatchError::new(format!(
+                    "remove inactive worker-lineage lease {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(DispatchError::new(format!(
+                "inspect worker-lineage lease {}: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        DispatchError::new(format!(
+            "worker-lineage lease has no parent: {}",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        DispatchError::new(format!(
+            "create worker-lineage lease directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let output = Command::new("mkfifo")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            DispatchError::new(format!(
+                "spawn mkfifo for worker-lineage lease {}: {error}",
+                path.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(DispatchError::new(format!(
+            "mkfifo worker-lineage lease {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    validate_worker_lineage_fifo(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn prepare_worker_lineage_lease(_path: &Path) -> Result<()> {
+    Err(DispatchError::new(
+        "worker-lineage leases are only implemented on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn validate_worker_lineage_fifo(path: &Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        DispatchError::new(format!(
+            "inspect worker-lineage lease {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_fifo() {
+        Ok(())
+    } else {
+        Err(DispatchError::worker_state_uncertain(format!(
+            "worker-lineage lease is not a FIFO: {}",
+            path.display()
+        )))
+    }
+}
+
+/// Returns whether any process still holds the inherited read end of a
+/// worker's durable lineage FIFO. Opening the write end nonblocking succeeds
+/// exactly while at least one reader survives; `ENXIO` proves there are none.
+#[cfg(unix)]
+pub(crate) fn worker_lineage_active(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    validate_worker_lineage_fifo(path)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => Ok(false),
+        Err(error) => Err(DispatchError::worker_state_uncertain(format!(
+            "probe worker-lineage lease {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn worker_lineage_active(_path: &Path) -> Result<bool> {
+    Err(DispatchError::worker_state_uncertain(
+        "worker-lineage lease probes are only implemented on Unix",
+    ))
+}
+
+fn wait_for_worker_lineage_exit(path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !worker_lineage_active(path)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(DispatchError::worker_state_uncertain(format!(
+                "worker lineage still holds {} after process-group quiescence",
+                path.display()
+            )));
+        }
+        std::thread::sleep(WAIT_POLL);
+    }
+}
+
+fn stdin_for_mode(mode: &StdinMode) -> Result<Stdio> {
+    match mode {
+        StdinMode::Null => Ok(Stdio::null()),
+        StdinMode::WorkerLineageLease(path) => worker_lineage_stdin(path),
+    }
+}
+
+#[cfg(unix)]
+fn worker_lineage_stdin(path: &Path) -> Result<Stdio> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    validate_worker_lineage_fifo(path)?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map(Stdio::from)
+        .map_err(|error| {
+            DispatchError::new(format!(
+                "open worker-lineage lease {} for child stdin: {error}",
+                path.display()
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+fn worker_lineage_stdin(_path: &Path) -> Result<Stdio> {
+    Err(DispatchError::new(
+        "worker-lineage leases are only implemented on Unix",
+    ))
+}
+
+struct WorkerLineageChild {
+    child: Box<dyn ChildProcess>,
+    lineage_lease_path: PathBuf,
+}
+
+impl ChildProcess for WorkerLineageChild {
+    fn wait_for(&mut self, timeout: Duration) -> Result<Option<ProcessStatus>> {
+        self.child.wait_for(timeout)
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        self.child.terminate()
+    }
+
+    fn kill(&mut self) -> Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> Result<ProcessStatus> {
+        self.child.wait()
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    fn ensure_worker_quiescent(&mut self) -> Result<()> {
+        self.child.ensure_worker_quiescent()?;
+        wait_for_worker_lineage_exit(&self.lineage_lease_path, KILL_GRACE)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CommandExec;
 
@@ -730,14 +958,31 @@ impl Exec for CommandExec {
                 request.stderr_path.display()
             ))
         })?;
-        let mut command = Command::new(program);
+        let mut command = match &request.stdin {
+            StdinMode::Null => {
+                let mut command = Command::new(program);
+                command.args(args);
+                command
+            }
+            StdinMode::WorkerLineageLease(_) => {
+                // POSIX shells may replace fd 0 with `/dev/null` for an
+                // asynchronous child. Duplicate the FIFO first so a
+                // background descendant that calls `setsid(2)` still holds
+                // the lineage lease even when its stdin is redirected.
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg("exec 3<&0; exec \"$@\"")
+                    .arg("conductor-worker-lineage")
+                    .arg(program)
+                    .args(args);
+                command
+            }
+        };
         command
-            .args(args)
             .current_dir(&request.cwd)
             .envs(request.env.iter().map(|(key, value)| (key, value)))
-            .stdin(match request.stdin {
-                StdinMode::Null => Stdio::null(),
-            })
+            .stdin(stdin_for_mode(&request.stdin)?)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         // Make the worker the leader of its own process group so a timeout
@@ -1028,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_backend_uses_pinned_argv_repo_cwd_and_null_stdin() {
+    fn pi_backend_uses_pinned_argv_repo_cwd_and_lineage_lease_stdin() {
         let temp = TempDir::new("pi-argv");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
@@ -1067,7 +1312,10 @@ mod tests {
             ]
         );
         assert_eq!(spawn.cwd, repo);
-        assert_eq!(spawn.stdin, StdinMode::Null);
+        assert_eq!(
+            spawn.stdin,
+            StdinMode::WorkerLineageLease(repo.join("worker-lineage.fifo"))
+        );
         assert_eq!(
             spawn.stdout_path,
             temp.path().join("logs/cycle-1/bead-1/001-worker.out")
@@ -1695,6 +1943,7 @@ mod tests {
             reasoning_effort: None,
             prompt: PROMPT.to_string(),
             attempt_identity: TEST_ATTEMPT_IDENTITY.to_string(),
+            lineage_lease_path: repo.join("worker-lineage.fifo"),
         }
     }
 
@@ -2028,6 +2277,69 @@ mod tests {
             !process_alive(grandchild_pid),
             "grandchild process must not survive killing the process group"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_exec_lineage_lease_survives_a_descendants_setsid() {
+        let temp = TempDir::new("setsid-lineage-lease");
+        let marker = temp.path().join("escaped.pid");
+        let lease = temp.path().join("worker-lineage.fifo");
+        prepare_worker_lineage_lease(&lease).expect("create worker-lineage lease");
+        let script = r#"
+            python3 -c '
+import os, sys, time
+os.setsid()
+with open(sys.argv[1], "w") as fh:
+    fh.write(str(os.getpid()))
+time.sleep(30)
+' "$1" &
+            while [ ! -s "$1" ]; do sleep 0.01; done
+            exit 0
+        "#;
+        let request = SpawnRequest {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                script.to_string(),
+                "setsid-lineage-lease".to_string(),
+                marker.display().to_string(),
+            ],
+            cwd: temp.path().to_path_buf(),
+            env: Vec::new(),
+            stdin: StdinMode::WorkerLineageLease(lease.clone()),
+            stdout_path: temp.path().join("out.log"),
+            stderr_path: temp.path().join("err.log"),
+        };
+
+        let child = CommandExec.spawn(&request).expect("spawn worker shell");
+        let mut child = WorkerLineageChild {
+            child,
+            lineage_lease_path: lease.clone(),
+        };
+        let status = child
+            .wait_for(Duration::from_secs(5))
+            .expect("wait for direct worker")
+            .expect("direct worker exits");
+        assert!(status.success());
+        let escaped_pid = wait_for_pid_marker(&marker);
+        assert!(process_alive(escaped_pid));
+
+        let error = child
+            .ensure_worker_quiescent()
+            .expect_err("setsid descendant must keep the worker lineage unquiesced");
+        assert!(error.to_string().contains("worker lineage still holds"));
+
+        Command::new("kill")
+            .arg("-KILL")
+            .arg(escaped_pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill escaped descendant");
+        wait_for_worker_lineage_exit(&lease, Duration::from_secs(2))
+            .expect("escaped descendant releases the lineage lease after death");
     }
 
     #[cfg(unix)]
