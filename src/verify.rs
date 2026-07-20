@@ -2284,6 +2284,14 @@ mod tests {
         ) -> crate::dispatch::Result<bool> {
             Ok(true)
         }
+
+        fn committer_email(
+            &self,
+            _repo: &Path,
+            _commit: &str,
+        ) -> crate::dispatch::Result<Option<String>> {
+            Ok(None)
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

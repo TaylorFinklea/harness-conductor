@@ -7,11 +7,12 @@ use std::fmt;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{Backend, ReasoningEffort};
 
 const PI_THINKING: &str = "xhigh";
+const ATTEMPT_IDENTITY_NAME: &str = "Conductor Worker Attempt";
 const KILL_GRACE: Duration = Duration::from_secs(3);
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
@@ -62,6 +63,59 @@ pub(crate) struct DispatchRequest {
     pub(crate) dispatch_id: String,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) prompt: String,
+    /// The git committer identity this attempt's worker — and only this
+    /// attempt's worker — runs under. See [`attempt_commit_identity`].
+    pub(crate) attempt_identity: String,
+}
+
+/// Mints the unguessable git identity a single worker attempt commits under.
+///
+/// An isolated attempt checkout is not an exclusive boundary on its own: any
+/// same-user process — notably a descendant of an *earlier* attempt that
+/// escaped its process group with `setsid(2)` — can discover a later attempt's
+/// checkout path and commit inside it. Filesystem secrecy cannot fix that,
+/// because the same user may always list a directory it owns.
+///
+/// What such a process cannot obtain is the identity minted *after* it was
+/// spawned. Conductor exports this value to the worker through `GIT_*_NAME` /
+/// `GIT_*_EMAIL`, which every descendant of that worker inherits automatically
+/// and no earlier attempt's environment can contain, and then requires an
+/// accepted commit to carry it. That binds a commit to the process Conductor
+/// actually dispatched rather than to whoever held write access to the tree.
+pub(crate) fn attempt_commit_identity() -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::hash::BuildHasher;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = Sha256::new();
+    let mut seed = [0u8; 32];
+    if File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut seed))
+        .is_ok()
+    {
+        hasher.update(seed);
+    }
+    // Mixed in unconditionally so a platform without `/dev/urandom` still
+    // yields a value an already-running process cannot predict.
+    let per_process = std::collections::hash_map::RandomState::new();
+    hasher.update(
+        per_process
+            .hash_one(MINTED.fetch_add(1, Ordering::Relaxed))
+            .to_le_bytes(),
+    );
+    hasher.update(std::process::id().to_le_bytes());
+    if let Ok(since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        hasher.update(since_epoch.as_nanos().to_le_bytes());
+    }
+    let mut nonce = String::with_capacity(32);
+    for byte in hasher.finalize().iter().take(16) {
+        let _ = write!(nonce, "{byte:02x}");
+    }
+    format!("conductor-attempt-{nonce}@invalid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,9 +268,21 @@ pub(crate) trait CommitProbe {
     fn is_clean(&self, repo: &Path) -> Result<bool>;
     /// Proves `commit` is the single commit immediately after `before`.
     /// Dispatch only invokes this against a parent-created, attempt-specific
-    /// checkout, so the observed checkout HEAD — not worker-controlled stdout
-    /// or Git identity metadata — is the ownership boundary.
+    /// checkout, so the observed checkout HEAD — never worker-controlled
+    /// stdout — is what dispatch reads the commit from.
     fn is_direct_child(&self, repo: &Path, before: Option<&str>, commit: &str) -> Result<bool>;
+    /// The committer email recorded on `commit`.
+    ///
+    /// This is *not* identity the worker asserts about itself: Conductor mints
+    /// a fresh, unguessable identity per attempt (see
+    /// [`attempt_commit_identity`]) and hands it to the worker through the
+    /// spawn environment. It is therefore an *inter-attempt* boundary — it
+    /// proves a commit came from the process tree Conductor dispatched for
+    /// this attempt, not from some other process with write access to the
+    /// checkout, such as an escaped descendant of an earlier attempt. It says
+    /// nothing about whether the work itself is good; that is verification's
+    /// job.
+    fn committer_email(&self, repo: &Path, commit: &str) -> Result<Option<String>>;
 }
 
 pub(crate) fn run<E: Exec, C: CommitProbe>(
@@ -305,6 +371,7 @@ where
         request.before_head.as_deref(),
         commits,
         &request.repo,
+        &request.attempt_identity,
     )?;
 
     Ok(DispatchResult {
@@ -356,7 +423,14 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
             &request.repo,
         )?,
         cwd: request.repo.clone(),
-        env: Vec::new(),
+        // Every commit the worker (or any process it spawns) makes inherits
+        // this attempt's identity; `classify` accepts nothing else.
+        env: vec![
+            ("GIT_AUTHOR_NAME".to_string(), ATTEMPT_IDENTITY_NAME.to_string()),
+            ("GIT_AUTHOR_EMAIL".to_string(), request.attempt_identity.clone()),
+            ("GIT_COMMITTER_NAME".to_string(), ATTEMPT_IDENTITY_NAME.to_string()),
+            ("GIT_COMMITTER_EMAIL".to_string(), request.attempt_identity.clone()),
+        ],
         stdin: StdinMode::Null,
         stdout_path,
         stderr_path,
@@ -587,6 +661,7 @@ fn classify<C: CommitProbe + ?Sized>(
     before_head: Option<&str>,
     commits: &C,
     repo: &Path,
+    attempt_identity: &str,
 ) -> Result<(DispatchStatus, Option<String>)> {
     if process.timed_out {
         return Ok((DispatchStatus::Failed(DispatchFailure::TimedOut), None));
@@ -602,9 +677,15 @@ fn classify<C: CommitProbe + ?Sized>(
 
     let after_head = commits.head(repo)?;
     if after_head.as_deref() != before_head {
+        // A new, clean, direct-child commit is necessary but not sufficient:
+        // it must also carry *this* attempt's identity. Otherwise any process
+        // with write access to the checkout — including an escaped descendant
+        // of an earlier attempt — could author the commit this worker is
+        // credited with.
         if let Some(commit) = after_head.as_deref()
             && commits.is_direct_child(repo, before_head, commit)?
             && commits.is_clean(repo)?
+            && commits.committer_email(repo, commit)?.as_deref() == Some(attempt_identity)
         {
             return Ok((DispatchStatus::Success, after_head));
         }
@@ -899,6 +980,28 @@ impl CommitProbe for GitCommitProbe {
             None => fields.next().is_none(),
         })
     }
+
+    fn committer_email(&self, repo: &Path, commit: &str) -> Result<Option<String>> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["show", "--no-patch", "--format=%ce", commit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| {
+                DispatchError::new(format!(
+                    "failed to read committer identity in {}: {e}",
+                    repo.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let email = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok((!email.is_empty()).then_some(email))
+    }
 }
 
 #[cfg(test)]
@@ -973,7 +1076,30 @@ mod tests {
             spawn.stderr_path,
             temp.path().join("logs/cycle-1/bead-1/001-worker.err")
         );
-        assert!(spawn.env.is_empty());
+        // The worker — and every process it spawns — commits under this
+        // attempt's identity, which is what binds an observed commit to the
+        // process Conductor dispatched.
+        assert_eq!(
+            spawn.env,
+            vec![
+                (
+                    "GIT_AUTHOR_NAME".to_string(),
+                    ATTEMPT_IDENTITY_NAME.to_string()
+                ),
+                (
+                    "GIT_AUTHOR_EMAIL".to_string(),
+                    TEST_ATTEMPT_IDENTITY.to_string()
+                ),
+                (
+                    "GIT_COMMITTER_NAME".to_string(),
+                    ATTEMPT_IDENTITY_NAME.to_string()
+                ),
+                (
+                    "GIT_COMMITTER_EMAIL".to_string(),
+                    TEST_ATTEMPT_IDENTITY.to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1550,6 +1676,7 @@ mod tests {
     }
 
     const PROMPT: &str = "work on the bead";
+    const TEST_ATTEMPT_IDENTITY: &str = "conductor-attempt-test@invalid";
 
     fn request(
         repo: &Path,
@@ -1567,6 +1694,7 @@ mod tests {
             dispatch_id: dispatch_id.to_string(),
             reasoning_effort: None,
             prompt: PROMPT.to_string(),
+            attempt_identity: TEST_ATTEMPT_IDENTITY.to_string(),
         }
     }
 
@@ -1641,13 +1769,10 @@ mod tests {
 
     impl Exec for DirectChildExec {
         fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>> {
-            std::fs::write(request.cwd.join("foreign.txt"), b"foreign\n")
-                .expect("write foreign change");
-            git(&request.cwd, &["add", "foreign.txt"]);
-            git(
-                &request.cwd,
-                &["commit", "-m", "foreign: concurrent change"],
-            );
+            std::fs::write(request.cwd.join("worker.txt"), b"worker\n")
+                .expect("write worker change");
+            git_as_worker(request, &["add", "worker.txt"]);
+            git_as_worker(request, &["commit", "-m", "worker: clean direct child"]);
             std::fs::write(&request.stdout_path, b"worker complete\n")
                 .expect("write worker stdout");
             std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
@@ -1683,6 +1808,28 @@ mod tests {
                 Vec::new(),
             )))))
         }
+    }
+
+    /// Runs git under the spawn environment, so the commit carries the
+    /// per-attempt identity a real worker process inherits.
+    fn git_as_worker(request: &SpawnRequest, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&request.cwd)
+            .args(args)
+            .envs(request.env.iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn git as worker");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn git(repo: &Path, args: &[&str]) -> String {
@@ -1834,6 +1981,10 @@ mod tests {
             commit: &str,
         ) -> Result<bool> {
             Ok(matches!(commit, WORKER_COMMIT | "after"))
+        }
+
+        fn committer_email(&self, _repo: &Path, _commit: &str) -> Result<Option<String>> {
+            Ok(Some(TEST_ATTEMPT_IDENTITY.to_string()))
         }
     }
 

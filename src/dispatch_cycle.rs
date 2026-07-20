@@ -55,14 +55,17 @@ pub(crate) struct DispatchCycleOptions {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    clippy::enum_variant_names,
-    reason = "each variant is named for the promotion step it interrupts after"
-)]
 enum PromotionInterruption {
     AfterMergeBeforeReceipt,
     AfterReceiptBeforeCleanup,
     AfterCleanupBeforeAttemptFinished,
+    /// The canonical merge ran and moved HEAD, but its outcome could not be
+    /// read back — the ambiguous case where refusing to promote would strand a
+    /// canonical repository that has *already* advanced.
+    MergeOutcomeUncertain,
+    /// The promotion receipt is durable and HEAD has moved, but the read-back
+    /// that confirms it fails transiently.
+    HeadConfirmationProbeFails,
 }
 
 impl DispatchCycleOptions {
@@ -834,7 +837,9 @@ fn git_worktree_paths(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "promotion binds the worker commit to its leased attempt and durable receipt explicitly"
+    clippy::too_many_lines,
+    reason = "promotion binds the worker commit to its leased attempt and durable receipt \
+              explicitly, and each step's ambiguous-outcome branch is spelled out in place"
 )]
 fn promote_attempt_commit<C: CommitProbe + ?Sized>(
     commits: &C,
@@ -890,22 +895,48 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
     };
     write_promotion_record(run_artifacts.dir(), &promotion)?;
 
-    let output = std::process::Command::new("git")
+    let merge = std::process::Command::new("git")
         .arg("-C")
         .arg(canonical_repo)
         .args(["merge", "--ff-only", "--no-edit", worker_commit])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| {
-            DispatchCycleError::message(format!("promote isolated worker commit: {error}"))
-        })?;
+        .output();
+    let merge = if merge_outcome_is_unreadable(options) {
+        Err(std::io::Error::other(
+            "simulated unreadable promotion merge outcome",
+        ))
+    } else {
+        merge
+    };
+    // From here on the merge may already have moved canonical HEAD. Any
+    // outcome we cannot read back is *ambiguous*, not a refusal: only a HEAD
+    // we can prove is still `before_head` may be reported as a promotion
+    // refusal, because only that outcome is safe to release and re-dispatch.
+    let output = match merge {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(ambiguous_promotion_outcome(
+                commits,
+                canonical_repo,
+                before_head,
+                worker_commit,
+                &format!("promote isolated worker commit: {error}"),
+            ));
+        }
+    };
     if !output.status.success() {
-        return Err(DispatchCycleError::message(format!(
-            "promote isolated worker commit failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        return Err(ambiguous_promotion_outcome(
+            commits,
+            canonical_repo,
+            before_head,
+            worker_commit,
+            &format!(
+                "promote isolated worker commit failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
     }
     if interrupt_after_promotion_merge(options) {
         return Err(DispatchCycleError::recovery_required(
@@ -918,16 +949,59 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
             "canonical promotion completed but receipt persistence failed: {error}"
         ))
     })?;
-    let promoted_head = commits
-        .head(canonical_repo)
-        .map_err(|error| DispatchCycleError::message(format!("promoted git head: {error}")))?;
+    let promoted_head = if head_confirmation_probe_fails(options) {
+        Err(crate::dispatch::DispatchError::new(
+            "simulated transient promoted-head probe failure",
+        ))
+    } else {
+        commits.head(canonical_repo)
+    };
+    // The receipt is durable and the merge reported success, so the promotion
+    // is a fact regardless of whether this confirming probe can observe it.
+    // Downgrading here would release an already-promoted Bead.
+    let promoted_head = promoted_head.map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "canonical promotion receipt is durable but its confirming HEAD probe failed \
+             ({error}); claim and attempt checkout retained for dispatch --resume"
+        ))
+    })?;
     if promoted_head.as_deref() != Some(worker_commit) {
-        return Err(DispatchCycleError::message(format!(
-            "promoted HEAD mismatch: expected {worker_commit}, found {}",
+        return Err(DispatchCycleError::recovery_required(format!(
+            "promoted HEAD mismatch: expected {worker_commit}, found {}; \
+             claim and attempt checkout retained for dispatch --resume",
             promoted_head.as_deref().unwrap_or("<none>")
         )));
     }
     Ok(())
+}
+
+/// Classifies an outcome observed *after* the canonical merge may have moved
+/// HEAD. A promotion refusal — which releases the claim and re-dispatches the
+/// Bead — is only reported when canonical HEAD is provably still `before_head`;
+/// everything else preserves the claim for `dispatch --resume`.
+fn ambiguous_promotion_outcome<C: CommitProbe + ?Sized>(
+    commits: &C,
+    canonical_repo: &Path,
+    before_head: &str,
+    worker_commit: &str,
+    context: &str,
+) -> DispatchCycleError {
+    match commits.head(canonical_repo) {
+        Ok(head) if head.as_deref() == Some(before_head) => DispatchCycleError::message(format!(
+            "{context}; canonical HEAD is unchanged at {before_head}"
+        )),
+        Ok(head) => DispatchCycleError::recovery_required(format!(
+            "{context}; canonical HEAD is {} rather than {before_head}, so promotion of \
+             {worker_commit} is undecided; claim and attempt checkout retained for \
+             dispatch --resume",
+            head.as_deref().unwrap_or("<none>")
+        )),
+        Err(error) => DispatchCycleError::recovery_required(format!(
+            "{context}; canonical HEAD could not be read back ({error}), so promotion of \
+             {worker_commit} is undecided; claim and attempt checkout retained for \
+             dispatch --resume"
+        )),
+    }
 }
 
 fn interrupt_after_promotion_merge(options: &DispatchCycleOptions) -> bool {
@@ -935,6 +1009,30 @@ fn interrupt_after_promotion_merge(options: &DispatchCycleOptions) -> bool {
     {
         options.promotion_interruption
             == Some(PromotionInterruption::AfterMergeBeforeReceipt)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        false
+    }
+}
+
+fn merge_outcome_is_unreadable(options: &DispatchCycleOptions) -> bool {
+    #[cfg(test)]
+    {
+        options.promotion_interruption == Some(PromotionInterruption::MergeOutcomeUncertain)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        false
+    }
+}
+
+fn head_confirmation_probe_fails(options: &DispatchCycleOptions) -> bool {
+    #[cfg(test)]
+    {
+        options.promotion_interruption == Some(PromotionInterruption::HeadConfirmationProbeFails)
     }
     #[cfg(not(test))]
     {
@@ -2480,6 +2578,10 @@ where
                 prior_capture.as_ref(),
                 run_artifacts.dir(),
             ),
+            // Minted per attempt, after every earlier attempt has already been
+            // spawned, so no earlier attempt's process — however it escaped —
+            // can author a commit this attempt will be credited with.
+            attempt_identity: dispatch::attempt_commit_identity(),
         };
         let result = {
             // Reborrow the run handle for the duration of the worker so both
@@ -5552,13 +5654,21 @@ dispatch_id = "senior-reviewer"
         )
         .expect("read report");
 
-        assert_eq!(result.dispatched, 2, "{report}");
-        assert_eq!(result.verified, 0);
+        // Both attempts really ran: the escaped descendant reached — and
+        // committed inside — the second attempt's checkout, so this RED
+        // exercises the forgery rather than merely failing earlier.
+        assert_eq!(exec.worker_spawns(), 2, "{report}");
+        assert_eq!(
+            result.verified, 0,
+            "a commit authored by an escaped descendant of an earlier attempt \
+             must never be credited to the fallback worker:\n{report}"
+        );
         assert_eq!(result.failed, 1);
         assert_eq!(fixture.bd.close_count(), 0);
         assert_eq!(
             git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
-            before_head
+            before_head,
+            "canonical HEAD must not advance on a forged attempt commit"
         );
     }
 
@@ -5617,6 +5727,33 @@ dispatch_id = "senior-reviewer"
             PromotionInterruption::AfterCleanupBeforeAttemptFinished,
             "promoted",
             false,
+        );
+    }
+
+    /// Once the canonical merge may have moved HEAD, an unreadable merge
+    /// outcome is *ambiguous*, not a refusal: the claim must survive and
+    /// recovery must resume from the journaled HEAD.
+    #[test]
+    fn promotion_intent_recovers_an_unreadable_merge_outcome() {
+        assert_promotion_boundary_recovers(
+            "promotion-merge-unreadable",
+            PromotionInterruption::MergeOutcomeUncertain,
+            "intent",
+            true,
+        );
+    }
+
+    /// A durable receipt plus an advanced canonical HEAD must never be
+    /// downgraded to `UnauthenticatedCommit` just because the confirming probe
+    /// failed transiently — that releases and re-dispatches an already
+    /// promoted Bead.
+    #[test]
+    fn promotion_receipt_recovers_a_failed_head_confirmation_probe() {
+        assert_promotion_boundary_recovers(
+            "promotion-head-probe",
+            PromotionInterruption::HeadConfirmationProbeFails,
+            "promoted",
+            true,
         );
     }
 
@@ -5705,6 +5842,14 @@ dispatch_id = "senior-reviewer"
                 commit: &str,
             ) -> crate::dispatch::Result<bool> {
                 GitCommitProbe.is_direct_child(repo, before, commit)
+            }
+
+            fn committer_email(
+                &self,
+                repo: &Path,
+                commit: &str,
+            ) -> crate::dispatch::Result<Option<String>> {
+                GitCommitProbe.committer_email(repo, commit)
             }
         }
 
@@ -9144,6 +9289,27 @@ dispatch_id = "fake-worker"
         }
     }
 
+    /// Runs git in the attempt checkout under the spawn environment, so a fake
+    /// worker's commit carries the per-attempt identity a real worker process
+    /// inherits — and which `classify` requires before crediting the attempt.
+    fn run_as_worker(request: &SpawnRequest, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&request.cwd)
+            .envs(request.env.iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn git as worker");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn run(cwd: &Path, program: &str, args: &[&str]) {
         let output = Command::new(program)
             .args(args)
@@ -9324,6 +9490,14 @@ dispatch_id = "fake-worker"
         ) -> crate::dispatch::Result<bool> {
             panic!("commit probe should not run")
         }
+
+        fn committer_email(
+            &self,
+            _repo: &Path,
+            _commit: &str,
+        ) -> crate::dispatch::Result<Option<String>> {
+            panic!("commit probe should not run")
+        }
     }
 
     struct DirtyAfterVerifyCommitProbe {
@@ -9365,6 +9539,14 @@ dispatch_id = "fake-worker"
             commit: &str,
         ) -> crate::dispatch::Result<bool> {
             GitCommitProbe.is_direct_child(repo, before, commit)
+        }
+
+        fn committer_email(
+            &self,
+            repo: &Path,
+            commit: &str,
+        ) -> crate::dispatch::Result<Option<String>> {
+            GitCommitProbe.committer_email(repo, commit)
         }
     }
 
@@ -9636,12 +9818,8 @@ dispatch_id = "fake-worker"
                 std::fs::write(&request.stderr_path, b"").expect("write worker stderr");
                 std::fs::write(request.cwd.join("worker.txt"), b"done\n")
                     .expect("write worker file");
-                run(&request.cwd, "git", &["add", "worker.txt"]);
-                run(
-                    &request.cwd,
-                    "git",
-                    &["commit", "-m", "worker: complete sandbox bead"],
-                );
+                run_as_worker(request, &["add", "worker.txt"]);
+                run_as_worker(request, &["commit", "-m", "worker: complete sandbox bead"]);
                 write_worker_stdout(request, "worker ran");
                 return Ok(Box::new(FakeChild::delayed_success()));
             }
@@ -9740,10 +9918,9 @@ dispatch_id = "fake-worker"
                 if worker == 0 {
                     std::fs::write(request.cwd.join("worker.txt"), b"done\n")
                         .expect("write worker file");
-                    run(&request.cwd, "git", &["add", "worker.txt"]);
-                    run(
-                        &request.cwd,
-                        "git",
+                    run_as_worker(request, &["add", "worker.txt"]);
+                    run_as_worker(
+                        request,
                         &["commit", "-m", "worker: verified bursar-d6r artifact"],
                     );
                 }
@@ -9887,10 +10064,16 @@ dispatch_id = "fake-worker"
         }
     }
 
+    /// The escaped descendant re-sessions with `setsid(2)` before attempt one
+    /// exits, so process-group quiescence is provably satisfied while the
+    /// descendant is still alive and still able to write the *next* attempt's
+    /// checkout. Only a per-attempt commit identity — which attempt one's
+    /// environment cannot contain — can reject what it commits there.
     #[cfg(unix)]
     struct DescendantForgeryExec {
         worker_spawns: RefCell<usize>,
         attempt_one_pgid: RefCell<Option<u32>>,
+        escaped_pid_marker: RefCell<Option<PathBuf>>,
     }
 
     #[cfg(unix)]
@@ -9899,9 +10082,25 @@ dispatch_id = "fake-worker"
             Self {
                 worker_spawns: RefCell::new(0),
                 attempt_one_pgid: RefCell::new(None),
+                escaped_pid_marker: RefCell::new(None),
             }
         }
+
+        fn worker_spawns(&self) -> usize {
+            *self.worker_spawns.borrow()
+        }
+
+        fn handoff_dir(request: &SpawnRequest) -> PathBuf {
+            request
+                .cwd
+                .parent()
+                .expect("attempt checkout parent")
+                .join("descendant-handoff")
+        }
     }
+
+    #[cfg(unix)]
+    const ESCAPED_FORGERY_SUBJECT: &str = "forged: escaped descendant direct child";
 
     #[cfg(unix)]
     impl Exec for DescendantForgeryExec {
@@ -9915,19 +10114,40 @@ dispatch_id = "fake-worker"
                     .parent()
                     .expect("attempt checkout parent")
                     .join("002-fallback-worker");
+                let handoff = Self::handoff_dir(request);
+                std::fs::create_dir_all(&handoff).expect("create descendant handoff dir");
+                let escaped_pid = handoff.join("escaped.pid");
+                let fallback_started = handoff.join("fallback-started");
+                *self.escaped_pid_marker.borrow_mut() = Some(escaped_pid.clone());
                 let stdout = std::fs::File::create(&request.stdout_path)
                     .expect("create attempt-one stdout");
                 let stderr = std::fs::File::create(&request.stderr_path)
                     .expect("create attempt-one stderr");
+                // The descendant leaves attempt one's process group entirely,
+                // publishes its readiness *before* attempt one exits, and only
+                // then predicts and writes attempt two's checkout.
                 let script = r#"
-                    (
-                        trap '' HUP
-                        while [ ! -e "$1/.git" ]; do sleep 0.01; done
-                        cd "$1" || exit 1
-                        printf 'forged by stale descendant\n' > worker.txt
-                        git add worker.txt
-                        git commit -m 'forged: stale descendant direct child'
-                    ) &
+                    python3 -c '
+import os, subprocess, sys, time
+os.setsid()
+target, ready, started = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(ready, "w") as fh:
+    fh.write(str(os.getpid()))
+deadline = time.time() + 30
+while time.time() < deadline and not (
+    os.path.exists(os.path.join(target, ".git")) and os.path.exists(started)
+):
+    time.sleep(0.01)
+with open(os.path.join(target, "worker.txt"), "w") as fh:
+    fh.write("forged by escaped descendant\n")
+subprocess.run(["git", "add", "worker.txt"], cwd=target, check=False)
+subprocess.run(
+    ["git", "commit", "-m", "forged: escaped descendant direct child"],
+    cwd=target,
+    check=False,
+)
+' "$1" "$2" "$3" &
+                    while [ ! -s "$2" ]; do sleep 0.01; done
                     printf 'HTTP 429 capacity exhausted\n' >&2
                     exit 1
                 "#;
@@ -9936,25 +10156,37 @@ dispatch_id = "fake-worker"
                     .arg(script)
                     .arg("descendant-forgery")
                     .arg(&fallback_checkout)
+                    .arg(&escaped_pid)
+                    .arg(&fallback_started)
                     .current_dir(&request.cwd)
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr))
                     .process_group(0)
                     .spawn()
-                    .expect("spawn failed worker with background descendant");
+                    .expect("spawn failed worker with escaping descendant");
                 *self.attempt_one_pgid.borrow_mut() = Some(child.id());
                 return Ok(Box::new(RealProcessGroupChild { child }));
             }
             if request.argv.iter().any(|arg| arg == "fallback-worker") {
                 *self.worker_spawns.borrow_mut() += 1;
-                let deadline = Instant::now() + Duration::from_secs(2);
+                // Release the descendant only once the fallback attempt is
+                // genuinely under way, so its commit lands inside the window
+                // Conductor attributes to *this* worker.
+                std::fs::write(Self::handoff_dir(request).join("fallback-started"), b"go\n")
+                    .expect("write fallback-started marker");
+                let deadline = Instant::now() + Duration::from_secs(30);
                 while Instant::now() < deadline
-                    && git(&request.cwd, &["log", "-1", "--format=%s"])
-                        != "forged: stale descendant direct child"
+                    && git(&request.cwd, &["log", "-1", "--format=%s"]).trim()
+                        != ESCAPED_FORGERY_SUBJECT
                 {
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                assert_eq!(
+                    git(&request.cwd, &["log", "-1", "--format=%s"]).trim(),
+                    ESCAPED_FORGERY_SUBJECT,
+                    "the escaped descendant must land its forged commit for this RED to bite"
+                );
                 std::fs::write(&request.stdout_path, b"fallback exited without a commit\n")
                     .expect("write fallback stdout");
                 std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
@@ -9986,6 +10218,20 @@ dispatch_id = "fake-worker"
                 let _ = Command::new("kill")
                     .arg("-KILL")
                     .arg(format!("-{pgid}"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            // The escaped descendant is in its own session, so the group kill
+            // above cannot reach it; reap it by pid or it outlives the test.
+            if let Some(marker) = self.escaped_pid_marker.borrow().as_ref()
+                && let Ok(pid) = std::fs::read_to_string(marker)
+                && !pid.trim().is_empty()
+            {
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(pid.trim())
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -10259,10 +10505,9 @@ dispatch_id = "fake-worker"
                 std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
                 std::fs::write(request.cwd.join("worker.txt"), b"done\n")
                     .expect("write worker file");
-                run(&request.cwd, "git", &["add", "worker.txt"]);
-                run(
-                    &request.cwd,
-                    "git",
+                run_as_worker(request, &["add", "worker.txt"]);
+                run_as_worker(
+                    request,
                     &["commit", "-m", "worker: fallback complete sandbox bead"],
                 );
                 write_worker_stdout(request, "fallback worker ran");
@@ -10364,10 +10609,9 @@ dispatch_id = "fake-worker"
                 std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
                 std::fs::write(request.cwd.join("worker.txt"), b"done\n")
                     .expect("write worker file");
-                run(&request.cwd, "git", &["add", "worker.txt"]);
-                run(
-                    &request.cwd,
-                    "git",
+                run_as_worker(request, &["add", "worker.txt"]);
+                run_as_worker(
+                    request,
                     &["commit", "-m", "worker: fallback complete sandbox bead"],
                 );
                 write_worker_stdout(request, "fallback worker ran");
