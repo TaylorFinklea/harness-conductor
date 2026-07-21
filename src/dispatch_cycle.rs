@@ -6196,6 +6196,142 @@ dispatch_id = "senior-reviewer"
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real subsession contract keeps process-shape and exact-authentication assertions together"
+    )]
+    fn current_attempt_subsession_commit_is_authenticated() {
+        struct SubsessionHarnessExec {
+            session_marker: PathBuf,
+        }
+
+        impl Exec for SubsessionHarnessExec {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                if request.argv.iter().any(|arg| arg == "fake-worker") {
+                    let child_script = r#"
+import os, subprocess, sys
+
+worker_sid = int(sys.argv[1])
+marker = sys.argv[2]
+with open(marker, "w") as fh:
+    fh.write(f"{os.getppid()} {worker_sid} {os.getsid(0)} {os.getpid()}\n")
+with open("worker.txt", "w") as fh:
+    fh.write("legitimate subsession worker\n")
+for args in (
+    ["git", "add", "worker.txt"],
+    ["git", "commit", "-m", "worker: authenticated current subsession commit"],
+):
+    result = subprocess.run(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(result.returncode)
+"#;
+                    let worker_script = r#"
+import os, subprocess, sys
+
+result = subprocess.run(
+    [sys.executable, "-c", sys.argv[1], str(os.getsid(0)), sys.argv[2]],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    close_fds=True,
+    start_new_session=True,
+    check=False,
+)
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+sys.exit(result.returncode)
+"#;
+                    let mut worker = request.clone();
+                    worker.argv = vec![
+                        "/usr/bin/python3".to_string(),
+                        "-c".to_string(),
+                        worker_script.to_string(),
+                        child_script.to_string(),
+                        self.session_marker.display().to_string(),
+                    ];
+                    return crate::dispatch::CommandExec.spawn(&worker);
+                }
+                crate::dispatch::CommandExec.spawn(request)
+            }
+        }
+
+        let temp = TempDir::new("current-attempt-subsession");
+        let repo = temp.path().join("repo");
+        init_sandbox_repo_without_bd(&repo);
+        let before = git(&repo, &["rev-parse", "HEAD"]);
+        let session_marker = temp.path().join("subsession.txt");
+        let exec = SubsessionHarnessExec {
+            session_marker: session_marker.clone(),
+        };
+        let request = DispatchRequest {
+            repo: repo.clone(),
+            before_head: Some(before.trim().to_string()),
+            attempt_id: "001-subsession".to_string(),
+            cycle_id: "cycle-subsession-core".to_string(),
+            bead_id: "subsession-core".to_string(),
+            backend: Backend::Pi,
+            dispatch_id: "fake-worker".to_string(),
+            reasoning_effort: None,
+            prompt: "subsession receipt core".to_string(),
+            attempt_identity: dispatch::attempt_commit_identity(),
+            sandbox_profile: None,
+        };
+
+        let result = dispatch::run(
+            &exec,
+            &GitCommitProbe,
+            &request,
+            &temp.path().join("state"),
+            Duration::from_secs(30),
+        )
+        .expect("run current worker with descriptor-closed subsession");
+
+        let process_shape = std::fs::read_to_string(session_marker)
+            .expect("subsession process marker")
+            .split_whitespace()
+            .map(|value| value.parse::<u32>().expect("numeric process identity"))
+            .collect::<Vec<_>>();
+        assert_eq!(process_shape.len(), 4);
+        assert_eq!(
+            process_shape[0], process_shape[1],
+            "child must descend from worker root"
+        );
+        assert_eq!(
+            process_shape[2], process_shape[3],
+            "child must lead its new session"
+        );
+        assert_ne!(
+            process_shape[1], process_shape[2],
+            "child must leave the worker session"
+        );
+        assert!(matches!(result.status, dispatch::DispatchStatus::Success));
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(result.worker_commit.as_deref(), Some(head.trim()));
+        assert_eq!(
+            git(
+                &repo,
+                &["rev-list", "--count", &format!("{}..HEAD", before.trim())]
+            )
+            .trim(),
+            "1",
+            "exactly the one subsession commit must be authenticated"
+        );
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "real Node harness contract keeps the closed-fd and promotion assertions together"

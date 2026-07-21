@@ -941,7 +941,7 @@ impl CommitReceiptBroker {
                 .read_line(&mut line)
                 .map_err(|error| DispatchError::new(format!("read commit receipt: {error}")))?;
             let commit = line.trim();
-            if valid_git_oid(commit) && process_in_worker_session(peer, self.worker_root)? {
+            if valid_git_oid(commit) && process_in_live_worker_lineage(peer, self.worker_root)? {
                 self.accepted.push(commit.to_string());
                 stream
                     .write_all(b"ok\n")
@@ -976,12 +976,16 @@ fn valid_git_oid(value: &str) -> bool {
 fn peer_pid(stream: &UnixStream) -> Result<u32> {
     let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
         .map_err(|error| {
-            DispatchError::new(format!("authenticate commit receipt peer pid: {error}"))
+            DispatchError::worker_state_uncertain(format!(
+                "authenticate commit receipt peer pid: {error}"
+            ))
         })?;
     u32::try_from(pid)
         .ok()
         .filter(|pid| *pid != 0)
-        .ok_or_else(|| DispatchError::new("commit receipt peer returned an invalid pid"))
+        .ok_or_else(|| {
+            DispatchError::worker_state_uncertain("commit receipt peer returned an invalid pid")
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -989,7 +993,7 @@ fn peer_pid(stream: &UnixStream) -> Result<u32> {
     let credentials =
         nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials).map_err(
             |error| {
-                DispatchError::new(format!(
+                DispatchError::worker_state_uncertain(format!(
                     "authenticate commit receipt peer credentials: {error}"
                 ))
             },
@@ -997,36 +1001,150 @@ fn peer_pid(stream: &UnixStream) -> Result<u32> {
     u32::try_from(credentials.pid())
         .ok()
         .filter(|pid| *pid != 0)
-        .ok_or_else(|| DispatchError::new("commit receipt peer returned an invalid pid"))
+        .ok_or_else(|| {
+            DispatchError::worker_state_uncertain("commit receipt peer returned an invalid pid")
+        })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn peer_pid(_stream: &UnixStream) -> Result<u32> {
-    Err(DispatchError::new(
+    Err(DispatchError::worker_state_uncertain(
         "kernel peer-pid authentication is unsupported on this platform",
     ))
 }
 
-fn process_in_worker_session(peer: u32, root: u32) -> Result<bool> {
-    let peer = nix::unistd::Pid::from_raw(i32::try_from(peer).map_err(|error| {
-        DispatchError::new(format!("convert commit receipt peer pid: {error}"))
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KernelProcessIdentity {
+    pid: u32,
+    parent: Option<u32>,
+    start_time: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, PartialEq, Eq)]
+struct KernelLineageSnapshot {
+    worker: KernelProcessIdentity,
+    peer_lineage: Vec<KernelProcessIdentity>,
+    reaches_worker: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_in_live_worker_lineage(peer: u32, root: u32) -> Result<bool> {
+    let root_pid = nix::unistd::Pid::from_raw(i32::try_from(root).map_err(|error| {
+        DispatchError::worker_state_uncertain(format!("convert worker lineage pid: {error}"))
     })?);
-    let root = nix::unistd::Pid::from_raw(
-        i32::try_from(root)
-            .map_err(|error| DispatchError::new(format!("convert worker session pid: {error}")))?,
-    );
-    let peer_session = nix::unistd::getsid(Some(peer)).map_err(|error| {
-        DispatchError::new(format!("authenticate commit receipt peer session: {error}"))
+    let worker_session = nix::unistd::getsid(Some(root_pid)).map_err(|error| {
+        DispatchError::worker_state_uncertain(format!("authenticate live worker session: {error}"))
     })?;
-    let worker_session = nix::unistd::getsid(Some(root))
-        .map_err(|error| DispatchError::new(format!("authenticate worker session: {error}")))?;
-    if worker_session != root {
+    if worker_session != root_pid {
         // The broker can receive a forged connection in the short interval
         // before the worker wrapper completes `setsid`. Deny that peer; a
         // legitimate hook can authenticate only after the boundary exists.
         return Ok(false);
     }
-    Ok(peer_session == worker_session)
+
+    let first = kernel_lineage_snapshot(peer, root)?;
+    let second = kernel_lineage_snapshot(peer, root)?;
+    let worker_session_after = nix::unistd::getsid(Some(root_pid)).map_err(|error| {
+        DispatchError::worker_state_uncertain(format!("recheck live worker session: {error}"))
+    })?;
+    if worker_session_after != root_pid || first != second {
+        return Err(DispatchError::worker_state_uncertain(
+            "commit receipt process ancestry changed while it was authenticated",
+        ));
+    }
+    Ok(first.reaches_worker)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn kernel_lineage_snapshot(peer: u32, root: u32) -> Result<KernelLineageSnapshot> {
+    use std::collections::HashSet;
+
+    let worker = kernel_process_identity(root)?;
+    let mut peer_lineage = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = peer;
+
+    loop {
+        if !seen.insert(current) {
+            return Err(DispatchError::worker_state_uncertain(format!(
+                "commit receipt ancestry contains a cycle at pid {current}"
+            )));
+        }
+        let identity = if current == root {
+            worker.clone()
+        } else {
+            kernel_process_identity(current)?
+        };
+        let parent = identity.parent;
+        peer_lineage.push(identity);
+        if current == root {
+            return Ok(KernelLineageSnapshot {
+                worker,
+                peer_lineage,
+                reaches_worker: true,
+            });
+        }
+        if current == 1 || parent == Some(0) || (parent == Some(1) && root != 1) {
+            return Ok(KernelLineageSnapshot {
+                worker,
+                peer_lineage,
+                reaches_worker: false,
+            });
+        }
+        current = parent.ok_or_else(|| {
+            DispatchError::worker_state_uncertain(format!(
+                "commit receipt ancestry pid {current} had no kernel-reported parent"
+            ))
+        })?;
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn kernel_process_identity(pid: u32) -> Result<KernelProcessIdentity> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    let target = [Pid::from_u32(pid)];
+    let updated = system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&target),
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    let process = system.process(target[0]).ok_or_else(|| {
+        DispatchError::worker_state_uncertain(format!(
+            "pid {pid} was absent from a targeted kernel process snapshot"
+        ))
+    })?;
+    if updated != 1
+        || matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        )
+    {
+        return Err(DispatchError::worker_state_uncertain(format!(
+            "pid {pid} was not unambiguously live while authenticating a commit receipt"
+        )));
+    }
+    let start_time = process.start_time();
+    if start_time == 0 {
+        return Err(DispatchError::worker_state_uncertain(format!(
+            "kernel process identity for pid {pid} had no start time"
+        )));
+    }
+    Ok(KernelProcessIdentity {
+        pid,
+        parent: process.parent().map(sysinfo::Pid::as_u32),
+        start_time,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_in_live_worker_lineage(_peer: u32, _root: u32) -> Result<bool> {
+    Err(DispatchError::worker_state_uncertain(
+        "kernel process ancestry authentication is unsupported on this platform",
+    ))
 }
 
 const WORKER_LINEAGE_LEASE_FILE: &str = "worker-lineage.fifo";
