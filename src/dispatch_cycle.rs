@@ -532,9 +532,21 @@ enum WorkerChainOutcome {
 }
 
 struct AttemptCheckout {
-    canonical_repo: PathBuf,
     path: PathBuf,
+    sandbox_profile: PathBuf,
     active: bool,
+}
+
+const WORKER_ISOLATION_SCHEMA: &str = "conductor/worker-isolation@1";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerIsolationRecord {
+    schema: String,
+    canonical_repo: String,
+    state_dir: String,
+    attempt_path: String,
+    sandbox_profile: String,
 }
 
 const PROMOTION_SCHEMA: &str = "conductor/promotion@1";
@@ -602,7 +614,15 @@ fn write_promotion_record(
             "commit promotion record {}: {error}",
             path.display()
         ))
-    })
+    })?;
+    std::fs::File::open(run_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "sync promotion record directory {}: {error}",
+                run_dir.display()
+            ))
+        })
 }
 
 fn read_promotion_record(
@@ -637,6 +657,7 @@ fn read_promotion_record(
 impl AttemptCheckout {
     fn create(
         canonical_repo: &Path,
+        state_dir: &Path,
         run_dir: &Path,
         attempt_id: &str,
         before_head: Option<&str>,
@@ -655,31 +676,64 @@ impl AttemptCheckout {
         })?;
         let path = root.join(attempt_id);
         let output = std::process::Command::new("git")
-            .arg("-C")
+            .args(["clone", "--shared", "--no-checkout"])
             .arg(canonical_repo)
-            .args(["worktree", "add", "--detach"])
             .arg(&path)
-            .arg(before_head)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
             .map_err(|error| {
                 DispatchCycleError::message(format!(
-                    "create isolated worker attempt checkout {}: {error}",
+                    "clone isolated worker attempt checkout {}: {error}",
                     path.display()
                 ))
             })?;
         if !output.status.success() {
             return Err(DispatchCycleError::message(format!(
-                "create isolated worker attempt checkout {} failed: {}",
+                "clone isolated worker attempt checkout {} failed: {}",
                 path.display(),
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        let checkout = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["checkout", "--detach", before_head])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|error| {
+                DispatchCycleError::message(format!(
+                    "checkout isolated worker base in {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if !checkout.status.success() {
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(DispatchCycleError::message(format!(
+                "checkout isolated worker base in {} failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&checkout.stderr).trim()
+            )));
+        }
+        let sandbox_profile = match write_worker_sandbox_profile(
+            canonical_repo,
+            state_dir,
+            run_dir,
+            &path,
+            attempt_id,
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&path);
+                return Err(error);
+            }
+        };
         Ok(Self {
-            canonical_repo: canonical_repo.to_path_buf(),
             path,
+            sandbox_profile,
             active: true,
         })
     }
@@ -688,32 +742,20 @@ impl AttemptCheckout {
         &self.path
     }
 
+    fn sandbox_profile(&self) -> &Path {
+        &self.sandbox_profile
+    }
+
     fn cleanup(&mut self) -> std::result::Result<(), DispatchCycleError> {
         if !self.active {
             return Ok(());
         }
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.canonical_repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|error| {
-                DispatchCycleError::message(format!(
-                    "remove isolated worker attempt checkout {}: {error}",
-                    self.path.display()
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(DispatchCycleError::message(format!(
-                "remove isolated worker attempt checkout {} failed: {}",
-                self.path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
+        std::fs::remove_dir_all(&self.path).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "remove isolated worker attempt checkout {}: {error}",
+                self.path.display()
+            ))
+        })?;
         self.active = false;
         Ok(())
     }
@@ -726,17 +768,200 @@ impl AttemptCheckout {
 impl Drop for AttemptCheckout {
     fn drop(&mut self) {
         if self.active {
-            let _ = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&self.canonical_repo)
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "profile and its fsynced recovery record are one crash-consistency transaction"
+)]
+fn write_worker_sandbox_profile(
+    canonical_repo: &Path,
+    state_dir: &Path,
+    run_dir: &Path,
+    attempt_path: &Path,
+    attempt_id: &str,
+) -> std::result::Result<PathBuf, DispatchCycleError> {
+    let canonical_repo = std::fs::canonicalize(canonical_repo).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize repository for worker sandbox: {error}"
+        ))
+    })?;
+    let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
+        DispatchCycleError::message(format!("canonicalize state directory for sandbox: {error}"))
+    })?;
+    let attempt_path = std::fs::canonicalize(attempt_path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize isolated attempt for sandbox: {error}"
+        ))
+    })?;
+    let profile_dir = run_dir.join("worker-sandboxes");
+    std::fs::create_dir_all(&profile_dir).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "create worker sandbox profile directory {}: {error}",
+            profile_dir.display()
+        ))
+    })?;
+    let profile_path = profile_dir.join(format!("{attempt_id}.sb"));
+    let profile = format!(
+        "(version 1)\n(allow default)\n\
+         (deny file-link)\n\
+         (deny file-write* (subpath \"{}\"))\n\
+         (deny file-write* (subpath \"{}\"))\n\
+         (allow file-write* (subpath \"{}\"))\n",
+        sandbox_string(&canonical_repo),
+        sandbox_string(&state_dir),
+        sandbox_string(&attempt_path),
+    );
+    std::fs::write(&profile_path, profile).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "write worker sandbox profile {}: {error}",
+            profile_path.display()
+        ))
+    })?;
+    let canonical_profile = std::fs::canonicalize(&profile_path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "canonicalize worker sandbox profile {}: {error}",
+            profile_path.display()
+        ))
+    })?;
+
+    let record_dir = run_dir.join("worker-isolation");
+    std::fs::create_dir_all(&record_dir).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "create worker isolation record directory {}: {error}",
+            record_dir.display()
+        ))
+    })?;
+    let record = WorkerIsolationRecord {
+        schema: WORKER_ISOLATION_SCHEMA.to_string(),
+        canonical_repo: canonical_repo.display().to_string(),
+        state_dir: state_dir.display().to_string(),
+        attempt_path: attempt_path.display().to_string(),
+        sandbox_profile: canonical_profile.display().to_string(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+        DispatchCycleError::message(format!("serialize worker isolation record: {error}"))
+    })?;
+    bytes.push(b'\n');
+    let record_path = record_dir.join(format!("{attempt_id}.json"));
+    let pending = record_dir.join(format!("{attempt_id}.json.pending"));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&pending)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "open pending worker isolation record {}: {error}",
+                pending.display()
+            ))
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "write pending worker isolation record {}: {error}",
+            pending.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        DispatchCycleError::message(format!(
+            "sync pending worker isolation record {}: {error}",
+            pending.display()
+        ))
+    })?;
+    std::fs::rename(&pending, &record_path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "commit worker isolation record {}: {error}",
+            record_path.display()
+        ))
+    })?;
+    std::fs::File::open(&record_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "sync worker isolation record directory {}: {error}",
+                record_dir.display()
+            ))
+        })?;
+    Ok(profile_path)
+}
+
+fn sandbox_string(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+fn run_has_durable_worker_isolation(
+    run_dir: &Path,
+    canonical_repo: &Path,
+    state_dir: &Path,
+) -> bool {
+    let Ok(run_dir) = std::fs::canonicalize(run_dir) else {
+        return false;
+    };
+    let Ok(canonical_repo) = std::fs::canonicalize(canonical_repo) else {
+        return false;
+    };
+    let Ok(state_dir) = std::fs::canonicalize(state_dir) else {
+        return false;
+    };
+    let attempt_root = run_dir.join("attempt-checkouts");
+    let mut existing_attempts = BTreeSet::new();
+    match std::fs::read_dir(&attempt_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                let Ok(path) = std::fs::canonicalize(entry.path()) else {
+                    return false;
+                };
+                if !path.starts_with(&attempt_root) {
+                    return false;
+                }
+                existing_attempts.insert(path);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    let record_dir = run_dir.join("worker-isolation");
+    let Ok(records) = std::fs::read_dir(record_dir) else {
+        return false;
+    };
+    let mut recorded_attempts = BTreeSet::new();
+    for entry in records {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry.path().extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            return false;
+        };
+        let Ok(record) = serde_json::from_slice::<WorkerIsolationRecord>(&bytes) else {
+            return false;
+        };
+        let attempt_path = PathBuf::from(&record.attempt_path);
+        let Ok(sandbox_profile) = std::fs::canonicalize(&record.sandbox_profile) else {
+            return false;
+        };
+        if record.schema != WORKER_ISOLATION_SCHEMA
+            || Path::new(&record.canonical_repo) != canonical_repo
+            || Path::new(&record.state_dir) != state_dir
+            || !attempt_path.starts_with(&attempt_root)
+            || !sandbox_profile.starts_with(run_dir.join("worker-sandboxes"))
+        {
+            return false;
+        }
+        recorded_attempts.insert(attempt_path);
+    }
+    !recorded_attempts.is_empty() && existing_attempts.is_subset(&recorded_attempts)
 }
 
 fn cleanup_run_attempt_worktrees(
@@ -750,39 +975,60 @@ fn cleanup_run_attempt_worktrees(
         ))
     })?;
     let attempt_root = canonical_run_dir.join("attempt-checkouts");
-    let listed = git_worktree_paths(canonical_repo)?;
-    for worktree in listed {
-        let comparable = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
-        if !comparable.starts_with(&attempt_root) {
-            continue;
+    let entries = match std::fs::read_dir(&attempt_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(DispatchCycleError::message(format!(
+                "list stale isolated attempt clones {}: {error}",
+                attempt_root.display()
+            )));
         }
-        if worktree.exists() {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(canonical_repo)
-                .args(["worktree", "remove", "--force"])
-                .arg(&worktree)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .map_err(|error| {
-                    DispatchCycleError::message(format!(
-                        "remove stale attempt worktree {}: {error}",
-                        worktree.display()
-                    ))
-                })?;
-            if !output.status.success() {
-                return Err(DispatchCycleError::message(format!(
-                    "remove stale attempt worktree {} failed: {}",
-                    worktree.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            DispatchCycleError::message(format!("read stale isolated attempt clone entry: {error}"))
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "inspect stale isolated attempt clone {}: {error}",
+                path.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            std::fs::remove_file(&path)
+        } else {
+            std::fs::remove_dir_all(&path)
         }
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "remove stale isolated attempt clone {}: {error}",
+                path.display()
+            ))
+        })?;
     }
-
-    let output = std::process::Command::new("git")
+    if std::fs::read_dir(&attempt_root)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "recheck stale isolated attempt clones {}: {error}",
+                attempt_root.display()
+            ))
+        })?
+        .next()
+        .is_some()
+    {
+        return Err(DispatchCycleError::message(format!(
+            "stale isolated attempt clones remain under {}",
+            attempt_root.display()
+        )));
+    }
+    // A run created by a pre-isolation Conductor may still have registered
+    // linked worktrees under the same attempt root. Removing their directories
+    // above is safe only after the recorded worker is dead; prune the now-dead
+    // registrations so recovery remains compatible without using linked
+    // worktrees for any new worker.
+    let prune = std::process::Command::new("git")
         .arg("-C")
         .arg(canonical_repo)
         .args(["worktree", "prune"])
@@ -790,49 +1036,16 @@ fn cleanup_run_attempt_worktrees(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|error| DispatchCycleError::message(format!("prune stale worktrees: {error}")))?;
-    if !output.status.success() {
+        .map_err(|error| {
+            DispatchCycleError::message(format!("prune legacy attempt worktrees: {error}"))
+        })?;
+    if !prune.status.success() {
         return Err(DispatchCycleError::message(format!(
-            "prune stale worktrees failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    if git_worktree_paths(canonical_repo)?.into_iter().any(|worktree| {
-        std::fs::canonicalize(&worktree)
-            .unwrap_or(worktree)
-            .starts_with(&attempt_root)
-    }) {
-        return Err(DispatchCycleError::message(format!(
-            "stale attempt worktrees remain registered under {}",
-            attempt_root.display()
+            "prune legacy attempt worktrees failed: {}",
+            String::from_utf8_lossy(&prune.stderr).trim()
         )));
     }
     Ok(())
-}
-
-fn git_worktree_paths(
-    canonical_repo: &Path,
-) -> std::result::Result<Vec<PathBuf>, DispatchCycleError> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(canonical_repo)
-        .args(["worktree", "list", "--porcelain"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| DispatchCycleError::message(format!("list git worktrees: {error}")))?;
-    if !output.status.success() {
-        return Err(DispatchCycleError::message(format!(
-            "list git worktrees failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .collect())
 }
 
 #[expect(
@@ -844,6 +1057,7 @@ fn git_worktree_paths(
 fn promote_attempt_commit<C: CommitProbe + ?Sized>(
     commits: &C,
     canonical_repo: &Path,
+    attempt_repo: &Path,
     before_head: Option<&str>,
     worker_commit: &str,
     attempt_id: &str,
@@ -870,6 +1084,28 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         ));
     }
 
+    let fetch = std::process::Command::new("git")
+        .arg("-C")
+        .arg(canonical_repo)
+        .args(["fetch", "--no-tags", "--no-write-fetch-head"])
+        .arg(attempt_repo)
+        .arg(worker_commit)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "import authenticated worker commit from isolated clone: {error}"
+            ))
+        })?;
+    if !fetch.status.success() {
+        return Err(DispatchCycleError::message(format!(
+            "import authenticated worker commit from isolated clone failed: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        )));
+    }
+
     let work = run_artifacts
         .work()
         .ok_or_else(|| DispatchCycleError::message("promotion requires work run state"))?;
@@ -879,9 +1115,8 @@ fn promote_attempt_commit<C: CommitProbe + ?Sized>(
         .bead
         .clone()
         .ok_or_else(|| DispatchCycleError::message("promotion requires a Bead target"))?;
-    let before_head = before_head.ok_or_else(|| {
-        DispatchCycleError::message("promotion requires a recorded before_head")
-    })?;
+    let before_head = before_head
+        .ok_or_else(|| DispatchCycleError::message("promotion requires a recorded before_head"))?;
     let mut promotion = PromotionRecord {
         schema: PROMOTION_SCHEMA.to_string(),
         cycle_id: work.cycle_id.clone(),
@@ -1068,11 +1303,11 @@ fn interrupt_before_attempt_finished(options: &DispatchCycleOptions) -> bool {
 }
 
 fn find_promoted_work_run<C: CommitProbe + ?Sized>(
-    commits: &C,
+    _commits: &C,
     state_dir: &Path,
     cycle_id: &str,
     canonical_repo: &str,
-    repo_path: &Path,
+    _repo_path: &Path,
     bead: &str,
 ) -> std::result::Result<Option<(String, PromotionRecord)>, DispatchCycleError> {
     let Some(run_id) = crate::run::find_implementing_work_run(
@@ -1089,22 +1324,17 @@ fn find_promoted_work_run<C: CommitProbe + ?Sized>(
     let Some(promotion) = read_promotion_record(run_artifacts.dir())? else {
         return Ok(None);
     };
-    if promotion.cycle_id != cycle_id
-        || promotion.repo != canonical_repo
-        || promotion.bead != bead
+    if promotion.cycle_id != cycle_id || promotion.repo != canonical_repo || promotion.bead != bead
     {
         return Err(DispatchCycleError::message(
             "promotion record does not match its implementing run target",
         ));
     }
-    let head = commits
-        .head(repo_path)
-        .map_err(|error| DispatchCycleError::message(format!("promotion recovery head: {error}")))?;
-    if head.as_deref() == Some(promotion.worker_commit.as_str()) {
-        Ok(Some((run_id, promotion)))
-    } else {
-        Ok(None)
-    }
+    // The durable receipt is the recovery authority. Canonical HEAD is
+    // validated only after the claim and repository lease are reacquired;
+    // filtering here would make an exact promoted run disappear precisely on
+    // the mismatch path where redispatch is forbidden.
+    Ok(Some((run_id, promotion)))
 }
 
 #[expect(
@@ -1648,14 +1878,9 @@ fn complete_worker_verification<
         format!("verify {}/{}", item.repo, item.issue_id),
         progress,
     ) {
-        return Err(finish_and_release_claim(
-            bd,
-            repo_path,
-            &item.issue_id,
-            &mut run_artifacts,
-            "report_update_error",
-            error,
-        ));
+        return Err(DispatchCycleError::recovery_required(format!(
+            "promoted worker report update failed before verification ({error}); exact promotion receipt and claim retained for dispatch --resume"
+        )));
     }
     let mut verify_request = VerifyRequest {
         repo: repo_path.to_path_buf(),
@@ -1667,6 +1892,10 @@ fn complete_worker_verification<
         worker_status: worker_attempt.result.status.clone(),
         worker_commit: worker_attempt.result.worker_commit.clone(),
         before_head,
+        preserve_claim_on_failure: matches!(
+            worker_attempt.result.status,
+            dispatch::DispatchStatus::Success
+        ),
     };
     let review = ReviewSettings {
         config: cfg.review.clone(),
@@ -1677,14 +1906,9 @@ fn complete_worker_verification<
     let mechanical = match verify::run_mechanical(bd, exec, commits, &verify_request) {
         Ok(outcome) => outcome,
         Err(error) => {
-            return Err(finish_and_release_claim(
-                bd,
-                repo_path,
-                &item.issue_id,
-                &mut run_artifacts,
-                "verify_error",
-                DispatchCycleError::message(format!("verify: {error}")),
-            ));
+            return Err(DispatchCycleError::recovery_required(format!(
+                "promoted worker mechanical verification infrastructure failed ({error}); exact promotion receipt and claim retained for dispatch --resume"
+            )));
         }
     };
     let worker_commit = match mechanical {
@@ -1696,6 +1920,12 @@ fn complete_worker_verification<
                 cycle_id,
                 &item.issue_id,
             )?;
+            if verify_request.preserve_claim_on_failure {
+                return Err(DispatchCycleError::recovery_required(format!(
+                    "promoted worker mechanical verification did not pass ({}); exact promotion receipt and claim retained for dispatch --resume",
+                    outcome.summary
+                )));
+            }
             run_artifacts
                 .finish(verify_decision_label(outcome.decision))
                 .map_err(run_artifact_error)?;
@@ -1715,83 +1945,76 @@ fn complete_worker_verification<
             });
         }
     };
-    let verifier_refs =
-        match capture_mechanical_logs(&run_artifacts, state_dir, cycle_id, &item.issue_id) {
-            Ok(refs) => refs,
-            Err(error) => {
-                return Err(finish_and_release_claim(
-                    bd,
-                    repo_path,
-                    &item.issue_id,
-                    &mut run_artifacts,
-                    "post_verify_error",
-                    error,
-                ));
-            }
-        };
+    let verifier_refs = match capture_mechanical_logs(
+        &run_artifacts,
+        state_dir,
+        cycle_id,
+        &item.issue_id,
+    ) {
+        Ok(refs) => refs,
+        Err(error) => {
+            return Err(DispatchCycleError::recovery_required(format!(
+                "promoted worker mechanical log capture failed ({error}); exact promotion receipt and claim retained for dispatch --resume"
+            )));
+        }
+    };
     if let Err(error) = run_artifacts.checkpoint_pending_review(
         &active_roster.name,
         &worker_commit,
         &extracted.verify_cmd,
         verifier_refs,
     ) {
-        return Err(finish_and_release_claim(
-            bd,
-            repo_path,
-            &item.issue_id,
-            &mut run_artifacts,
-            "checkpoint_error",
-            run_artifact_error(error),
-        ));
+        return Err(DispatchCycleError::recovery_required(format!(
+            "promoted worker pending-review checkpoint failed ({}); exact promotion receipt and claim retained for dispatch --resume",
+            error.into_message()
+        )));
     }
     let post_verify_head = match commits.head(&verify_request.repo) {
         Ok(head) => head,
         Err(error) => {
-            return Err(DispatchCycleError::message(format!(
+            return Err(DispatchCycleError::recovery_required(format!(
                 "git head after verify: {error}; pending-review checkpoint retained for dispatch --resume"
             )));
         }
     };
     if post_verify_head.as_deref() != Some(worker_commit.as_str()) {
-        return Err(DispatchCycleError::message(
+        return Err(DispatchCycleError::recovery_required(
             "worker commit changed during mechanical verification; pending-review checkpoint retained for dispatch --resume",
         ));
     }
     let is_clean = match commits.is_clean(&verify_request.repo) {
         Ok(is_clean) => is_clean,
         Err(error) => {
-            return Err(DispatchCycleError::message(format!(
+            return Err(DispatchCycleError::recovery_required(format!(
                 "git status after verify: {error}; pending-review checkpoint retained for dispatch --resume"
             )));
         }
     };
     if !is_clean {
-        return Err(DispatchCycleError::message(
+        return Err(DispatchCycleError::recovery_required(
             "repository is dirty after mechanical verification; pending-review checkpoint retained for dispatch --resume",
         ));
     }
     if interrupt_before_review(options) {
-        return Err(DispatchCycleError::message(
+        return Err(DispatchCycleError::recovery_required(
             "simulated process interruption before qualitative review",
         ));
     }
     let review_issue = bd.show(repo_path, &item.issue_id).map_err(|error| {
         DispatchCycleError::message(format!("qualitative-review claim re-fetch: {error}"))
     })?;
-    if review_issue.status != "in_progress"
-        || review_issue.assignee.as_deref() != Some("conductor")
+    if review_issue.status != "in_progress" || review_issue.assignee.as_deref() != Some("conductor")
     {
         return Err(DispatchCycleError::message(
             "qualitative-review claim is no longer held by conductor",
         ));
     }
-    validate_item_authorization(cfg, item, selected_roster, canonical_repo, &review_issue).map_err(
-        |reason| {
+    validate_item_authorization(cfg, item, selected_roster, canonical_repo, &review_issue)
+        .map_err(|reason| {
             DispatchCycleError::message(format!(
                 "qualitative-review approval changed after checkpoint: {reason}"
             ))
-        },
-    )?;
+        })?;
     if !head_matches_clean(commits, repo_path, &worker_commit)? {
         return Err(DispatchCycleError::message(
             "repository changed after the pending-review checkpoint",
@@ -1808,6 +2031,17 @@ fn complete_worker_verification<
         &item.issue_id,
         &outcome,
     )?;
+    if verify_request.preserve_claim_on_failure
+        && matches!(
+            outcome.decision,
+            VerifyDecision::Failed | VerifyDecision::HardError
+        )
+    {
+        return Err(DispatchCycleError::recovery_required(format!(
+            "promoted worker qualitative review did not pass ({}); exact promotion receipt and claim retained for dispatch --resume",
+            outcome.summary
+        )));
+    }
     if outcome.decision != VerifyDecision::PendingReview {
         run_artifacts
             .finish(verify_decision_label(outcome.decision))
@@ -1939,20 +2173,28 @@ fn resume_promoted_work<
 
     let current_head = commits
         .head(repo_path)
-        .map_err(|error| DispatchCycleError::message(format!("promotion resume head: {error}")))?;
+        .map_err(|error| {
+            DispatchCycleError::recovery_required(format!(
+                "promotion resume HEAD probe failed ({error}); exact promotion receipt and claim retained"
+            ))
+        })?;
     if current_head.as_deref() != Some(promotion.worker_commit.as_str()) {
-        return Err(DispatchCycleError::message(format!(
-            "promoted worker HEAD changed: expected {}, found {}",
+        return Err(DispatchCycleError::recovery_required(format!(
+            "promoted worker HEAD changed: expected {}, found {}; exact promotion receipt and claim retained",
             promotion.worker_commit,
             current_head.as_deref().unwrap_or("<none>")
         )));
     }
     if !commits
         .is_clean(repo_path)
-        .map_err(|error| DispatchCycleError::message(format!("promotion resume status: {error}")))?
+        .map_err(|error| {
+            DispatchCycleError::recovery_required(format!(
+                "promotion resume status probe failed ({error}); exact promotion receipt and claim retained"
+            ))
+        })?
     {
-        return Err(DispatchCycleError::message(
-            "promoted worker repository is dirty",
+        return Err(DispatchCycleError::recovery_required(
+            "promoted worker repository is dirty; exact promotion receipt and claim retained",
         ));
     }
     if !commits
@@ -1962,11 +2204,13 @@ fn resume_promoted_work<
             &promotion.worker_commit,
         )
         .map_err(|error| {
-            DispatchCycleError::message(format!("promotion resume parent check: {error}"))
+            DispatchCycleError::recovery_required(format!(
+                "promotion resume parent check failed ({error}); exact promotion receipt and claim retained"
+            ))
         })?
     {
-        return Err(DispatchCycleError::message(
-            "promoted worker commit is not the recorded base's direct child",
+        return Err(DispatchCycleError::recovery_required(
+            "promoted worker commit is not the recorded base's direct child; exact promotion receipt and claim retained",
         ));
     }
 
@@ -2246,6 +2490,7 @@ fn resume_pending_review<
         worker_status: dispatch::DispatchStatus::Success,
         worker_commit: Some(worker_commit.clone()),
         before_head: None,
+        preserve_claim_on_failure: true,
     };
     let review = ReviewSettings {
         config: cfg.review.clone(),
@@ -2255,7 +2500,11 @@ fn resume_pending_review<
     };
     let outcome =
         verify::run_review_stage(bd, exec, &verify_request, &review, options.item_timeout)
-            .map_err(|error| DispatchCycleError::message(format!("resume review: {error}")))?;
+            .map_err(|error| {
+                DispatchCycleError::recovery_required(format!(
+                    "promoted worker review resume infrastructure failed ({error}); claim and pending-review checkpoint retained"
+                ))
+            })?;
     record_review_events(
         &mut run_artifacts,
         state_dir,
@@ -2263,6 +2512,15 @@ fn resume_pending_review<
         &item.issue_id,
         &outcome,
     )?;
+    if matches!(
+        outcome.decision,
+        VerifyDecision::Failed | VerifyDecision::HardError
+    ) {
+        return Err(DispatchCycleError::recovery_required(format!(
+            "promoted worker qualitative review did not pass ({}); claim and pending-review checkpoint retained",
+            outcome.summary
+        )));
+    }
     if outcome.decision != VerifyDecision::PendingReview {
         run_artifacts
             .finish(verify_decision_label(outcome.decision))
@@ -2551,8 +2809,13 @@ where
                 "canonical repository changed before isolated worker attempt",
             ));
         }
-        let mut attempt_checkout =
-            AttemptCheckout::create(repo_path, run_artifacts.dir(), &attempt_id, before_head)?;
+        let mut attempt_checkout = AttemptCheckout::create(
+            repo_path,
+            state_dir,
+            run_artifacts.dir(),
+            &attempt_id,
+            before_head,
+        )?;
         run_artifacts
             .append_event(
                 EventKind::AttemptStarted,
@@ -2578,11 +2841,10 @@ where
                 prior_capture.as_ref(),
                 run_artifacts.dir(),
             ),
-            // Minted per attempt, after every earlier attempt has already been
-            // spawned, so no earlier attempt's process — however it escaped —
-            // can author a commit this attempt will be credited with.
+            // Unique audit metadata only; the kernel-authenticated receipt,
+            // not this observable value, authorizes the worker commit.
             attempt_identity: dispatch::attempt_commit_identity(),
-            lineage_lease_path: dispatch::worker_lineage_lease_path(run_artifacts.dir()),
+            sandbox_profile: Some(attempt_checkout.sandbox_profile().to_path_buf()),
         };
         let result = {
             // Reborrow the run handle for the duration of the worker so both
@@ -2660,6 +2922,7 @@ where
             match promote_attempt_commit(
                 commits,
                 repo_path,
+                attempt_checkout.path(),
                 before_head,
                 worker_commit,
                 &attempt_id,
@@ -2681,6 +2944,27 @@ where
                     worker_succeeded = false;
                 }
             }
+        }
+        if matches!(
+            result.status,
+            dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::UnauthenticatedCommit)
+        ) {
+            attempt_checkout.preserve_for_recovery();
+            run_artifacts
+                .append_event(
+                    EventKind::AttemptFinished,
+                    EventInput {
+                        profile_id: Some(roster.name.clone()),
+                        artifact_refs,
+                        outcome: Some(format!(
+                            "{outcome_label}; unauthenticated commit requires recovery"
+                        )),
+                    },
+                )
+                .map_err(run_artifact_error)?;
+            return Err(DispatchCycleError::recovery_required(
+                "isolated checkout HEAD changed without a kernel-authenticated receipt from the current worker; claim and attempt checkout retained for dispatch --resume",
+            ));
         }
         // Any non-success attempt may have left tracked or untracked
         // changes behind without an accepted commit. Quarantine those now,
@@ -2724,7 +3008,7 @@ where
                         )
                         .map_err(run_artifact_error)?;
                     return Err(DispatchCycleError::message(format!(
-                        "quarantine after failed attempt: {error}"
+                        "quarantine after failed attempt ({outcome_label}): {error}"
                     )));
                 }
             }
@@ -3347,11 +3631,12 @@ struct StaleClaimReclaim {
 ///   finished `stale_claim_reaped` history that stays auditable and is never
 ///   miscounted — and it has gone heartbeat-silent past
 ///   [`STALE_CLAIM_THRESHOLD`] with *both* its recorded owner pid and its
-///   worker process group provably dead and its durable lineage FIFO has no
-///   inherited readers. A dead owner and empty process group do not prove a
-///   descendant that called `setsid(2)` died: an escaped worker still holding
-///   the FIFO keeps the claim. Unknown, `EPERM`, pid-reuse-ambiguous, missing
-///   identity, or an unreadable/missing lease all fail closed;
+///   worker process group provably dead. A new run must also carry the durable
+///   record of its per-attempt Seatbelt boundary, which makes a `setsid(2)`
+///   escape incapable of reaching canonical state or later clones. Legacy
+///   runs instead require their inherited FIFO to have no readers. Unknown,
+///   `EPERM`, pid-reuse-ambiguous, missing identity, or missing boundary
+///   evidence all fail closed;
 /// - the repository HEAD still equals the generation's `before_head` exactly
 ///   and the tree is clean — any committed, dirty, missing-head, or foreign
 ///   state fails closed instead of silently adopting unreviewed work.
@@ -3496,10 +3781,16 @@ fn reclaim_stale_claim<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
             if quarantine::process_group_alive(worker_pgid) {
                 return Ok(None);
             }
-            let lineage_lease = dispatch::worker_lineage_lease_path(run_artifacts.dir());
-            match dispatch::worker_lineage_active(&lineage_lease) {
-                Ok(false) => {}
-                Ok(true) | Err(_) => return Ok(None),
+            if !run_has_durable_worker_isolation(run_artifacts.dir(), repo_path, state_dir) {
+                // Compatibility for pre-isolation runs: only their inherited
+                // FIFO can prove an escaped descendant is gone. New runs use
+                // an irreversible Seatbelt boundary, so a re-sessioned
+                // descendant cannot reach canonical state or any later clone.
+                let lineage_lease = dispatch::worker_lineage_lease_path(run_artifacts.dir());
+                match dispatch::worker_lineage_active(&lineage_lease) {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => return Ok(None),
+                }
             }
 
             cleanup_run_attempt_worktrees(repo_path, run_artifacts.dir())?;
@@ -4369,7 +4660,7 @@ mod tests {
     use crate::config;
     use crate::deck::{Block, Report, ReportStatus};
     use crate::dispatch::{
-        ChildProcess, CommitProbe, Exec, GitCommitProbe, ProcessStatus, SpawnRequest, StdinMode,
+        ChildProcess, CommitProbe, Exec, GitCommitProbe, ProcessStatus, SpawnRequest,
     };
     use crate::plan::{
         ApprovalScope, ApprovalScopeKind, CyclePlan, ItemAuthorizationRecord, ProposalEntry,
@@ -5621,9 +5912,7 @@ dispatch_id = "senior-reviewer"
         assert_ne!(spawns[0].stdout_path, spawns[1].stdout_path);
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn descendant_from_failed_attempt_cannot_forge_fallback_checkout_success() {
+    fn descendant_forgery_fixture() -> ResumeFixture {
         let mut fixture = ResumeFixture::new("descendant-forges-fallback");
         fixture.cfg.review.enabled = false;
         fixture.cfg.roster[0].fallback = vec!["fallback-worker".to_string()];
@@ -5643,6 +5932,13 @@ dispatch_id = "senior-reviewer"
             &fixture.cfg.roster,
             &sandbox_issue(),
         );
+        fixture
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn descendant_from_failed_attempt_cannot_forge_fallback_checkout_success() {
+        let fixture = descendant_forgery_fixture();
         let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
             .trim()
             .to_string();
@@ -5663,9 +5959,9 @@ dispatch_id = "senior-reviewer"
 
         assert_eq!(
             exec.worker_spawns(),
-            1,
-            "an escaped descendant keeps attempt one unquiesced, so a fallback \
-             checkout must never be created:\n{report}"
+            2,
+            "attempt one's escaped descendant must survive into the fallback \
+             window so the commit-authentication boundary is exercised:\n{report}"
         );
         assert_eq!(
             result.verified, 0,
@@ -5674,19 +5970,63 @@ dispatch_id = "senior-reviewer"
         );
         assert_eq!(result.failed, 1);
         assert_eq!(fixture.bd.close_count(), 0);
+        let run_dir = fixture.pending_run_dir();
+        let events = std::fs::read_to_string(run_dir.join("events.jsonl"))
+            .expect("read descendant regression events");
+        let fallback_stdout = std::fs::read_to_string(
+            fixture
+                .state
+                .join("logs")
+                .join(&fixture.cycle_id)
+                .join("sandbox-1/002-fallback-worker.out"),
+        )
+        .unwrap_or_default();
+        let fallback_stderr = std::fs::read_to_string(
+            fixture
+                .state
+                .join("logs")
+                .join(&fixture.cycle_id)
+                .join("sandbox-1/002-fallback-worker.err"),
+        )
+        .unwrap_or_default();
         assert_eq!(
             fixture.bd.release_count(),
             0,
-            "unproven worker-lineage quiescence must preserve the claim"
+            "unauthenticated fallback state must preserve the claim:\n{report}\n\
+             events:\n{events}\nfallback stdout:\n{fallback_stdout}\nfallback stderr:\n{fallback_stderr}"
         );
-        let worktrees = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
-        assert!(
-            worktrees.contains("attempt-checkouts/001-fake-worker"),
-            "attempt one must remain registered for recovery:\n{worktrees}"
+        let fallback_checkout = fixture
+            .pending_run_dir()
+            .join("attempt-checkouts/002-fallback-worker");
+        assert_eq!(
+            git(&fallback_checkout, &["log", "-1", "--format=%s"]).trim(),
+            ESCAPED_FORGERY_SUBJECT,
+            "the escaped attempt-one descendant must forge the only fallback commit"
         );
-        assert!(
-            !worktrees.contains("attempt-checkouts/002-fallback-worker"),
-            "the escaped descendant must never receive a later checkout to target:\n{worktrees}"
+        assert_eq!(
+            git(&fallback_checkout, &["log", "-1", "--format=%ce"]).trim(),
+            exec.fallback_identity(),
+            "the escaped descendant must observe and recreate attempt two's audit identity"
+        );
+        assert_eq!(
+            git(
+                &fallback_checkout,
+                &["rev-list", "--count", &format!("{before_head}..HEAD")]
+            )
+            .trim(),
+            "1",
+            "the commitless fallback must have exactly one foreign commit to reject"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                fallback_checkout
+                    .parent()
+                    .unwrap()
+                    .join("descendant-handoff/forged-receipt-response")
+            )
+            .expect("escaped descendant receipt response"),
+            "denied",
+            "the kernel must reject a receipt from the escaped same-UID lineage"
         );
         assert_eq!(
             git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
@@ -5716,10 +6056,13 @@ dispatch_id = "senior-reviewer"
             0,
             "an unproven worker group must keep the claim held for recovery"
         );
-        let worktrees = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
+        let checkout = fixture
+            .pending_run_dir()
+            .join("attempt-checkouts/001-fake-worker");
         assert!(
-            worktrees.contains("attempt-checkouts/001-fake-worker"),
-            "the checkout must remain registered until the worker group is proven dead:\n{worktrees}"
+            checkout.exists(),
+            "the isolated clone must remain until the worker group is proven dead: {}",
+            checkout.display()
         );
     }
 
@@ -5778,6 +6121,338 @@ dispatch_id = "senior-reviewer"
             "promoted",
             true,
         );
+    }
+
+    #[test]
+    fn promotion_receipt_head_mismatch_remains_exactly_discoverable() {
+        let mut fixture = ResumeFixture::new("promotion-receipt-head-mismatch");
+        fixture.cfg.review.enabled = false;
+        let exec = PendingReviewExec::ship_immediately();
+
+        fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1))
+                    .interrupt_promotion_at(PromotionInterruption::AfterReceiptBeforeCleanup),
+            )
+            .expect("promotion interruption is isolated to the item");
+        let run_dir = fixture.pending_run_dir();
+        let receipt =
+            std::fs::read(run_dir.join("promotion.json")).expect("durable promoted receipt");
+        std::fs::write(
+            fixture.repo.join("foreign-after-promotion.txt"),
+            b"foreign\n",
+        )
+        .expect("write foreign post-promotion change");
+        run(
+            &fixture.repo,
+            "git",
+            &["add", "foreign-after-promotion.txt"],
+        );
+        run(
+            &fixture.repo,
+            "git",
+            &["commit", "-m", "foreign: move after promoted receipt"],
+        );
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonical repo")
+            .to_str()
+            .expect("utf8 repo")
+            .to_string();
+        let discovered = find_promoted_work_run(
+            &GitCommitProbe,
+            &fixture.state,
+            &fixture.cycle_id,
+            &canonical_repo,
+            &fixture.repo,
+            "sandbox-1",
+        )
+        .expect("promotion lookup succeeds")
+        .expect("durable receipt remains exactly discoverable despite HEAD mismatch");
+        assert_eq!(discovered.0, run_dir.file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            discovered.1,
+            serde_json::from_slice::<PromotionRecord>(&receipt).expect("parse exact receipt")
+        );
+        fixture.mark_pending_review_recoverable();
+
+        let resumed = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("head mismatch is isolated to the item");
+
+        assert_eq!(resumed.verified, 0);
+        assert_eq!(exec.worker_spawns(), 1, "resume must not reimplement");
+        assert_eq!(exec.review_spawns(), 0, "resume must not review wrong HEAD");
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(fixture.bd.release_count(), 0, "claim must remain held");
+        assert_eq!(
+            std::fs::read(run_dir.join("promotion.json")).expect("receipt remains"),
+            receipt,
+            "the exact durable promotion receipt must remain discoverable"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real Node harness contract keeps the closed-fd and promotion assertions together"
+    )]
+    fn node_harness_commit_is_authenticated_without_inherited_extra_fds() {
+        struct NodeHarnessExec {
+            worker_spawn: RefCell<Option<SpawnRequest>>,
+        }
+
+        impl Exec for NodeHarnessExec {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                if request.argv.iter().any(|arg| arg == "fake-worker") {
+                    *self.worker_spawn.borrow_mut() = Some(request.clone());
+                    let script = r#"
+const fs = require("fs");
+const { spawnSync } = require("child_process");
+function git(args) {
+  const result = spawnSync("git", args, {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr || Buffer.from("git failed\n"));
+    process.exit(result.status || 1);
+  }
+}
+fs.writeFileSync("worker.txt", "legitimate node worker\n");
+git(["add", "worker.txt"]);
+git(["commit", "-m", "worker: authenticated node child_process commit"]);
+process.stdout.write("node worker complete\n");
+"#;
+                    let mut node = request.clone();
+                    node.argv = vec!["node".to_string(), "-e".to_string(), script.to_string()];
+                    return crate::dispatch::CommandExec.spawn(&node);
+                }
+                crate::dispatch::CommandExec.spawn(request)
+            }
+        }
+
+        // Exercise the socket authority even when this test itself runs in an
+        // outer sandbox which cannot initialize nested Seatbelt. Node's
+        // child_process explicitly exposes only fd 0/1/2 to Git.
+        let direct = TempDir::new("node-receipt-core");
+        let direct_repo = direct.path().join("repo");
+        init_sandbox_repo_without_bd(&direct_repo);
+        let direct_before = git(&direct_repo, &["rev-parse", "HEAD"]);
+        let direct_exec = NodeHarnessExec {
+            worker_spawn: RefCell::new(None),
+        };
+        let direct_request = DispatchRequest {
+            repo: direct_repo.clone(),
+            before_head: Some(direct_before.trim().to_string()),
+            attempt_id: "001-node".to_string(),
+            cycle_id: "cycle-node-core".to_string(),
+            bead_id: "node-core".to_string(),
+            backend: Backend::Pi,
+            dispatch_id: "fake-worker".to_string(),
+            reasoning_effort: None,
+            prompt: "node receipt core".to_string(),
+            attempt_identity: dispatch::attempt_commit_identity(),
+            sandbox_profile: None,
+        };
+        let direct_result = dispatch::run(
+            &direct_exec,
+            &GitCommitProbe,
+            &direct_request,
+            &direct.path().join("state"),
+            Duration::from_secs(30),
+        )
+        .expect("run descriptor-free Node worker");
+        assert!(matches!(
+            direct_result.status,
+            dispatch::DispatchStatus::Success
+        ));
+        assert_eq!(
+            direct_result.worker_commit.as_deref(),
+            Some(git(&direct_repo, &["rev-parse", "HEAD"]).trim())
+        );
+
+        let mut fixture = ResumeFixture::new("node-closed-extra-fds");
+        fixture.cfg.review.enabled = false;
+        let before = git(&fixture.repo, &["rev-parse", "HEAD"]);
+        let exec = NodeHarnessExec {
+            worker_spawn: RefCell::new(None),
+        };
+
+        let result = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(10)),
+            )
+            .expect("node worker outcome is isolated to the item");
+        let spawn = exec.worker_spawn.borrow();
+        let spawn = spawn.as_ref().expect("node worker spawned");
+        let stderr = std::fs::read_to_string(&spawn.stderr_path).expect("read node stderr");
+        if result.verified == 0
+            && stderr.contains("sandbox_apply")
+            && stderr.contains("Operation not permitted")
+        {
+            assert_eq!(
+                git(&fixture.repo, &["rev-parse", "HEAD"]),
+                before,
+                "failed sandbox initialization must execute no worker payload"
+            );
+            return;
+        }
+
+        assert_eq!(result.verified, 1, "node stderr:\n{stderr}");
+        assert_eq!(fixture.bd.close_count(), 1);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(
+            git(&fixture.repo, &["log", "-1", "--format=%s"]).trim(),
+            "worker: authenticated node child_process commit"
+        );
+        assert_ne!(git(&fixture.repo, &["rev-parse", "HEAD"]), before);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real macOS process contract covers direct, link, and initialization boundaries"
+    )]
+    fn macos_worker_sandbox_denies_direct_hardlink_and_symlink_escape() {
+        #[cfg(not(target_os = "macos"))]
+        return;
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::symlink;
+
+            let temp = TempDir::new("macos-worker-sandbox");
+            let repo = temp.path().join("canonical-repo");
+            init_sandbox_repo_without_bd(&repo);
+            let state = temp.path().join("state");
+            let run_dir = state.join("runs/test-run");
+            std::fs::create_dir_all(&run_dir).expect("create sandbox run dir");
+            let head = git(&repo, &["rev-parse", "HEAD"]);
+            let current =
+                AttemptCheckout::create(&repo, &state, &run_dir, "001-current", Some(head.trim()))
+                    .expect("create current isolated clone");
+            let later =
+                AttemptCheckout::create(&repo, &state, &run_dir, "002-later", Some(head.trim()))
+                    .expect("create later isolated clone");
+            assert!(
+                run_has_durable_worker_isolation(&run_dir, &repo, &state),
+                "stale recovery must recognize the parent-authored isolation boundary"
+            );
+
+            let canonical_target = repo.join("canonical-sentinel");
+            let state_target = state.join("state-sentinel");
+            let later_target = later.path().join("later-sentinel");
+            std::fs::write(&canonical_target, b"canonical\n").expect("canonical sentinel");
+            std::fs::write(&state_target, b"state\n").expect("state sentinel");
+            std::fs::write(&later_target, b"later\n").expect("later sentinel");
+            let hardlink = current.path().join("canonical-hardlink");
+            let symlink_path = current.path().join("later-symlink");
+            symlink(&later_target, &symlink_path).expect("create symlink escape");
+            let inside = current.path().join("inside-allowed");
+            let stdout = temp.path().join("sandbox.out");
+            let stderr = temp.path().join("sandbox.err");
+            let script = r#"
+set +e
+printf hacked > "$1"; echo direct-canonical:$?
+printf hacked > "$2"; echo direct-state:$?
+printf hacked > "$3"; echo direct-later:$?
+/bin/ln "$1" "$4"; echo hardlink-create:$?
+printf hacked > "$5"; echo symlink:$?
+printf allowed > "$6"; echo inside:$?
+exit 0
+"#;
+            let request = SpawnRequest {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                    "worker-sandbox-probe".to_string(),
+                    canonical_target.display().to_string(),
+                    state_target.display().to_string(),
+                    later_target.display().to_string(),
+                    hardlink.display().to_string(),
+                    symlink_path.display().to_string(),
+                    inside.display().to_string(),
+                ],
+                cwd: current.path().to_path_buf(),
+                env: Vec::new(),
+                stdin: crate::dispatch::StdinMode::Null,
+                sandbox_profile: Some(current.sandbox_profile().to_path_buf()),
+                commit_receipt_socket: None,
+                stdout_path: stdout.clone(),
+                stderr_path: stderr.clone(),
+            };
+            let mut child = crate::dispatch::CommandExec
+                .spawn(&request)
+                .expect("spawn sandbox probe");
+            let status = child.wait().expect("wait sandbox probe");
+            let stderr_text = std::fs::read_to_string(&stderr).expect("read sandbox stderr");
+            if status.exit_code() == Some(71)
+                && stderr_text.contains("sandbox_apply")
+                && stderr_text.contains("Operation not permitted")
+            {
+                assert!(!inside.exists(), "failed initialization ran worker payload");
+                assert_eq!(std::fs::read(&canonical_target).unwrap(), b"canonical\n");
+                assert_eq!(std::fs::read(&state_target).unwrap(), b"state\n");
+                assert_eq!(std::fs::read(&later_target).unwrap(), b"later\n");
+                return;
+            }
+            assert!(status.success(), "sandbox stderr:\n{stderr_text}");
+            let stdout_text = std::fs::read_to_string(stdout).expect("read sandbox stdout");
+            for label in [
+                "direct-canonical",
+                "direct-state",
+                "direct-later",
+                "hardlink-create",
+                "symlink",
+            ] {
+                assert!(
+                    stdout_text
+                        .lines()
+                        .find_map(|line| line.strip_prefix(&format!("{label}:")))
+                        .is_some_and(|status| status != "0"),
+                    "{label} write unexpectedly succeeded:\n{stdout_text}\nstderr:\n{stderr_text}"
+                );
+            }
+            assert!(stdout_text.lines().any(|line| line == "inside:0"));
+            assert_eq!(std::fs::read(&inside).unwrap(), b"allowed");
+            assert_eq!(std::fs::read(&canonical_target).unwrap(), b"canonical\n");
+            assert_eq!(std::fs::read(&state_target).unwrap(), b"state\n");
+            assert_eq!(std::fs::read(&later_target).unwrap(), b"later\n");
+            assert!(!hardlink.exists(), "sandbox created an external hard link");
+
+            // A hard link planted before launch is rejected before any worker
+            // payload can execute; Seatbelt path filters cannot distinguish
+            // two names for the same vnode, so this preflight is part of the
+            // fail-closed sandbox initialization contract.
+            std::fs::hard_link(&canonical_target, &hardlink)
+                .expect("plant preexisting hard-link escape");
+            let hardlink_payload_marker = current.path().join("hardlink-payload-ran");
+            let mut hardlink_request = request.clone();
+            hardlink_request.argv = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf hacked > \"$1\"; printf ran > \"$2\"".to_string(),
+                "hardlink-preflight-probe".to_string(),
+                hardlink.display().to_string(),
+                hardlink_payload_marker.display().to_string(),
+            ];
+            let Err(error) = crate::dispatch::CommandExec.spawn(&hardlink_request) else {
+                panic!("preexisting external hard link must fail closed");
+            };
+            assert!(error.to_string().contains("multiple hard links"));
+            assert!(!hardlink_payload_marker.exists());
+            assert_eq!(std::fs::read(&canonical_target).unwrap(), b"canonical\n");
+        }
     }
 
     fn assert_promotion_boundary_recovers(
@@ -9419,8 +10094,8 @@ dispatch_id = "fake-worker"
     }
 
     /// Runs git in the attempt checkout under the spawn environment, so a fake
-    /// worker's commit carries the per-attempt identity a real worker process
-    /// inherits — and which `classify` requires before crediting the attempt.
+    /// worker's commit carries the audit identity used by in-memory test
+    /// doubles. Real workers require a kernel-authenticated receipt instead.
     fn run_as_worker(request: &SpawnRequest, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
@@ -10196,13 +10871,14 @@ dispatch_id = "fake-worker"
     /// The escaped descendant re-sessions with `setsid(2)` before attempt one
     /// exits, so process-group quiescence is provably satisfied while the
     /// descendant is still alive and still able to write the *next* attempt's
-    /// checkout. Only a per-attempt commit identity — which attempt one's
-    /// environment cannot contain — can reject what it commits there.
+    /// checkout. The test gives it every observable attempt-two value, then
+    /// requires the kernel lineage boundary to reject its forged receipt.
     #[cfg(unix)]
     struct DescendantForgeryExec {
         worker_spawns: RefCell<usize>,
         attempt_one_pgid: RefCell<Option<u32>>,
         escaped_pid_marker: RefCell<Option<PathBuf>>,
+        fallback_identity: RefCell<Option<String>>,
     }
 
     #[cfg(unix)]
@@ -10212,11 +10888,19 @@ dispatch_id = "fake-worker"
                 worker_spawns: RefCell::new(0),
                 attempt_one_pgid: RefCell::new(None),
                 escaped_pid_marker: RefCell::new(None),
+                fallback_identity: RefCell::new(None),
             }
         }
 
         fn worker_spawns(&self) -> usize {
             *self.worker_spawns.borrow()
+        }
+
+        fn fallback_identity(&self) -> String {
+            self.fallback_identity
+                .borrow()
+                .clone()
+                .expect("fallback identity observed")
         }
 
         fn handoff_dir(request: &SpawnRequest) -> PathBuf {
@@ -10226,19 +10910,6 @@ dispatch_id = "fake-worker"
                 .expect("attempt checkout parent")
                 .join("descendant-handoff")
         }
-
-        fn lineage_stdin(request: &SpawnRequest) -> std::fs::File {
-            use std::os::unix::fs::OpenOptionsExt as _;
-
-            let StdinMode::WorkerLineageLease(path) = &request.stdin else {
-                panic!("worker must receive a lineage lease")
-            };
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(path)
-                .expect("open worker-lineage lease as stdin")
-        }
     }
 
     #[cfg(unix)]
@@ -10246,6 +10917,10 @@ dispatch_id = "fake-worker"
 
     #[cfg(unix)]
     impl Exec for DescendantForgeryExec {
+        #[expect(
+            clippy::too_many_lines,
+            reason = "real-process attack harness coordinates both attempts and the escaped descendant"
+        )]
         fn spawn(&self, request: &SpawnRequest) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
             if request.argv.iter().any(|arg| arg == "fake-worker") {
                 use std::os::unix::process::CommandExt;
@@ -10261,36 +10936,59 @@ dispatch_id = "fake-worker"
                 let escaped_pid = handoff.join("escaped.pid");
                 let fallback_started = handoff.join("fallback-started");
                 *self.escaped_pid_marker.borrow_mut() = Some(escaped_pid.clone());
-                let stdout = std::fs::File::create(&request.stdout_path)
-                    .expect("create attempt-one stdout");
-                let stderr = std::fs::File::create(&request.stderr_path)
-                    .expect("create attempt-one stderr");
-                let lineage_stdin = Self::lineage_stdin(request);
+                let stdout =
+                    std::fs::File::create(&request.stdout_path).expect("create attempt-one stdout");
+                let stderr =
+                    std::fs::File::create(&request.stderr_path).expect("create attempt-one stderr");
                 // The descendant leaves attempt one's process group entirely,
                 // publishes its readiness *before* attempt one exits, and only
-                // then predicts and writes attempt two's checkout.
+                // then observes attempt two's audit identity and writes its
+                // checkout. That observable identity must not be authority.
                 let script = r#"
-                    exec 3<&0
                     python3 -c '
 import os, subprocess, sys, time
 os.setsid()
-target, ready, started = sys.argv[1], sys.argv[2], sys.argv[3]
+target, ready, started, identity_file, socket_file, response_file = sys.argv[1:7]
 with open(ready, "w") as fh:
     fh.write(str(os.getpid()))
 deadline = time.time() + 30
 while time.time() < deadline and not (
-    os.path.exists(os.path.join(target, ".git")) and os.path.exists(started)
+    os.path.exists(os.path.join(target, ".git"))
+    and os.path.exists(started)
+    and os.path.exists(identity_file)
+    and os.path.exists(socket_file)
 ):
     time.sleep(0.01)
+with open(identity_file) as fh:
+    identity = fh.read().strip()
 with open(os.path.join(target, "worker.txt"), "w") as fh:
     fh.write("forged by escaped descendant\n")
-subprocess.run(["git", "add", "worker.txt"], cwd=target, check=False)
+env = os.environ.copy()
+env["GIT_AUTHOR_EMAIL"] = identity
+env["GIT_COMMITTER_EMAIL"] = identity
+env["GIT_CONFIG_COUNT"] = "0"
+subprocess.run(["git", "add", "worker.txt"], cwd=target, env=env, check=False)
 subprocess.run(
     ["git", "commit", "-m", "forged: escaped descendant direct child"],
     cwd=target,
+    env=env,
     check=False,
 )
-' "$1" "$2" "$3" &
+commit = subprocess.check_output(
+    ["git", "rev-parse", "HEAD"], cwd=target, text=True
+).strip()
+with open(socket_file) as fh:
+    socket_path = fh.read().strip()
+receipt = subprocess.run(
+    ["/usr/bin/nc", "-w", "3", "-U", socket_path],
+    input=commit + "\n",
+    text=True,
+    capture_output=True,
+    check=False,
+)
+with open(response_file, "w") as fh:
+    fh.write(receipt.stdout.strip())
+' "$1" "$2" "$3" "$4" "$5" "$6" &
                     while [ ! -s "$2" ]; do sleep 0.01; done
                     printf 'HTTP 429 capacity exhausted\n' >&2
                     exit 1
@@ -10302,8 +11000,11 @@ subprocess.run(
                     .arg(&fallback_checkout)
                     .arg(&escaped_pid)
                     .arg(&fallback_started)
+                    .arg(handoff.join("fallback-identity"))
+                    .arg(handoff.join("fallback-receipt-socket"))
+                    .arg(handoff.join("forged-receipt-response"))
                     .current_dir(&request.cwd)
-                    .stdin(Stdio::from(lineage_stdin))
+                    .stdin(Stdio::null())
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr))
                     .process_group(0)
@@ -10317,24 +11018,52 @@ subprocess.run(
                 // Release the descendant only once the fallback attempt is
                 // genuinely under way, so its commit lands inside the window
                 // Conductor attributes to *this* worker.
-                std::fs::write(Self::handoff_dir(request).join("fallback-started"), b"go\n")
-                    .expect("write fallback-started marker");
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while Instant::now() < deadline
-                    && git(&request.cwd, &["log", "-1", "--format=%s"]).trim()
-                        != ESCAPED_FORGERY_SUBJECT
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                assert_eq!(
-                    git(&request.cwd, &["log", "-1", "--format=%s"]).trim(),
-                    ESCAPED_FORGERY_SUBJECT,
-                    "the escaped descendant must land its forged commit for this RED to bite"
+                let handoff = Self::handoff_dir(request);
+                let identity = request
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == "GIT_COMMITTER_EMAIL")
+                    .map(|(_, value)| value)
+                    .expect("fallback attempt audit identity");
+                *self.fallback_identity.borrow_mut() = Some(identity.clone());
+                std::fs::write(handoff.join("fallback-identity"), identity)
+                    .expect("publish observable fallback identity");
+                let receipt_socket = request
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == "CONDUCTOR_COMMIT_RECEIPT_SOCKET")
+                    .map(|(_, value)| value)
+                    .expect("fallback receipt socket");
+                std::fs::write(handoff.join("fallback-receipt-socket"), receipt_socket)
+                    .expect("publish observable fallback receipt socket");
+                let script = format!(
+                    "polls=0; \
+                     while [ $polls -lt 3000 ]; do \
+                       [ \"$(git log -1 --format=%s 2>/dev/null)\" = '{ESCAPED_FORGERY_SUBJECT}' ] && [ -s \"$1\" ] && exit 0; \
+                       polls=$((polls + 1)); \
+                       sleep 0.01; \
+                     done; exit 1"
                 );
-                std::fs::write(&request.stdout_path, b"fallback exited without a commit\n")
-                    .expect("write fallback stdout");
-                std::fs::write(&request.stderr_path, b"").expect("write fallback stderr");
-                return Ok(Box::new(FakeChild::delayed_success()));
+                let mut fallback = request.clone();
+                // This gate isolates commit authority. The separate macOS
+                // gate exercises Seatbelt; disabling it here lets the foreign
+                // commit land even when the test runner itself forbids nested
+                // sandbox initialization.
+                fallback.sandbox_profile = None;
+                fallback.argv = vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    script,
+                    "commitless-fallback".to_string(),
+                    handoff
+                        .join("forged-receipt-response")
+                        .display()
+                        .to_string(),
+                ];
+                let child = crate::dispatch::CommandExec.spawn(&fallback)?;
+                std::fs::write(handoff.join("fallback-started"), b"go\n")
+                    .expect("write fallback-started marker");
+                return Ok(child);
             }
             if request.argv.first().map(String::as_str) == Some("sh") {
                 let output = Command::new(&request.argv[0])

@@ -74,6 +74,9 @@ pub(crate) struct VerifyRequest {
     pub(crate) worker_status: DispatchStatus,
     pub(crate) worker_commit: Option<String>,
     pub(crate) before_head: Option<String>,
+    /// A worker commit already promoted into canonical history cannot be
+    /// safely released for reimplementation on a verification failure.
+    pub(crate) preserve_claim_on_failure: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -355,7 +358,9 @@ fn fail_with_review<B: BdClient + ?Sized>(
     review: Option<ReviewRecord>,
     review_attempts: Vec<ReviewRecord>,
 ) -> Result<VerifyOutcome> {
-    bd.release(&request.repo, &request.issue.id)?;
+    if !request.preserve_claim_on_failure {
+        bd.release(&request.repo, &request.issue.id)?;
+    }
     let comment = format!(
         "conductor: {} {} verify failed: {}",
         request.cycle_id, request.issue.id, summary
@@ -512,6 +517,8 @@ fn spawn_request(request: &VerifyRequest, suffix: &str, argv: Vec<String>) -> Re
         cwd: request.repo.clone(),
         env: Vec::new(),
         stdin: StdinMode::Null,
+        sandbox_profile: None,
+        commit_receipt_socket: None,
         stdout_path,
         stderr_path,
     })
@@ -615,19 +622,18 @@ fn review_revise<B: BdClient + ?Sized>(
         CONDUCTOR_REVISE_FINDINGS_METADATA_KEY,
         &metadata_value,
     )?;
-    // 2. Release the claim. The metadata is now durable, so the
-    //    released bead can never race ahead of the retry context
-    //    (any subsequent rescan that picks it up sees the same
-    //    findings this revise recorded). Preserve release-on-failure
-    //    behavior: if anything after this point errors, the bead is
-    //    still released and ready for the next cycle.
-    bd.release(&request.repo, &request.issue.id)?;
+    // 2. Release only work which has not already been promoted. Once the
+    //    authenticated commit is canonical, a revise must preserve the claim
+    //    for exact recovery instead of making the Bead eligible for a second
+    //    implementation. For pre-promotion verification, the metadata is now
+    //    durable, so a released Bead cannot race ahead of its retry context.
+    if !request.preserve_claim_on_failure {
+        bd.release(&request.repo, &request.issue.id)?;
+    }
     // 3. Write the human-facing comment last. The metadata is the
     //    authoritative retry context; the comment is a breadcrumb
-    //    surfaced to humans, not part of the worker prompt. A failure
-    //    here is non-fatal in spirit (metadata is already durable
-    //    and the claim is released) but the function still propagates
-    //    the error so callers see a failed verify.
+    //    surfaced to humans, not part of the worker prompt. The function
+    //    still propagates a comment failure so callers see a failed verify.
     let summary = review_findings_summary(findings);
     let comment = format!(
         "conductor: {} {} qualitative review requested revisions:\n{}",
@@ -1646,6 +1652,64 @@ mod tests {
     }
 
     #[test]
+    fn promoted_review_revise_preserves_claim_after_recording_findings() {
+        let temp = TempDir::new("promoted-review-revise");
+        let mut request = request(
+            temp.path(),
+            issue(false),
+            verify_config(false),
+            Some("before"),
+        );
+        request.preserve_claim_on_failure = true;
+        let roster = review_roster();
+        let bd = FakeBdClient::new(&request.issue);
+        let exec = FakeExec::new(vec![
+            Process::exit(0, "verify ok\n", ""),
+            Process::exit(
+                0,
+                r#"{"verdict":"revise","findings":["missing edge-case test"]}"#,
+                "",
+            ),
+        ]);
+        let commits = FakeCommits::new([Some("after")]);
+        let settings = ReviewSettings {
+            config: ReviewConfig {
+                enabled: true,
+                min_tier_gap: 1,
+            },
+            roster,
+            dispatched_model: review_roster()[0].clone(),
+            item_tier_floor: Tier::Junior,
+        };
+
+        let outcome =
+            run_with_review_backoff(&bd, &exec, &commits, &request, &settings, Duration::ZERO)
+                .expect("review revise is a normal promoted verify outcome");
+
+        assert_eq!(outcome.decision, VerifyDecision::Failed);
+        let events = bd.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BdEvent::SetMetadata { .. })),
+            "revision findings must remain durable: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BdEvent::Comment { .. })),
+            "the review breadcrumb must still be recorded: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BdEvent::Release { .. })),
+            "a promoted commit cannot be released for reimplementation: {events:?}"
+        );
+        assert_eq!(bd.close_count(), 0);
+    }
+
+    #[test]
     fn review_revise_records_findings_in_bd_metadata_with_exact_round_trippable_value() {
         // Regression for conductor-0ya: the bounded revision findings must
         // land in `conductor_revise_findings` metadata, not just the
@@ -2038,6 +2102,7 @@ mod tests {
             worker_status: DispatchStatus::Success,
             worker_commit: Some("after".to_string()),
             before_head: before_head.map(str::to_string),
+            preserve_claim_on_failure: false,
         }
     }
 

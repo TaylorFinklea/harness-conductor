@@ -1321,6 +1321,8 @@ fn run_judge_attempt<E: Exec>(
         cwd: authorized.review_dir.clone(),
         env: Vec::new(),
         stdin: StdinMode::Null,
+        sandbox_profile: None,
+        commit_receipt_socket: None,
         stdout_path: stdout_path.clone(),
         stderr_path: stderr_path.clone(),
     };
@@ -2028,6 +2030,8 @@ fn run_reviewer_attempt<E: Exec + Sync>(
         cwd: review_dir.to_path_buf(),
         env: Vec::new(),
         stdin: StdinMode::Null,
+        sandbox_profile: None,
+        commit_receipt_socket: None,
         stdout_path: stdout_path.clone(),
         stderr_path: stderr_path.clone(),
     };

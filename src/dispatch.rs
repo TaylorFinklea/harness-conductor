@@ -5,6 +5,9 @@
 
 use std::fmt;
 use std::fs::{self, File};
+use std::io::{BufRead as _, BufReader, Write as _};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,32 +66,19 @@ pub(crate) struct DispatchRequest {
     pub(crate) dispatch_id: String,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) prompt: String,
-    /// The git committer identity this attempt's worker — and only this
-    /// attempt's worker — runs under. See [`attempt_commit_identity`].
+    /// A per-attempt audit identity. Real worker authority comes from the
+    /// kernel-authenticated commit receipt, not this observable value.
     pub(crate) attempt_identity: String,
-    /// Durable FIFO whose read end replaces `/dev/null` for this worker's
-    /// stdin and is duplicated onto an inherited descriptor before exec.
-    /// Descendants retain that descriptor across process-group changes and
-    /// `setsid(2)`, so Conductor can prove the worker lineage released it
-    /// before creating a later attempt checkout. The fixed per-run path also
-    /// survives an owner crash for stale-claim recovery.
-    pub(crate) lineage_lease_path: PathBuf,
+    /// Parent-authored Seatbelt profile which confines this worker and all of
+    /// its descendants to the current isolated checkout.
+    pub(crate) sandbox_profile: Option<PathBuf>,
 }
 
-/// Mints the unguessable git identity a single worker attempt commits under.
+/// Mints a unique audit identity for a single worker attempt's Git metadata.
 ///
-/// An isolated attempt checkout is not an exclusive boundary on its own: any
-/// same-user process — notably a descendant of an *earlier* attempt that
-/// escaped its process group with `setsid(2)` — can discover a later attempt's
-/// checkout path and commit inside it. Filesystem secrecy cannot fix that,
-/// because the same user may always list a directory it owns.
-///
-/// What such a process cannot obtain is the identity minted *after* it was
-/// spawned. Conductor exports this value to the worker through `GIT_*_NAME` /
-/// `GIT_*_EMAIL`, which every descendant of that worker inherits automatically
-/// and no earlier attempt's environment can contain, and then requires an
-/// accepted commit to carry it. That binds a commit to the process Conductor
-/// actually dispatched rather than to whoever held write access to the tree.
+/// This value is intentionally not authority: another same-UID process can
+/// observe or recreate environment and commit metadata. Real worker authority
+/// is the kernel-authenticated socket receipt handled by [`CommandChild`].
 pub(crate) fn attempt_commit_identity() -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
@@ -156,6 +146,8 @@ pub(crate) struct SpawnRequest {
     pub(crate) cwd: PathBuf,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) stdin: StdinMode,
+    pub(crate) sandbox_profile: Option<PathBuf>,
+    pub(crate) commit_receipt_socket: Option<PathBuf>,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
 }
@@ -163,7 +155,6 @@ pub(crate) struct SpawnRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StdinMode {
     Null,
-    WorkerLineageLease(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +214,12 @@ pub(crate) trait ChildProcess {
     fn id(&self) -> Option<u32> {
         None
     }
+    /// Returns the only commit hash reported by a post-commit hook whose
+    /// connecting process the kernel proved descends from this worker root.
+    /// In-memory test doubles have no OS lineage and return `None`.
+    fn authenticated_worker_commit(&self) -> Option<String> {
+        None
+    }
     /// Proves that the worker's process group has no surviving descendants
     /// after the direct child exits. A real worker may fork background tools
     /// that outlive the harness process; those descendants must be terminated
@@ -232,10 +229,9 @@ pub(crate) trait ChildProcess {
     fn ensure_process_group_quiescent(&mut self) -> Result<()> {
         self.id().map_or(Ok(()), ensure_process_group_quiescent)
     }
-    /// Proves both process-group and cross-session descendant quiescence.
-    /// Real worker children are wrapped with a durable inherited FIFO lease;
-    /// test doubles retain the process-group-only default unless they model
-    /// that lease explicitly.
+    /// Proves process-group quiescence. A descendant which changes session is
+    /// contained by the irreversible per-attempt filesystem sandbox instead
+    /// of an inherited descriptor.
     fn ensure_worker_quiescent(&mut self) -> Result<()> {
         self.ensure_process_group_quiescent()
     }
@@ -286,17 +282,9 @@ pub(crate) trait CommitProbe {
     /// checkout, so the observed checkout HEAD — never worker-controlled
     /// stdout — is what dispatch reads the commit from.
     fn is_direct_child(&self, repo: &Path, before: Option<&str>, commit: &str) -> Result<bool>;
-    /// The committer email recorded on `commit`.
-    ///
-    /// This is *not* identity the worker asserts about itself: Conductor mints
-    /// a fresh, unguessable identity per attempt (see
-    /// [`attempt_commit_identity`]) and hands it to the worker through the
-    /// spawn environment. It is therefore an *inter-attempt* boundary — it
-    /// proves a commit came from the process tree Conductor dispatched for
-    /// this attempt, not from some other process with write access to the
-    /// checkout, such as an escaped descendant of an earlier attempt. It says
-    /// nothing about whether the work itself is good; that is verification's
-    /// job.
+    /// The committer email recorded on `commit`. Production workers never use
+    /// this observable metadata as authority; it remains for audit evidence
+    /// and in-memory tests which cannot model an OS process lineage.
     fn committer_email(&self, repo: &Path, commit: &str) -> Result<Option<String>>;
 }
 
@@ -359,38 +347,44 @@ where
             stderr_bytes: 0,
         });
     }
-    prepare_worker_lineage_lease(&request.lineage_lease_path)?;
     // Durably invalidate any earlier attempt's worker-group identity before
     // this attempt's process exists at all. A failure here must prevent the
     // spawn outright — see `WorkerHooks::on_pre_spawn`.
     hooks.on_pre_spawn()?;
-    let child = exec.spawn(&spawn)?;
-    let mut child = WorkerLineageChild {
-        child,
-        lineage_lease_path: request.lineage_lease_path.clone(),
-    };
+    let mut child = exec.spawn(&spawn)?;
+    #[cfg(test)]
+    let requires_kernel_authentication = child.id().is_some();
+    #[cfg(not(test))]
+    let requires_kernel_authentication = true;
     // Bind the run to this worker's process group before it can meaningfully
     // mutate the repository. If that durable record fails, tear the worker
     // (and any descendants) down rather than let a worker whose identity we
     // cannot prove keep running unattended.
     if let Err(error) = hooks.on_spawn(child.id()) {
-        if terminate_and_reap_best_effort(&mut child) {
+        if terminate_and_reap_best_effort(child.as_mut()) {
             return Err(error);
         }
         return Err(DispatchError::worker_state_uncertain(format!(
             "{error}; spawned worker process group could not be proven quiescent"
         )));
     }
-    let process = wait_with_timeout_and_heartbeat(&mut child, timeout, heartbeat_interval, hooks)?;
+    let process =
+        wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
+    let authenticated_commit = child.authenticated_worker_commit();
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
+    let authentication = CommitAuthentication {
+        attempt_identity: &request.attempt_identity,
+        authenticated_commit: authenticated_commit.as_deref(),
+        requires_kernel_authentication,
+    };
     let (status, worker_commit) = classify(
         process,
         stdout_bytes,
         request.before_head.as_deref(),
         commits,
         &request.repo,
-        &request.attempt_identity,
+        authentication,
     )?;
 
     Ok(DispatchResult {
@@ -433,24 +427,64 @@ fn spawn_request(request: &DispatchRequest, state_dir: &Path) -> Result<SpawnReq
         ))
     })?;
 
+    let mut argv = argv_for_backend(
+        request.backend,
+        &request.dispatch_id,
+        request.reasoning_effort,
+        &request.prompt,
+        &request.repo,
+    )?;
+    // The outer Seatbelt profile is the single filesystem authority for a
+    // worker. Disable a harness's nested sandbox only when that parent-owned
+    // profile is actually present; a missing profile must fail safe.
+    if request.sandbox_profile.is_some() {
+        match request.backend {
+            Backend::Codex => {
+                argv.insert(2, "--dangerously-bypass-approvals-and-sandbox".to_string());
+            }
+            Backend::Claude => argv.push("--dangerously-skip-permissions".to_string()),
+            Backend::Pi | Backend::Omp | Backend::Agy => {}
+        }
+    }
+    let receipt_socket = commit_receipt_socket_path(&request.attempt_identity);
+    let hook_dir = prepare_authenticated_commit_hook(state_dir, &request.attempt_identity)?;
+
     Ok(SpawnRequest {
-        argv: argv_for_backend(
-            request.backend,
-            &request.dispatch_id,
-            request.reasoning_effort,
-            &request.prompt,
-            &request.repo,
-        )?,
+        argv,
         cwd: request.repo.clone(),
-        // Every commit the worker (or any process it spawns) makes inherits
-        // this attempt's identity; `classify` accepts nothing else.
+        // Git identity remains useful audit evidence. The socket receipt is
+        // the authority: its peer pid is authenticated by the kernel.
         env: vec![
-            ("GIT_AUTHOR_NAME".to_string(), ATTEMPT_IDENTITY_NAME.to_string()),
-            ("GIT_AUTHOR_EMAIL".to_string(), request.attempt_identity.clone()),
-            ("GIT_COMMITTER_NAME".to_string(), ATTEMPT_IDENTITY_NAME.to_string()),
-            ("GIT_COMMITTER_EMAIL".to_string(), request.attempt_identity.clone()),
+            (
+                "GIT_AUTHOR_NAME".to_string(),
+                ATTEMPT_IDENTITY_NAME.to_string(),
+            ),
+            (
+                "GIT_AUTHOR_EMAIL".to_string(),
+                request.attempt_identity.clone(),
+            ),
+            (
+                "GIT_COMMITTER_NAME".to_string(),
+                ATTEMPT_IDENTITY_NAME.to_string(),
+            ),
+            (
+                "GIT_COMMITTER_EMAIL".to_string(),
+                request.attempt_identity.clone(),
+            ),
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
+            (
+                "GIT_CONFIG_VALUE_0".to_string(),
+                hook_dir.display().to_string(),
+            ),
+            (
+                "CONDUCTOR_COMMIT_RECEIPT_SOCKET".to_string(),
+                receipt_socket.display().to_string(),
+            ),
         ],
-        stdin: StdinMode::WorkerLineageLease(request.lineage_lease_path.clone()),
+        stdin: StdinMode::Null,
+        sandbox_profile: request.sandbox_profile.clone(),
+        commit_receipt_socket: Some(receipt_socket),
         stdout_path,
         stderr_path,
     })
@@ -701,9 +735,16 @@ fn terminate_and_reap_best_effort(child: &mut dyn ChildProcess) -> bool {
 fn ensure_child_worker_quiescent(child: &mut dyn ChildProcess) -> Result<()> {
     child.ensure_worker_quiescent().map_err(|error| {
         DispatchError::worker_state_uncertain(format!(
-            "worker process-group and lineage quiescence could not be proven: {error}"
+            "worker process-group quiescence could not be proven: {error}"
         ))
     })
+}
+
+#[derive(Clone, Copy)]
+struct CommitAuthentication<'a> {
+    attempt_identity: &'a str,
+    authenticated_commit: Option<&'a str>,
+    requires_kernel_authentication: bool,
 }
 
 fn classify<C: CommitProbe + ?Sized>(
@@ -712,7 +753,7 @@ fn classify<C: CommitProbe + ?Sized>(
     before_head: Option<&str>,
     commits: &C,
     repo: &Path,
-    attempt_identity: &str,
+    authentication: CommitAuthentication<'_>,
 ) -> Result<(DispatchStatus, Option<String>)> {
     if process.timed_out {
         return Ok((DispatchStatus::Failed(DispatchFailure::TimedOut), None));
@@ -728,15 +769,21 @@ fn classify<C: CommitProbe + ?Sized>(
 
     let after_head = commits.head(repo)?;
     if after_head.as_deref() != before_head {
-        // A new, clean, direct-child commit is necessary but not sufficient:
-        // it must also carry *this* attempt's identity. Otherwise any process
-        // with write access to the checkout — including an escaped descendant
-        // of an earlier attempt — could author the commit this worker is
-        // credited with.
+        // A new, clean, direct-child commit is necessary but not sufficient.
+        // A real worker must have reported this exact hash through the
+        // post-commit socket while the kernel still proved that hook client
+        // was in the current worker's process lineage. Observable environment
+        // identity is retained only for in-memory test doubles, which have no
+        // OS pid and therefore cannot exercise the production boundary.
         if let Some(commit) = after_head.as_deref()
             && commits.is_direct_child(repo, before_head, commit)?
             && commits.is_clean(repo)?
-            && commits.committer_email(repo, commit)?.as_deref() == Some(attempt_identity)
+            && if authentication.requires_kernel_authentication {
+                authentication.authenticated_commit == Some(commit)
+            } else {
+                commits.committer_email(repo, commit)?.as_deref()
+                    == Some(authentication.attempt_identity)
+            }
         {
             return Ok((DispatchStatus::Success, after_head));
         }
@@ -761,12 +808,231 @@ fn file_len(path: &Path) -> Result<u64> {
         .map_err(|e| DispatchError::new(format!("failed to stat {}: {e}", path.display())))
 }
 
+fn commit_receipt_socket_path(attempt_identity: &str) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+    let mut digest = Sha256::new();
+    digest.update(attempt_identity.as_bytes());
+    digest.update(NEXT_SOCKET.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in digest.finalize().iter().take(8) {
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    std::env::temp_dir().join(format!(
+        "conductor-receipt-{}-{suffix}.sock",
+        std::process::id()
+    ))
+}
+
+fn prepare_authenticated_commit_hook(state_dir: &Path, attempt_identity: &str) -> Result<PathBuf> {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut digest = Sha256::new();
+    digest.update(attempt_identity.as_bytes());
+    let mut name = String::with_capacity(32);
+    for byte in digest.finalize().iter().take(16) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    let hook_dir = state_dir.join("worker-commit-hooks").join(name);
+    fs::create_dir_all(&hook_dir).map_err(|error| {
+        DispatchError::new(format!(
+            "create authenticated commit hook directory {}: {error}",
+            hook_dir.display()
+        ))
+    })?;
+    let hook = hook_dir.join("post-commit");
+    fs::write(
+        &hook,
+        br#"#!/bin/sh
+commit=$(/usr/bin/git rev-parse --verify HEAD) || exit 1
+reply=$(printf '%s\n' "$commit" | /usr/bin/nc -w 3 -U "$CONDUCTOR_COMMIT_RECEIPT_SOCKET" 2>/dev/null) || exit 1
+[ "$reply" = "ok" ]
+"#,
+    )
+    .map_err(|error| {
+        DispatchError::new(format!(
+            "write authenticated commit hook {}: {error}",
+            hook.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        DispatchError::new(format!(
+            "make authenticated commit hook executable {}: {error}",
+            hook.display()
+        ))
+    })?;
+    Ok(hook_dir)
+}
+
+#[cfg(unix)]
+struct CommitReceiptBroker {
+    listener: UnixListener,
+    socket_path: PathBuf,
+    worker_root: u32,
+    accepted: Vec<String>,
+}
+
+#[cfg(unix)]
+impl CommitReceiptBroker {
+    fn bind(socket_path: &Path) -> Result<Self> {
+        match fs::symlink_metadata(socket_path) {
+            Ok(_) => {
+                return Err(DispatchError::new(format!(
+                    "commit receipt socket already exists: {}",
+                    socket_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DispatchError::new(format!(
+                    "inspect commit receipt socket {}: {error}",
+                    socket_path.display()
+                )));
+            }
+        }
+        let listener = UnixListener::bind(socket_path).map_err(|error| {
+            DispatchError::new(format!(
+                "bind commit receipt socket {}: {error}",
+                socket_path.display()
+            ))
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            DispatchError::new(format!(
+                "make commit receipt socket nonblocking {}: {error}",
+                socket_path.display()
+            ))
+        })?;
+        Ok(Self {
+            listener,
+            socket_path: socket_path.to_path_buf(),
+            worker_root: 0,
+            accepted: Vec::new(),
+        })
+    }
+
+    fn set_worker_root(&mut self, worker_root: u32) {
+        self.worker_root = worker_root;
+    }
+
+    fn poll(&mut self) -> Result<()> {
+        loop {
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => {
+                    return Err(DispatchError::new(format!(
+                        "accept authenticated commit receipt: {error}"
+                    )));
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .map_err(|error| DispatchError::new(format!("set receipt timeout: {error}")))?;
+            let peer = peer_pid(&stream)?;
+            let mut line = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut line)
+                .map_err(|error| DispatchError::new(format!("read commit receipt: {error}")))?;
+            let commit = line.trim();
+            if valid_git_oid(commit) && process_in_worker_session(peer, self.worker_root)? {
+                self.accepted.push(commit.to_string());
+                stream
+                    .write_all(b"ok\n")
+                    .map_err(|error| DispatchError::new(format!("ack commit receipt: {error}")))?;
+            } else {
+                let _ = stream.write_all(b"denied\n");
+            }
+        }
+    }
+
+    fn authenticated_commit(&self) -> Option<String> {
+        if self.accepted.len() == 1 {
+            self.accepted.first().cloned()
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CommitReceiptBroker {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+fn valid_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(target_os = "macos")]
+fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
+        .map_err(|error| {
+            DispatchError::new(format!("authenticate commit receipt peer pid: {error}"))
+        })?;
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| DispatchError::new("commit receipt peer returned an invalid pid"))
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    let credentials =
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials).map_err(
+            |error| {
+                DispatchError::new(format!(
+                    "authenticate commit receipt peer credentials: {error}"
+                ))
+            },
+        )?;
+    u32::try_from(credentials.pid())
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| DispatchError::new("commit receipt peer returned an invalid pid"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn peer_pid(_stream: &UnixStream) -> Result<u32> {
+    Err(DispatchError::new(
+        "kernel peer-pid authentication is unsupported on this platform",
+    ))
+}
+
+fn process_in_worker_session(peer: u32, root: u32) -> Result<bool> {
+    let peer = nix::unistd::Pid::from_raw(i32::try_from(peer).map_err(|error| {
+        DispatchError::new(format!("convert commit receipt peer pid: {error}"))
+    })?);
+    let root = nix::unistd::Pid::from_raw(
+        i32::try_from(root)
+            .map_err(|error| DispatchError::new(format!("convert worker session pid: {error}")))?,
+    );
+    let peer_session = nix::unistd::getsid(Some(peer)).map_err(|error| {
+        DispatchError::new(format!("authenticate commit receipt peer session: {error}"))
+    })?;
+    let worker_session = nix::unistd::getsid(Some(root))
+        .map_err(|error| DispatchError::new(format!("authenticate worker session: {error}")))?;
+    if worker_session != root {
+        // The broker can receive a forged connection in the short interval
+        // before the worker wrapper completes `setsid`. Deny that peer; a
+        // legitimate hook can authenticate only after the boundary exists.
+        return Ok(false);
+    }
+    Ok(peer_session == worker_session)
+}
+
 const WORKER_LINEAGE_LEASE_FILE: &str = "worker-lineage.fifo";
 
-/// The stable per-run lease path used both by live dispatch and crash
-/// recovery. Reusing one path across fallback attempts makes lease handoff
-/// serial: a later attempt cannot start until every reader inherited from the
-/// prior attempt has disappeared.
+/// The pre-isolation FIFO path retained only to recover runs created by older
+/// Conductor versions. New workers never inherit this descriptor.
 pub(crate) fn worker_lineage_lease_path(run_dir: &Path) -> PathBuf {
     run_dir.join(WORKER_LINEAGE_LEASE_FILE)
 }
@@ -890,94 +1156,26 @@ pub(crate) fn worker_lineage_active(_path: &Path) -> Result<bool> {
     ))
 }
 
-fn wait_for_worker_lineage_exit(path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !worker_lineage_active(path)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(DispatchError::worker_state_uncertain(format!(
-                "worker lineage still holds {} after process-group quiescence",
-                path.display()
-            )));
-        }
-        std::thread::sleep(WAIT_POLL);
-    }
-}
-
-fn stdin_for_mode(mode: &StdinMode) -> Result<Stdio> {
+fn stdin_for_mode(mode: &StdinMode) -> Stdio {
     match mode {
-        StdinMode::Null => Ok(Stdio::null()),
-        StdinMode::WorkerLineageLease(path) => worker_lineage_stdin(path),
-    }
-}
-
-#[cfg(unix)]
-fn worker_lineage_stdin(path: &Path) -> Result<Stdio> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    validate_worker_lineage_fifo(path)?;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .map(Stdio::from)
-        .map_err(|error| {
-            DispatchError::new(format!(
-                "open worker-lineage lease {} for child stdin: {error}",
-                path.display()
-            ))
-        })
-}
-
-#[cfg(not(unix))]
-fn worker_lineage_stdin(_path: &Path) -> Result<Stdio> {
-    Err(DispatchError::new(
-        "worker-lineage leases are only implemented on Unix",
-    ))
-}
-
-struct WorkerLineageChild {
-    child: Box<dyn ChildProcess>,
-    lineage_lease_path: PathBuf,
-}
-
-impl ChildProcess for WorkerLineageChild {
-    fn wait_for(&mut self, timeout: Duration) -> Result<Option<ProcessStatus>> {
-        self.child.wait_for(timeout)
-    }
-
-    fn terminate(&mut self) -> Result<()> {
-        self.child.terminate()
-    }
-
-    fn kill(&mut self) -> Result<()> {
-        self.child.kill()
-    }
-
-    fn wait(&mut self) -> Result<ProcessStatus> {
-        self.child.wait()
-    }
-
-    fn id(&self) -> Option<u32> {
-        self.child.id()
-    }
-
-    fn ensure_worker_quiescent(&mut self) -> Result<()> {
-        self.child.ensure_worker_quiescent()?;
-        wait_for_worker_lineage_exit(&self.lineage_lease_path, KILL_GRACE)
+        StdinMode::Null => Stdio::null(),
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CommandExec;
 
+const WORKER_SESSION_WRAPPER: &str =
+    "import os, sys; os.setsid(); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)";
+
 impl Exec for CommandExec {
     fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>> {
         let Some((program, args)) = request.argv.split_first() else {
             return Err(DispatchError::new("cannot spawn empty argv"));
         };
+        if request.sandbox_profile.is_some() {
+            reject_multiply_linked_checkout_files(&request.cwd)?;
+        }
         let stdout = File::create(&request.stdout_path).map_err(|e| {
             DispatchError::new(format!(
                 "failed to open stdout log {}: {e}",
@@ -990,39 +1188,47 @@ impl Exec for CommandExec {
                 request.stderr_path.display()
             ))
         })?;
-        let mut command = match &request.stdin {
-            StdinMode::Null => {
-                let mut command = Command::new(program);
-                command.args(args);
-                command
-            }
-            StdinMode::WorkerLineageLease(_) => {
-                // POSIX shells may replace fd 0 with `/dev/null` for an
-                // asynchronous child. Duplicate the FIFO first so a
-                // background descendant that calls `setsid(2)` still holds
-                // the lineage lease even when its stdin is redirected.
-                let mut command = Command::new("sh");
-                command
-                    .arg("-c")
-                    .arg("exec 3<&0; exec \"$@\"")
-                    .arg("conductor-worker-lineage")
-                    .arg(program)
-                    .args(args);
-                command
-            }
+        let session_isolation = request.commit_receipt_socket.is_some();
+        let (target_program, target_args) = if session_isolation {
+            let mut session_args = vec![
+                "-c".to_string(),
+                WORKER_SESSION_WRAPPER.to_string(),
+                program.clone(),
+            ];
+            session_args.extend(args.iter().cloned());
+            ("/usr/bin/python3", session_args)
+        } else {
+            (program.as_str(), args.to_vec())
+        };
+        let mut command = if let Some(profile) = &request.sandbox_profile {
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command
+                .arg("-f")
+                .arg(profile)
+                .arg(target_program)
+                .args(&target_args);
+            command
+        } else {
+            let mut command = Command::new(target_program);
+            command.args(&target_args);
+            command
         };
         command
             .current_dir(&request.cwd)
             .envs(request.env.iter().map(|(key, value)| (key, value)))
-            .stdin(stdin_for_mode(&request.stdin)?)
+            .stdin(stdin_for_mode(&request.stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
-        // Make the worker the leader of its own process group so a timeout
-        // can terminate every descendant it spawned, not just the direct
-        // child — otherwise a grandchild process can keep writing to the
-        // repository after Conductor has already declared the tree state
-        // and moved on to quarantine capture or a clean check.
-        set_own_process_group(&mut command);
+        if !session_isolation {
+            // Non-worker subprocesses still get a dedicated process group.
+            set_own_process_group(&mut command);
+        }
+        #[cfg(unix)]
+        let mut receipt_broker = request
+            .commit_receipt_socket
+            .as_deref()
+            .map(CommitReceiptBroker::bind)
+            .transpose()?;
         let child = command.spawn().map_err(|e| {
             DispatchError::new(format!(
                 "failed to spawn `{}` in {}: {e}",
@@ -1030,18 +1236,83 @@ impl Exec for CommandExec {
                 request.cwd.display()
             ))
         })?;
-        Ok(Box::new(CommandChild { child }))
+        #[cfg(unix)]
+        if let Some(broker) = &mut receipt_broker {
+            broker.set_worker_root(child.id());
+        }
+        Ok(Box::new(CommandChild {
+            child,
+            #[cfg(unix)]
+            receipt_broker,
+        }))
     }
+}
+
+#[cfg(unix)]
+fn reject_multiply_linked_checkout_files(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            DispatchError::new(format!(
+                "inspect sandbox checkout entry {}: {error}",
+                path.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() && metadata.nlink() > 1 {
+            return Err(DispatchError::new(format!(
+                "sandbox checkout contains a regular file with multiple hard links: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path).map_err(|error| {
+                DispatchError::new(format!(
+                    "list sandbox checkout directory {}: {error}",
+                    path.display()
+                ))
+            })? {
+                pending.push(
+                    entry
+                        .map_err(|error| {
+                            DispatchError::new(format!(
+                                "read sandbox checkout entry in {}: {error}",
+                                path.display()
+                            ))
+                        })?
+                        .path(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_multiply_linked_checkout_files(_root: &Path) -> Result<()> {
+    Err(DispatchError::new(
+        "worker hard-link preflight is unsupported on this platform",
+    ))
 }
 
 struct CommandChild {
     child: std::process::Child,
+    #[cfg(unix)]
+    receipt_broker: Option<CommitReceiptBroker>,
 }
 
 impl ChildProcess for CommandChild {
     fn wait_for(&mut self, timeout: Duration) -> Result<Option<ProcessStatus>> {
         let start = Instant::now();
         loop {
+            #[cfg(unix)]
+            if let Some(broker) = &mut self.receipt_broker {
+                broker.poll()?;
+            }
             if let Some(status) = self
                 .child
                 .try_wait()
@@ -1082,6 +1353,19 @@ impl ChildProcess for CommandChild {
 
     fn id(&self) -> Option<u32> {
         Some(self.child.id())
+    }
+
+    fn authenticated_worker_commit(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            self.receipt_broker
+                .as_ref()
+                .and_then(CommitReceiptBroker::authenticated_commit)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 }
 
@@ -1305,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_backend_uses_pinned_argv_repo_cwd_and_lineage_lease_stdin() {
+    fn pi_backend_uses_pinned_argv_repo_cwd_and_receipt_socket() {
         let temp = TempDir::new("pi-argv");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
@@ -1344,10 +1628,9 @@ mod tests {
             ]
         );
         assert_eq!(spawn.cwd, repo);
-        assert_eq!(
-            spawn.stdin,
-            StdinMode::WorkerLineageLease(repo.join("worker-lineage.fifo"))
-        );
+        assert_eq!(spawn.stdin, StdinMode::Null);
+        assert_eq!(spawn.sandbox_profile, None);
+        assert!(spawn.commit_receipt_socket.is_some());
         assert_eq!(
             spawn.stdout_path,
             temp.path().join("logs/cycle-1/bead-1/001-worker.out")
@@ -1356,30 +1639,28 @@ mod tests {
             spawn.stderr_path,
             temp.path().join("logs/cycle-1/bead-1/001-worker.err")
         );
-        // The worker — and every process it spawns — commits under this
-        // attempt's identity, which is what binds an observed commit to the
-        // process Conductor dispatched.
-        assert_eq!(
-            spawn.env,
-            vec![
-                (
-                    "GIT_AUTHOR_NAME".to_string(),
-                    ATTEMPT_IDENTITY_NAME.to_string()
-                ),
-                (
-                    "GIT_AUTHOR_EMAIL".to_string(),
-                    TEST_ATTEMPT_IDENTITY.to_string()
-                ),
-                (
-                    "GIT_COMMITTER_NAME".to_string(),
-                    ATTEMPT_IDENTITY_NAME.to_string()
-                ),
-                (
-                    "GIT_COMMITTER_EMAIL".to_string(),
-                    TEST_ATTEMPT_IDENTITY.to_string()
-                ),
-            ]
+        let receipt_socket = spawn
+            .commit_receipt_socket
+            .as_ref()
+            .expect("receipt socket")
+            .display()
+            .to_string();
+        let env = spawn
+            .env
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(env["GIT_AUTHOR_NAME"], ATTEMPT_IDENTITY_NAME);
+        assert_eq!(env["GIT_AUTHOR_EMAIL"], TEST_ATTEMPT_IDENTITY);
+        assert_eq!(env["GIT_COMMITTER_NAME"], ATTEMPT_IDENTITY_NAME);
+        assert_eq!(env["GIT_COMMITTER_EMAIL"], TEST_ATTEMPT_IDENTITY);
+        assert_eq!(env["GIT_CONFIG_COUNT"], "1");
+        assert_eq!(env["GIT_CONFIG_KEY_0"], "core.hooksPath");
+        assert!(
+            Path::new(&env["GIT_CONFIG_VALUE_0"])
+                .join("post-commit")
+                .exists()
         );
+        assert_eq!(env["CONDUCTOR_COMMIT_RECEIPT_SOCKET"], receipt_socket);
     }
 
     #[test]
@@ -1391,6 +1672,7 @@ mod tests {
         let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
         let mut request = request(&repo, Backend::Codex, "gpt-5.6-sol", Some(BEFORE_COMMIT));
         request.reasoning_effort = Some(ReasoningEffort::Max);
+        request.sandbox_profile = Some(repo.join("worker.sb"));
 
         run(
             &exec,
@@ -1406,12 +1688,51 @@ mod tests {
             vec![
                 "codex",
                 "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--model",
                 "gpt-5.6-sol",
                 "--config",
                 "model_reasoning_effort=\"max\"",
                 PROMPT,
             ]
+        );
+    }
+
+    #[test]
+    fn missing_outer_sandbox_does_not_disable_harness_safety() {
+        let temp = TempDir::new("missing-outer-sandbox");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut codex_request =
+            request(&repo, Backend::Codex, "gpt-5.6-sol", Some(BEFORE_COMMIT));
+        codex_request.reasoning_effort = Some(ReasoningEffort::Max);
+        let codex = spawn_request(&codex_request, temp.path())
+            .expect("build Codex spawn without outer sandbox");
+        assert!(
+            !codex
+                .argv
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+            "Codex's sandbox must remain enabled when no outer profile exists"
+        );
+
+        let claude = spawn_request(
+            &request(
+                &repo,
+                Backend::Claude,
+                "claude-sonnet-5",
+                Some(BEFORE_COMMIT),
+            ),
+            temp.path(),
+        )
+        .expect("build Claude spawn without outer sandbox");
+        assert!(
+            !claude
+                .argv
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "Claude's permission checks must remain enabled when no outer profile exists"
         );
     }
 
@@ -1460,12 +1781,13 @@ mod tests {
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         let exec = FakeExec::success(WORKER_STDOUT, "");
         let commits = FakeCommits::new([Some(BEFORE_COMMIT), Some(WORKER_COMMIT)]);
-        let request = request(
+        let mut request = request(
             &repo,
             Backend::Claude,
             "claude-sonnet-5",
             Some(BEFORE_COMMIT),
         );
+        request.sandbox_profile = Some(repo.join("worker.sb"));
 
         run(
             &exec,
@@ -1478,7 +1800,14 @@ mod tests {
 
         assert_eq!(
             exec.spawned().argv,
-            vec!["claude", "-p", PROMPT, "--model", "claude-sonnet-5"]
+            vec![
+                "claude",
+                "-p",
+                PROMPT,
+                "--model",
+                "claude-sonnet-5",
+                "--dangerously-skip-permissions"
+            ]
         );
     }
 
@@ -2032,7 +2361,7 @@ mod tests {
             reasoning_effort: None,
             prompt: PROMPT.to_string(),
             attempt_identity: TEST_ATTEMPT_IDENTITY.to_string(),
-            lineage_lease_path: repo.join("worker-lineage.fifo"),
+            sandbox_profile: None,
         }
     }
 
@@ -2148,8 +2477,8 @@ mod tests {
         }
     }
 
-    /// Runs git under the spawn environment, so the commit carries the
-    /// per-attempt identity a real worker process inherits.
+    /// Runs git under the spawn environment so in-memory test doubles carry
+    /// the audit identity used by their non-OS authentication fallback.
     fn git_as_worker(request: &SpawnRequest, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -2347,6 +2676,8 @@ mod tests {
             cwd: temp.path().to_path_buf(),
             env: Vec::new(),
             stdin: StdinMode::Null,
+            sandbox_profile: None,
+            commit_receipt_socket: None,
             stdout_path: temp.path().join("out.log"),
             stderr_path: temp.path().join("err.log"),
         };
@@ -2366,69 +2697,6 @@ mod tests {
             !process_alive(grandchild_pid),
             "grandchild process must not survive killing the process group"
         );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn command_exec_lineage_lease_survives_a_descendants_setsid() {
-        let temp = TempDir::new("setsid-lineage-lease");
-        let marker = temp.path().join("escaped.pid");
-        let lease = temp.path().join("worker-lineage.fifo");
-        prepare_worker_lineage_lease(&lease).expect("create worker-lineage lease");
-        let script = r#"
-            python3 -c '
-import os, sys, time
-os.setsid()
-with open(sys.argv[1], "w") as fh:
-    fh.write(str(os.getpid()))
-time.sleep(30)
-' "$1" &
-            while [ ! -s "$1" ]; do sleep 0.01; done
-            exit 0
-        "#;
-        let request = SpawnRequest {
-            argv: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                script.to_string(),
-                "setsid-lineage-lease".to_string(),
-                marker.display().to_string(),
-            ],
-            cwd: temp.path().to_path_buf(),
-            env: Vec::new(),
-            stdin: StdinMode::WorkerLineageLease(lease.clone()),
-            stdout_path: temp.path().join("out.log"),
-            stderr_path: temp.path().join("err.log"),
-        };
-
-        let child = CommandExec.spawn(&request).expect("spawn worker shell");
-        let mut child = WorkerLineageChild {
-            child,
-            lineage_lease_path: lease.clone(),
-        };
-        let status = child
-            .wait_for(Duration::from_secs(5))
-            .expect("wait for direct worker")
-            .expect("direct worker exits");
-        assert!(status.success());
-        let escaped_pid = wait_for_pid_marker(&marker);
-        assert!(process_alive(escaped_pid));
-
-        let error = child
-            .ensure_worker_quiescent()
-            .expect_err("setsid descendant must keep the worker lineage unquiesced");
-        assert!(error.to_string().contains("worker lineage still holds"));
-
-        Command::new("kill")
-            .arg("-KILL")
-            .arg(escaped_pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill escaped descendant");
-        wait_for_worker_lineage_exit(&lease, Duration::from_secs(2))
-            .expect("escaped descendant releases the lineage lease after death");
     }
 
     #[cfg(unix)]
