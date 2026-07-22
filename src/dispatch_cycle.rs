@@ -3332,6 +3332,7 @@ fn resume_promoted_work<
         result: dispatch::DispatchResult {
             status: dispatch::DispatchStatus::Success,
             worker_commit: Some(promotion.worker_commit.clone()),
+            authentication_rejection: None,
             stdout_path: log_dir.join(format!("{}.out", promotion.attempt_id)),
             stderr_path: log_dir.join(format!("{}.err", promotion.attempt_id)),
             stdout_bytes: 0,
@@ -4587,6 +4588,12 @@ where
         let mut result = result;
         let mut artifact_refs = capture_dispatch_result(run_artifacts, &attempt_id, &result)?;
         let mut outcome_label = dispatch_status_label(&result.status);
+        if let Some(rejection) = result.authentication_rejection {
+            outcome_label = format!(
+                "{outcome_label}; authentication_rejection={}",
+                rejection.as_str()
+            );
+        }
         let mut worker_succeeded = matches!(result.status, dispatch::DispatchStatus::Success);
         if worker_succeeded {
             let worker_commit = result.worker_commit.as_deref().ok_or_else(|| {
@@ -7646,6 +7653,10 @@ dispatch_id = "senior-reviewer"
         let run_dir = fixture.pending_run_dir();
         let events = std::fs::read_to_string(run_dir.join("events.jsonl"))
             .expect("read descendant regression events");
+        assert!(
+            events.contains("authentication_rejection=receipt_stale"),
+            "escaped prior-attempt receipt must persist a stale-lineage diagnostic: {events}"
+        );
         let fallback_stdout = std::fs::read_to_string(
             fixture
                 .state
@@ -7793,6 +7804,14 @@ print("worker committed without its authenticated receipt")
         );
 
         let run_dir = fixture.pending_run_dir();
+        let rejected_events = crate::run::read_events(&run_dir.join("events.jsonl"))
+            .expect("read unauthenticated attempt diagnostic");
+        assert!(rejected_events.iter().any(|event| {
+            event.kind == EventKind::AttemptFinished
+                && event.outcome.as_deref().is_some_and(|outcome| {
+                    outcome.contains("authentication_rejection=receipt_absent")
+                })
+        }));
         let retained_checkout = run_dir.join("attempt-checkouts/001-fake-worker");
         let retained_head = git(&retained_checkout, &["rev-parse", "HEAD"])
             .trim()
@@ -8621,6 +8640,180 @@ print("worker committed without its authenticated receipt")
             std::fs::read(run_dir.join("promotion.json")).expect("receipt remains"),
             receipt,
             "the exact durable promotion receipt must remain discoverable"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "historical evidence and the two-session real-process receipt contract stay together"
+    )]
+    fn long_running_codex_commit_auth_survives_current_worker_session_rotation() {
+        struct RotatingCodexHarnessExec {
+            verifier_repo: PathBuf,
+            session_marker: PathBuf,
+        }
+
+        impl Exec for RotatingCodexHarnessExec {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                if request.argv.iter().any(|arg| arg == "fake-worker") {
+                    let child_script = r#"
+import os, subprocess, sys
+
+mode, target, marker, worker_sid = sys.argv[1:5]
+with open(marker, "a") as fh:
+    fh.write(f"{mode} {os.getppid()} {worker_sid} {os.getsid(0)} {os.getpid()}\n")
+path = os.path.join(target, "worker.txt" if mode == "final" else "verifier.txt")
+with open(path, "a") as fh:
+    fh.write(mode + "\n")
+for args in (
+    ["git", "add", os.path.basename(path)],
+    ["git", "commit", "-m", f"worker: {mode} receipt"],
+):
+    result = subprocess.run(
+        args,
+        cwd=target,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(result.returncode)
+"#;
+                    let worker_script = r#"
+import os, subprocess, sys
+
+child, verifier, checkout, marker = sys.argv[1:5]
+for mode, target in (("verifier", verifier), ("final", checkout)):
+    result = subprocess.run(
+        [sys.executable, "-c", child, mode, target, marker, str(os.getsid(0))],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+        check=False,
+    )
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+print("rotating Codex worker completed nested verifier and final commit")
+"#;
+                    let mut worker = request.clone();
+                    worker.argv = vec![
+                        "/usr/bin/python3".to_string(),
+                        "-c".to_string(),
+                        worker_script.to_string(),
+                        child_script.to_string(),
+                        self.verifier_repo.display().to_string(),
+                        request.cwd.display().to_string(),
+                        self.session_marker.display().to_string(),
+                    ];
+                    return crate::dispatch::CommandExec.spawn(&worker);
+                }
+                crate::dispatch::CommandExec.spawn(request)
+            }
+        }
+
+        let historical: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/conductor-0kc-auth-loss.json"
+        ))
+        .expect("parse preserved conductor-0kc authentication-loss evidence");
+        assert_eq!(
+            historical["run_id"],
+            "run-work-20260722T150722.151098000-p18479-000000"
+        );
+        assert_eq!(historical["cycle_id"], "cycle-20260722-144431");
+        assert_eq!(
+            historical["rejected_commit"],
+            "3bd0b93200f25bb9cc6085f02636d7bf61c19df4"
+        );
+        assert_eq!(
+            historical["quarantine"]["sha256"],
+            "2403f4499659d72330d35e21345c0b1fc213f0434b8fb7067ad4da8746a1d866"
+        );
+
+        let temp = TempDir::new("long-running-codex-auth-rotation");
+        let repo = temp.path().join("attempt-checkout");
+        let verifier_repo = temp.path().join("nested-verifier-repo");
+        init_sandbox_repo_without_bd(&repo);
+        init_sandbox_repo_without_bd(&verifier_repo);
+        let before = git(&repo, &["rev-parse", "HEAD"]);
+        let verifier_before = git(&verifier_repo, &["rev-parse", "HEAD"]);
+        let session_marker = temp.path().join("sessions.txt");
+        let exec = RotatingCodexHarnessExec {
+            verifier_repo: verifier_repo.clone(),
+            session_marker: session_marker.clone(),
+        };
+        let request = DispatchRequest {
+            repo: repo.clone(),
+            before_head: Some(before.trim().to_string()),
+            attempt_id: "001-codex-rotation".to_string(),
+            cycle_id: "cycle-codex-rotation".to_string(),
+            bead_id: "codex-rotation".to_string(),
+            backend: Backend::Codex,
+            dispatch_id: "fake-worker".to_string(),
+            reasoning_effort: Some(crate::config::ReasoningEffort::Max),
+            prompt: "long-running Codex receipt rotation".to_string(),
+            attempt_identity: dispatch::attempt_commit_identity(),
+            sandbox_profile: None,
+        };
+
+        let result = dispatch::run(
+            &exec,
+            &GitCommitProbe,
+            &request,
+            &temp.path().join("state"),
+            Duration::from_secs(30),
+        )
+        .expect("run current Codex worker across child-session receipt rotation");
+
+        let sessions = std::fs::read_to_string(session_marker)
+            .expect("read child-session markers")
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sessions.len(), 2);
+        for session in &sessions {
+            assert_eq!(session.len(), 5);
+            assert_eq!(
+                session[1], session[2],
+                "child session must retain the current worker as parent"
+            );
+            assert_eq!(session[3], session[4], "child must lead its own session");
+            assert_ne!(session[2], session[3], "child session must rotate");
+        }
+        assert_ne!(sessions[0][3], sessions[1][3]);
+        assert_ne!(
+            git(&verifier_repo, &["rev-parse", "HEAD"]).trim(),
+            verifier_before.trim(),
+            "the nested verifier commit must send the first current-worker receipt"
+        );
+        assert!(matches!(result.status, dispatch::DispatchStatus::Success));
+        assert_eq!(result.authentication_rejection, None);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(result.worker_commit.as_deref(), Some(head.trim()));
+        assert_eq!(
+            git(
+                &repo,
+                &["rev-list", "--count", &format!("{}..HEAD", before.trim())]
+            )
+            .trim(),
+            "1",
+            "only the final exact checkout commit may authenticate the attempt"
         );
     }
 
@@ -11725,6 +11918,7 @@ dispatch_id = "fallback-worker"
         let result = dispatch::DispatchResult {
             status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::NoNewCommit),
             worker_commit: None,
+            authentication_rejection: None,
             stdout_path: temp.path().join("worker.out"),
             stderr_path,
             stdout_bytes: 1,
@@ -11742,6 +11936,7 @@ dispatch_id = "fallback-worker"
         let result = dispatch::DispatchResult {
             status: dispatch::DispatchStatus::Failed(dispatch::DispatchFailure::TimedOut),
             worker_commit: None,
+            authentication_rejection: None,
             stdout_path: temp.path().join("worker.out"),
             stderr_path,
             stdout_bytes: 0,

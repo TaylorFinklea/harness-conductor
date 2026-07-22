@@ -1,0 +1,20 @@
+{
+  "schema": "conductor/commit-auth-loss-evidence@1",
+  "run_id": "run-work-20260722T150722.151098000-p18479-000000",
+  "cycle_id": "cycle-20260722-144431",
+  "before_head": "c530186915cd1fda4eae0e8aa3bfaf4b71b62470",
+  "rejected_commit": "3bd0b93200f25bb9cc6085f02636d7bf61c19df4",
+  "outcome": "unauthenticated_commit_quarantined_recoverable",
+  "worker": {
+    "backend": "codex",
+    "session_id": "019f8a5d-fbdc-7c63-a5b9-74da22284890",
+    "tokens_used": 502617,
+    "stdout_sha256": "af9c4b78344f7d92babfc4eda6b4a151dcd580d2f29e67c6f5a065da1fc48bdb",
+    "stderr_sha256": "5e6a2e180538be5784cb5137670fd9d3ab0dda77d364547300036f4bf332504b"
+  },
+  "quarantine": {
+    "path": "artifacts/001-openai-codex--codex--gpt-5.6-sol--max-unauthenticated-quarantine.patch",
+    "sha256": "2403f4499659d72330d35e21345c0b1fc213f0434b8fb7067ad4da8746a1d866"
+  },
+  "inference": "current-worker receipt ambiguity or child-session rotation; not proven by the historical run"
+}

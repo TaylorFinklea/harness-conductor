@@ -119,6 +119,7 @@ pub(crate) fn attempt_commit_identity() -> String {
 pub(crate) struct DispatchResult {
     pub(crate) status: DispatchStatus,
     pub(crate) worker_commit: Option<String>,
+    pub(crate) authentication_rejection: Option<CommitAuthenticationRejection>,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
     pub(crate) stdout_bytes: u64,
@@ -138,6 +139,35 @@ pub(crate) enum DispatchFailure {
     NoNewCommit,
     UnauthenticatedCommit,
     BackendFlakeZeroStdoutNoCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitAuthenticationRejection {
+    CheckoutChangedBeforeSpawn,
+    CheckoutHeadMissing,
+    CheckoutHeadNotDirectChild,
+    CheckoutDirty,
+    ReceiptAbsent,
+    ReceiptStale,
+    ReceiptMismatched,
+    ReceiptAmbiguous,
+    AuditIdentityMismatched,
+}
+
+impl CommitAuthenticationRejection {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CheckoutChangedBeforeSpawn => "checkout_changed_before_spawn",
+            Self::CheckoutHeadMissing => "checkout_head_missing",
+            Self::CheckoutHeadNotDirectChild => "checkout_head_not_direct_child",
+            Self::CheckoutDirty => "checkout_dirty",
+            Self::ReceiptAbsent => "receipt_absent",
+            Self::ReceiptStale => "receipt_stale",
+            Self::ReceiptMismatched => "receipt_mismatched",
+            Self::ReceiptAmbiguous => "receipt_ambiguous",
+            Self::AuditIdentityMismatched => "audit_identity_mismatched",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +230,35 @@ pub(crate) trait Exec {
     fn spawn(&self, request: &SpawnRequest) -> Result<Box<dyn ChildProcess>>;
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CommitReceiptEvidence {
+    accepted: Vec<String>,
+    stale_lineage: usize,
+    invalid: usize,
+}
+
+impl CommitReceiptEvidence {
+    fn rejection_for(&self, expected: &str) -> Option<CommitAuthenticationRejection> {
+        if self.accepted.iter().any(|commit| commit == expected) {
+            return None;
+        }
+        let distinct = self
+            .accepted
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if distinct > 1 {
+            Some(CommitAuthenticationRejection::ReceiptAmbiguous)
+        } else if distinct == 1 || self.invalid > 0 {
+            Some(CommitAuthenticationRejection::ReceiptMismatched)
+        } else if self.stale_lineage > 0 {
+            Some(CommitAuthenticationRejection::ReceiptStale)
+        } else {
+            Some(CommitAuthenticationRejection::ReceiptAbsent)
+        }
+    }
+}
+
 pub(crate) trait ChildProcess {
     fn wait_for(&mut self, timeout: Duration) -> Result<Option<ProcessStatus>>;
     fn terminate(&mut self) -> Result<()>;
@@ -214,11 +273,11 @@ pub(crate) trait ChildProcess {
     fn id(&self) -> Option<u32> {
         None
     }
-    /// Returns the only commit hash reported by a post-commit hook whose
-    /// connecting process the kernel proved descends from this worker root.
-    /// In-memory test doubles have no OS lineage and return `None`.
-    fn authenticated_worker_commit(&self) -> Option<String> {
-        None
+    /// Returns commit receipts whose connecting processes the kernel proved
+    /// descend from this worker root, plus bounded rejection predicates.
+    /// In-memory test doubles have no OS lineage and return empty evidence.
+    fn commit_receipt_evidence(&self) -> CommitReceiptEvidence {
+        CommitReceiptEvidence::default()
     }
     /// Proves that the worker's process group has no surviving descendants
     /// after the direct child exits. A real worker may fork background tools
@@ -341,6 +400,9 @@ where
         return Ok(DispatchResult {
             status: DispatchStatus::Failed(DispatchFailure::UnauthenticatedCommit),
             worker_commit: None,
+            authentication_rejection: Some(
+                CommitAuthenticationRejection::CheckoutChangedBeforeSpawn,
+            ),
             stdout_path: spawn.stdout_path,
             stderr_path: spawn.stderr_path,
             stdout_bytes: 0,
@@ -370,15 +432,15 @@ where
     }
     let process =
         wait_with_timeout_and_heartbeat(child.as_mut(), timeout, heartbeat_interval, hooks)?;
-    let authenticated_commit = child.authenticated_worker_commit();
+    let receipt_evidence = child.commit_receipt_evidence();
     let stdout_bytes = file_len(&spawn.stdout_path)?;
     let stderr_bytes = file_len(&spawn.stderr_path)?;
     let authentication = CommitAuthentication {
         attempt_identity: &request.attempt_identity,
-        authenticated_commit: authenticated_commit.as_deref(),
+        receipt_evidence: &receipt_evidence,
         requires_kernel_authentication,
     };
-    let (status, worker_commit) = classify(
+    let (status, worker_commit, authentication_rejection) = classify(
         process,
         stdout_bytes,
         request.before_head.as_deref(),
@@ -390,6 +452,7 @@ where
     Ok(DispatchResult {
         status,
         worker_commit,
+        authentication_rejection,
         stdout_path: spawn.stdout_path,
         stderr_path: spawn.stderr_path,
         stdout_bytes,
@@ -743,7 +806,7 @@ fn ensure_child_worker_quiescent(child: &mut dyn ChildProcess) -> Result<()> {
 #[derive(Clone, Copy)]
 struct CommitAuthentication<'a> {
     attempt_identity: &'a str,
-    authenticated_commit: Option<&'a str>,
+    receipt_evidence: &'a CommitReceiptEvidence,
     requires_kernel_authentication: bool,
 }
 
@@ -754,15 +817,24 @@ fn classify<C: CommitProbe + ?Sized>(
     commits: &C,
     repo: &Path,
     authentication: CommitAuthentication<'_>,
-) -> Result<(DispatchStatus, Option<String>)> {
+) -> Result<(
+    DispatchStatus,
+    Option<String>,
+    Option<CommitAuthenticationRejection>,
+)> {
     if process.timed_out {
-        return Ok((DispatchStatus::Failed(DispatchFailure::TimedOut), None));
+        return Ok((
+            DispatchStatus::Failed(DispatchFailure::TimedOut),
+            None,
+            None,
+        ));
     }
     if !process.status.success {
         return Ok((
             DispatchStatus::Failed(DispatchFailure::ExitNonZero {
                 code: process.status.code,
             }),
+            None,
             None,
         ));
     }
@@ -775,30 +847,57 @@ fn classify<C: CommitProbe + ?Sized>(
         // was in the current worker's process lineage. Observable environment
         // identity is retained only for in-memory test doubles, which have no
         // OS pid and therefore cannot exercise the production boundary.
-        if let Some(commit) = after_head.as_deref()
-            && commits.is_direct_child(repo, before_head, commit)?
-            && commits.is_clean(repo)?
-            && if authentication.requires_kernel_authentication {
-                authentication.authenticated_commit == Some(commit)
-            } else {
-                commits.committer_email(repo, commit)?.as_deref()
-                    == Some(authentication.attempt_identity)
-            }
+        let Some(commit) = after_head.as_deref() else {
+            return Ok((
+                DispatchStatus::Failed(DispatchFailure::UnauthenticatedCommit),
+                None,
+                Some(CommitAuthenticationRejection::CheckoutHeadMissing),
+            ));
+        };
+        if !commits.is_direct_child(repo, before_head, commit)? {
+            return Ok((
+                DispatchStatus::Failed(DispatchFailure::UnauthenticatedCommit),
+                None,
+                Some(CommitAuthenticationRejection::CheckoutHeadNotDirectChild),
+            ));
+        }
+        if !commits.is_clean(repo)? {
+            return Ok((
+                DispatchStatus::Failed(DispatchFailure::UnauthenticatedCommit),
+                None,
+                Some(CommitAuthenticationRejection::CheckoutDirty),
+            ));
+        }
+        let rejection = if authentication.requires_kernel_authentication {
+            authentication.receipt_evidence.rejection_for(commit)
+        } else if commits.committer_email(repo, commit)?.as_deref()
+            == Some(authentication.attempt_identity)
         {
-            return Ok((DispatchStatus::Success, after_head));
+            None
+        } else {
+            Some(CommitAuthenticationRejection::AuditIdentityMismatched)
+        };
+        if rejection.is_none() {
+            return Ok((DispatchStatus::Success, after_head, None));
         }
         return Ok((
             DispatchStatus::Failed(DispatchFailure::UnauthenticatedCommit),
             None,
+            rejection,
         ));
     }
     if stdout_bytes == 0 {
         Ok((
             DispatchStatus::Failed(DispatchFailure::BackendFlakeZeroStdoutNoCommit),
             None,
+            None,
         ))
     } else {
-        Ok((DispatchStatus::Failed(DispatchFailure::NoNewCommit), None))
+        Ok((
+            DispatchStatus::Failed(DispatchFailure::NoNewCommit),
+            None,
+            None,
+        ))
     }
 }
 
@@ -877,6 +976,8 @@ struct CommitReceiptBroker {
     socket_path: PathBuf,
     worker_root: u32,
     accepted: Vec<String>,
+    stale_lineage: usize,
+    invalid: usize,
 }
 
 #[cfg(unix)]
@@ -914,6 +1015,8 @@ impl CommitReceiptBroker {
             socket_path: socket_path.to_path_buf(),
             worker_root: 0,
             accepted: Vec::new(),
+            stale_lineage: 0,
+            invalid: 0,
         })
     }
 
@@ -941,22 +1044,26 @@ impl CommitReceiptBroker {
                 .read_line(&mut line)
                 .map_err(|error| DispatchError::new(format!("read commit receipt: {error}")))?;
             let commit = line.trim();
-            if valid_git_oid(commit) && process_in_live_worker_lineage(peer, self.worker_root)? {
+            if !valid_git_oid(commit) {
+                self.invalid += 1;
+                let _ = stream.write_all(b"denied\n");
+            } else if process_in_live_worker_lineage(peer, self.worker_root)? {
                 self.accepted.push(commit.to_string());
                 stream
                     .write_all(b"ok\n")
                     .map_err(|error| DispatchError::new(format!("ack commit receipt: {error}")))?;
             } else {
+                self.stale_lineage += 1;
                 let _ = stream.write_all(b"denied\n");
             }
         }
     }
 
-    fn authenticated_commit(&self) -> Option<String> {
-        if self.accepted.len() == 1 {
-            self.accepted.first().cloned()
-        } else {
-            None
+    fn evidence(&self) -> CommitReceiptEvidence {
+        CommitReceiptEvidence {
+            accepted: self.accepted.clone(),
+            stale_lineage: self.stale_lineage,
+            invalid: self.invalid,
         }
     }
 }
@@ -1473,16 +1580,17 @@ impl ChildProcess for CommandChild {
         Some(self.child.id())
     }
 
-    fn authenticated_worker_commit(&self) -> Option<String> {
+    fn commit_receipt_evidence(&self) -> CommitReceiptEvidence {
         #[cfg(unix)]
         {
-            self.receipt_broker
-                .as_ref()
-                .and_then(CommitReceiptBroker::authenticated_commit)
+            self.receipt_broker.as_ref().map_or_else(
+                CommitReceiptEvidence::default,
+                CommitReceiptBroker::evidence,
+            )
         }
         #[cfg(not(unix))]
         {
-            None
+            CommitReceiptEvidence::default()
         }
     }
 }
@@ -1695,6 +1803,48 @@ mod tests {
     const BEFORE_COMMIT: &str = "1111111111111111111111111111111111111111";
     const WORKER_COMMIT: &str = "2222222222222222222222222222222222222222";
     const WORKER_STDOUT: &str = "worker stdout\n";
+
+    #[test]
+    fn commit_receipt_diagnostics_discriminate_absent_stale_mismatched_and_ambiguous() {
+        let absent = CommitReceiptEvidence::default();
+        assert_eq!(
+            absent.rejection_for(WORKER_COMMIT),
+            Some(CommitAuthenticationRejection::ReceiptAbsent)
+        );
+
+        let stale = CommitReceiptEvidence {
+            stale_lineage: 1,
+            ..CommitReceiptEvidence::default()
+        };
+        assert_eq!(
+            stale.rejection_for(WORKER_COMMIT),
+            Some(CommitAuthenticationRejection::ReceiptStale)
+        );
+
+        let mismatched = CommitReceiptEvidence {
+            accepted: vec![BEFORE_COMMIT.to_string()],
+            ..CommitReceiptEvidence::default()
+        };
+        assert_eq!(
+            mismatched.rejection_for(WORKER_COMMIT),
+            Some(CommitAuthenticationRejection::ReceiptMismatched)
+        );
+
+        let ambiguous = CommitReceiptEvidence {
+            accepted: vec![BEFORE_COMMIT.to_string(), "3".repeat(40)],
+            ..CommitReceiptEvidence::default()
+        };
+        assert_eq!(
+            ambiguous.rejection_for(WORKER_COMMIT),
+            Some(CommitAuthenticationRejection::ReceiptAmbiguous)
+        );
+
+        let rotated_current_worker = CommitReceiptEvidence {
+            accepted: vec![BEFORE_COMMIT.to_string(), WORKER_COMMIT.to_string()],
+            ..CommitReceiptEvidence::default()
+        };
+        assert_eq!(rotated_current_worker.rejection_for(WORKER_COMMIT), None);
+    }
 
     /// Adapts a bare heartbeat closure to the [`WorkerHooks`] trait so the
     /// wait-loop tests can drive `on_heartbeat` without a full observer.

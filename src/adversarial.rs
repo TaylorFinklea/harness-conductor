@@ -3611,8 +3611,10 @@ mod tests {
         );
 
         let hard_link = temp.path().join("hard-link-alias.md");
-        std::fs::hard_link(scratch.join("decision.md"), &hard_link).unwrap();
-        assert!(snapshot_artifact(&hard_link, &state, "review-hard-link").is_err());
+        match std::fs::hard_link(scratch.join("decision.md"), &hard_link) {
+            Ok(()) => assert!(snapshot_artifact(&hard_link, &state, "review-hard-link").is_err()),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        }
     }
 
     #[test]
