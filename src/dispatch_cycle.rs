@@ -550,6 +550,7 @@ struct WorkerIsolationRecord {
 }
 
 const PROMOTION_SCHEMA: &str = "conductor/promotion@1";
+const PROMOTION_RECOVERY_SCHEMA: &str = "conductor/promotion-recovery@1";
 const UNAUTHENTICATED_QUARANTINE_OUTCOME: &str = "unauthenticated_commit_quarantined_recoverable";
 const UNAUTHENTICATED_QUARANTINE_EVENT_PREFIX: &str = "unauthenticated_commit_quarantined:";
 
@@ -574,8 +575,40 @@ struct PromotionRecord {
     phase: PromotionPhase,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PromotionRecoveryPhase {
+    Intent,
+    Verifying,
+    Failed,
+    Verified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromotionRecoveryRecord {
+    schema: String,
+    run_id: String,
+    cycle_id: String,
+    repo: String,
+    bead: String,
+    authorization_sha256: String,
+    promotion: PromotionRecord,
+    mechanical_verifier: String,
+    qualitative_verifier: Option<String>,
+    owner_pid: u32,
+    started_at: String,
+    phase: PromotionRecoveryPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+}
+
 fn promotion_path(run_dir: &Path) -> PathBuf {
     run_dir.join("promotion.json")
+}
+
+fn promotion_recovery_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("promotion-recovery.json")
 }
 
 fn write_promotion_record(
@@ -650,6 +683,84 @@ fn read_promotion_record(
     if record.schema != PROMOTION_SCHEMA {
         return Err(DispatchCycleError::message(format!(
             "unsupported promotion schema {:?}",
+            record.schema
+        )));
+    }
+    Ok(Some(record))
+}
+
+fn write_promotion_recovery_record(
+    run_dir: &Path,
+    record: &PromotionRecoveryRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    let path = promotion_recovery_path(run_dir);
+    let pending = run_dir.join("promotion-recovery.json.pending");
+    let mut bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+        DispatchCycleError::message(format!("serialize promotion recovery record: {error}"))
+    })?;
+    bytes.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&pending)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "open pending promotion recovery record {}: {error}",
+                pending.display()
+            ))
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "write pending promotion recovery record {}: {error}",
+            pending.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        DispatchCycleError::message(format!(
+            "sync pending promotion recovery record {}: {error}",
+            pending.display()
+        ))
+    })?;
+    std::fs::rename(&pending, &path).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "commit promotion recovery record {}: {error}",
+            path.display()
+        ))
+    })?;
+    std::fs::File::open(run_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "sync promotion recovery record directory {}: {error}",
+                run_dir.display()
+            ))
+        })
+}
+
+fn read_promotion_recovery_record(
+    run_dir: &Path,
+) -> std::result::Result<Option<PromotionRecoveryRecord>, DispatchCycleError> {
+    let path = promotion_recovery_path(run_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(DispatchCycleError::message(format!(
+                "read promotion recovery record {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let record: PromotionRecoveryRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "parse promotion recovery record {}: {error}",
+            path.display()
+        ))
+    })?;
+    if record.schema != PROMOTION_RECOVERY_SCHEMA {
+        return Err(DispatchCycleError::message(format!(
+            "unsupported promotion recovery schema {:?}",
             record.schema
         )));
     }
@@ -1312,17 +1423,25 @@ fn find_promoted_work_run<C: CommitProbe + ?Sized>(
     _repo_path: &Path,
     bead: &str,
 ) -> std::result::Result<Option<(String, PromotionRecord)>, DispatchCycleError> {
-    let Some(run_id) = crate::run::find_implementing_work_run(
-        state_dir,
-        cycle_id,
-        canonical_repo,
-        bead,
-    )
-    .map_err(run_artifact_error)?
-    else {
-        return Ok(None);
+    let implementing =
+        crate::run::find_implementing_work_run(state_dir, cycle_id, canonical_repo, bead)
+            .map_err(run_artifact_error)?;
+    let run_id = if let Some(run_id) = implementing {
+        run_id
+    } else {
+        match crate::run::find_reclaimable_work_run(state_dir, cycle_id, canonical_repo, bead)
+            .map_err(run_artifact_error)?
+        {
+            Some(crate::run::ReclaimCandidate::FinishedLatest(run_id)) => run_id,
+            Some(crate::run::ReclaimCandidate::Unfinished(_)) | None => return Ok(None),
+        }
     };
     let run_artifacts = RunHandle::open(state_dir, &run_id).map_err(run_artifact_error)?;
+    if run_artifacts.manifest().lifecycle == crate::run::RunLifecycle::Finished
+        && run_artifacts.manifest().outcome.as_deref() != Some("failed")
+    {
+        return Ok(None);
+    }
     let Some(promotion) = read_promotion_record(run_artifacts.dir())? else {
         return Ok(None);
     };
@@ -2140,6 +2259,859 @@ fn complete_worker_verification<
     })
 }
 
+fn validate_finished_promoted_failure(
+    run_artifacts: &RunHandle,
+    item: &PlannedItem,
+    cycle_id: &str,
+    canonical_repo: &str,
+    promotion: &PromotionRecord,
+) -> std::result::Result<WorkState, DispatchCycleError> {
+    let work = run_artifacts
+        .work()
+        .cloned()
+        .ok_or_else(|| DispatchCycleError::message("finished promoted run has no work state"))?;
+    if run_artifacts.manifest().lifecycle != crate::run::RunLifecycle::Finished
+        || run_artifacts.manifest().outcome.as_deref() != Some("failed")
+        || work.stage != WorkStage::Completed
+        || work.cycle_id != cycle_id
+        || work.authorization_sha256 != item.authorization_sha256
+        || work.before_head.as_deref() != Some(promotion.before_head.as_str())
+        || work.worker_profile.is_some()
+        || work.worker_commit.is_some()
+        || work.mechanical.is_some()
+        || run_artifacts.manifest().target.repo != canonical_repo
+        || run_artifacts.manifest().target.bead.as_deref() != Some(item.issue_id.as_str())
+        || promotion.schema != PROMOTION_SCHEMA
+        || promotion.phase != PromotionPhase::Promoted
+        || promotion.cycle_id != cycle_id
+        || promotion.repo != canonical_repo
+        || promotion.bead != item.issue_id
+        || promotion.attempt_id.trim().is_empty()
+        || promotion.worker_profile.trim().is_empty()
+    {
+        return Err(DispatchCycleError::message(
+            "finished promoted run does not match the exact failed-verifier recovery shape",
+        ));
+    }
+    validate_finished_promoted_failure_events(run_artifacts, promotion)?;
+    Ok(work)
+}
+
+fn validate_finished_promoted_failure_events(
+    run_artifacts: &RunHandle,
+    promotion: &PromotionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    let events =
+        crate::run::read_events(&run_artifacts.events_path()).map_err(run_artifact_error)?;
+    let matching = |kind| {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.kind == kind)
+            .collect::<Vec<_>>()
+    };
+    let started = matching(EventKind::AttemptStarted);
+    let finished = matching(EventKind::AttemptFinished);
+    let verified = matching(EventKind::VerifyFinished);
+    let qualitative_gaps = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == EventKind::CoverageGap
+                && event.outcome.as_deref() == Some("qualitative_review_not_run")
+        })
+        .collect::<Vec<_>>();
+    let run_finished = matching(EventKind::RunFinished);
+    let recovered_success = format!(
+        "success_recovered:{}:{}",
+        promotion.attempt_id, promotion.worker_commit
+    );
+    let exact = events.first().is_some_and(|event| {
+        event.kind == EventKind::RunStarted && event.outcome.as_deref() == Some("started")
+    }) && started.len() == 1
+        && started[0].1.profile_id.as_deref() == Some(promotion.worker_profile.as_str())
+        && started[0].1.outcome.as_deref()
+            == Some(format!("running:{}", promotion.attempt_id).as_str())
+        && finished.len() == 1
+        && finished[0].1.profile_id.as_deref() == Some(promotion.worker_profile.as_str())
+        && finished[0]
+            .1
+            .outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome == "success" || outcome == recovered_success)
+        && verified.len() == 1
+        && verified[0].1.outcome.as_deref() == Some("failed")
+        && !verified[0].1.artifact_refs.is_empty()
+        && qualitative_gaps.len() == 1
+        && run_finished.len() == 1
+        && run_finished[0].0 + 1 == events.len()
+        && run_finished[0].1.outcome.as_deref() == Some("failed")
+        && started[0].0 < finished[0].0
+        && finished[0].0 < verified[0].0
+        && verified[0].0 < qualitative_gaps[0].0
+        && qualitative_gaps[0].0 < run_finished[0].0;
+    if !exact {
+        return Err(DispatchCycleError::message(
+            "finished promoted run journal is not the exact recoverable verifier-failure history",
+        ));
+    }
+    for (index, event) in events.iter().enumerate() {
+        let allowed = index == 0
+            || index == started[0].0
+            || index == finished[0].0
+            || index == verified[0].0
+            || index == qualitative_gaps[0].0
+            || index == run_finished[0].0
+            || event.kind == EventKind::CoverageGap
+                && event.outcome.as_deref() == Some("bursar_roster_artifact_unavailable")
+                && index < started[0].0;
+        if !allowed {
+            return Err(DispatchCycleError::message(
+                "finished promoted run contains evidence outside verifier/review incompleteness",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn authenticate_finished_promoted_owner(
+    run_artifacts: &RunHandle,
+) -> std::result::Result<(), DispatchCycleError> {
+    let last_seen = run_artifacts.last_seen().map_err(run_artifact_error)?;
+    if Utc::now().signed_duration_since(last_seen) < STALE_CLAIM_THRESHOLD {
+        return Err(DispatchCycleError::message(format!(
+            "finished promoted owner is still fresh (last seen {last_seen})"
+        )));
+    }
+    let owner_pid = run_artifacts.owner_pid().ok_or_else(|| {
+        DispatchCycleError::message(
+            "finished promoted owner identity is missing; refusing recovery",
+        )
+    })?;
+    if quarantine::process_alive(owner_pid) {
+        return Err(DispatchCycleError::message(format!(
+            "finished promoted owner pid {owner_pid} is still alive or ambiguous"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_finished_promoted_repository<C: CommitProbe + ?Sized>(
+    commits: &C,
+    repo_path: &Path,
+    promotion: &PromotionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    let head = commits.head(repo_path).map_err(|error| {
+        DispatchCycleError::message(format!("finished promotion recovery HEAD probe: {error}"))
+    })?;
+    if head.as_deref() != Some(promotion.worker_commit.as_str()) {
+        return Err(DispatchCycleError::message(format!(
+            "finished promoted HEAD changed: expected {}, found {}",
+            promotion.worker_commit,
+            head.as_deref().unwrap_or("<none>")
+        )));
+    }
+    if !commits.is_clean(repo_path).map_err(|error| {
+        DispatchCycleError::message(format!("finished promotion recovery status probe: {error}"))
+    })? {
+        return Err(DispatchCycleError::message(
+            "finished promoted repository is dirty",
+        ));
+    }
+    if !commits
+        .is_direct_child(
+            repo_path,
+            Some(promotion.before_head.as_str()),
+            &promotion.worker_commit,
+        )
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "finished promotion recovery parent check: {error}"
+            ))
+        })?
+    {
+        return Err(DispatchCycleError::message(
+            "finished promoted commit is not the recorded base's direct child",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_promotion_recovery_record(
+    recovery: &PromotionRecoveryRecord,
+    run_artifacts: &RunHandle,
+    item: &PlannedItem,
+    cycle_id: &str,
+    canonical_repo: &str,
+    promotion: &PromotionRecord,
+) -> std::result::Result<(), DispatchCycleError> {
+    if recovery.schema != PROMOTION_RECOVERY_SCHEMA
+        || recovery.run_id != run_artifacts.run_id()
+        || recovery.cycle_id != cycle_id
+        || recovery.repo != canonical_repo
+        || recovery.bead != item.issue_id
+        || recovery.authorization_sha256 != item.authorization_sha256
+        || recovery.promotion != *promotion
+        || recovery.mechanical_verifier
+            != run_artifacts
+                .manifest()
+                .verifier
+                .mechanical
+                .as_deref()
+                .unwrap_or_default()
+        || recovery.qualitative_verifier != run_artifacts.manifest().verifier.qualitative
+    {
+        return Err(DispatchCycleError::message(
+            "promotion recovery intent does not match the exact failed run and approval",
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the recovery authority binds the approved item, run, receipt, claim, and repository"
+)]
+fn validate_finished_promotion_recovery_authority<C: CommitProbe + ?Sized>(
+    cfg: &Config,
+    commits: &C,
+    item: &PlannedItem,
+    selected_roster: &RosterEntry,
+    cycle_id: &str,
+    repo_path: &Path,
+    canonical_repo: &str,
+    current: &Issue,
+    run_artifacts: &RunHandle,
+    promotion: &PromotionRecord,
+) -> std::result::Result<(WorkState, ExtractedFields, RosterEntry), DispatchCycleError> {
+    let work = validate_finished_promoted_failure(
+        run_artifacts,
+        item,
+        cycle_id,
+        canonical_repo,
+        promotion,
+    )?;
+    authenticate_finished_promoted_owner(run_artifacts)?;
+    let extracted =
+        validate_item_authorization(cfg, item, selected_roster, canonical_repo, current).map_err(
+            |reason| {
+                DispatchCycleError::message(format!(
+                    "finished promotion recovery approval is stale: {reason}"
+                ))
+            },
+        )?;
+    if run_artifacts.manifest().verifier.mechanical.as_deref()
+        != Some(extracted.verify_cmd.as_str())
+        || run_artifacts.manifest().verifier.qualitative != qualitative_verifier_label(cfg)
+    {
+        return Err(DispatchCycleError::message(
+            "finished promoted verifier configuration no longer matches the approval",
+        ));
+    }
+    validate_pending_approval(
+        &run_artifacts.approval().map_err(run_artifact_error)?,
+        item,
+        cycle_id,
+        canonical_repo,
+    )?;
+    validate_finished_promoted_repository(commits, repo_path, promotion)?;
+    let approved_chain = fallback_chain(
+        &cfg.roster,
+        selected_roster,
+        item.approved_route.as_ref(),
+        cfg.budgets.use_bursar,
+    )?;
+    let active_roster = approved_chain
+        .into_iter()
+        .find(|entry| entry.name == promotion.worker_profile)
+        .ok_or_else(|| {
+            DispatchCycleError::message(
+                "finished promoted worker profile is outside the approved provider envelope",
+            )
+        })?;
+    Ok((work, extracted, active_roster))
+}
+
+struct DeferredCloseBd<'a, B: BdClient + ?Sized> {
+    inner: &'a B,
+}
+
+impl<B: BdClient + ?Sized> BdClient for DeferredCloseBd<'_, B> {
+    fn ready(&self, repo: &Path) -> crate::bd::Result<Vec<Issue>> {
+        self.inner.ready(repo)
+    }
+
+    fn show(&self, repo: &Path, id: &str) -> crate::bd::Result<Issue> {
+        self.inner.show(repo, id)
+    }
+
+    fn count(&self, repo: &Path) -> crate::bd::Result<u64> {
+        self.inner.count(repo)
+    }
+
+    fn blocked(&self, repo: &Path) -> crate::bd::Result<Vec<Issue>> {
+        self.inner.blocked(repo)
+    }
+
+    fn claim(&self, repo: &Path, id: &str, actor: &str) -> crate::bd::Result<Issue> {
+        self.inner.claim(repo, id, actor)
+    }
+
+    fn release(&self, repo: &Path, id: &str) -> crate::bd::Result<Issue> {
+        self.inner.release(repo, id)
+    }
+
+    fn close(&self, repo: &Path, id: &str, _reason: &str) -> crate::bd::Result<Issue> {
+        let mut issue = self.inner.show(repo, id)?;
+        issue.status = "closed".to_string();
+        Ok(issue)
+    }
+
+    fn comment(&self, repo: &Path, id: &str, text: &str) -> crate::bd::Result<crate::bd::Comment> {
+        self.inner.comment(repo, id, text)
+    }
+
+    fn set_metadata(
+        &self,
+        repo: &Path,
+        id: &str,
+        key: &str,
+        value: &str,
+    ) -> crate::bd::Result<Issue> {
+        self.inner.set_metadata(repo, id, key, value)
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "terminal recovery evidence must be durable before its exact claim is released"
+)]
+fn finish_promotion_recovery_failure<B: BdClient + ?Sized>(
+    bd: &B,
+    repo_path: &Path,
+    issue_id: &str,
+    run_dir: &Path,
+    recovery: &mut PromotionRecoveryRecord,
+    decision: VerifyDecision,
+    summary: impl Into<String>,
+    review_dispatches: u64,
+) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
+    let summary = summary.into();
+    recovery.phase = PromotionRecoveryPhase::Failed;
+    recovery.outcome = Some(summary.clone());
+    write_promotion_recovery_record(run_dir, recovery).map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "promotion recovery failed but its terminal evidence could not be persisted ({error}); claim retained"
+        ))
+    })?;
+    bd.release(repo_path, issue_id).map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "promotion recovery evidence records failure but claim release failed: {error}"
+        ))
+    })?;
+    Ok(DispatchOneResult {
+        decision: Some(decision),
+        dispatches: review_dispatches,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "released promotion recovery revalidates one exact authority before and after its atomic claim"
+)]
+fn resume_finished_promoted_work<
+    B: BdClient + ?Sized,
+    E: Exec + ?Sized,
+    C: CommitProbe + ?Sized,
+    L: LiveSink + ?Sized,
+>(
+    cfg: &Config,
+    bd: &B,
+    exec: &E,
+    commits: &C,
+    state_dir: &Path,
+    cycle_id: &str,
+    options: &DispatchCycleOptions,
+    live: &L,
+    report_path: &Path,
+    cycle_start: Instant,
+    item: &PlannedItem,
+    progress: Option<f64>,
+    selected_roster: &RosterEntry,
+    repo_path: &Path,
+    canonical_repo: &str,
+    current: &Issue,
+    run_id: &str,
+    preflight_promotion: &PromotionRecord,
+) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
+    if !options.resume {
+        return Err(DispatchCycleError::message(
+            "finished promoted recovery requires explicit dispatch --resume",
+        ));
+    }
+    let preflight_run = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    let existing_recovery = read_promotion_recovery_record(preflight_run.dir())?;
+    if let Some(recovery) = existing_recovery.as_ref() {
+        validate_promotion_recovery_record(
+            recovery,
+            &preflight_run,
+            item,
+            cycle_id,
+            canonical_repo,
+            preflight_promotion,
+        )?;
+        match recovery.phase {
+            PromotionRecoveryPhase::Verified if current.status == "closed" => {
+                return Ok(DispatchOneResult {
+                    decision: None,
+                    dispatches: 0,
+                });
+            }
+            PromotionRecoveryPhase::Failed
+                if current.status == "open" && current.assignee.is_none() =>
+            {
+                return Ok(DispatchOneResult {
+                    decision: None,
+                    dispatches: 0,
+                });
+            }
+            PromotionRecoveryPhase::Intent => {}
+            PromotionRecoveryPhase::Verified
+            | PromotionRecoveryPhase::Verifying
+            | PromotionRecoveryPhase::Failed => {
+                return Err(DispatchCycleError::message(
+                    "promotion recovery phase does not match the Bead state",
+                ));
+            }
+        }
+    }
+    if current.status != "open" || current.assignee.is_some() {
+        return Err(DispatchCycleError::message(
+            "finished promoted recovery requires the released Bead to be open and unassigned",
+        ));
+    }
+    let (_, preflight_extracted, _) = validate_finished_promotion_recovery_authority(
+        cfg,
+        commits,
+        item,
+        selected_roster,
+        cycle_id,
+        repo_path,
+        canonical_repo,
+        current,
+        &preflight_run,
+        preflight_promotion,
+    )?;
+    let mut recovery = existing_recovery.unwrap_or_else(|| PromotionRecoveryRecord {
+        schema: PROMOTION_RECOVERY_SCHEMA.to_string(),
+        run_id: run_id.to_string(),
+        cycle_id: cycle_id.to_string(),
+        repo: canonical_repo.to_string(),
+        bead: item.issue_id.clone(),
+        authorization_sha256: item.authorization_sha256.clone(),
+        promotion: preflight_promotion.clone(),
+        mechanical_verifier: preflight_extracted.verify_cmd.clone(),
+        qualitative_verifier: qualitative_verifier_label(cfg),
+        owner_pid: std::process::id(),
+        started_at: Utc::now().to_rfc3339(),
+        phase: PromotionRecoveryPhase::Intent,
+        outcome: None,
+    });
+    recovery.owner_pid = std::process::id();
+    recovery.started_at = Utc::now().to_rfc3339();
+    recovery.phase = PromotionRecoveryPhase::Intent;
+    recovery.outcome = None;
+    write_promotion_recovery_record(preflight_run.dir(), &recovery)?;
+    drop(preflight_run);
+
+    let _recovery_lease = quarantine::RepoLease::acquire(state_dir, canonical_repo, run_id)
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "finished promotion recovery repository lease unavailable: {error}"
+            ))
+        })?;
+
+    let before_claim = bd.show(repo_path, &item.issue_id).map_err(|error| {
+        DispatchCycleError::message(format!(
+            "finished promotion recovery Bead re-fetch: {error}"
+        ))
+    })?;
+    if before_claim.status != "open" || before_claim.assignee.is_some() {
+        return Err(DispatchCycleError::message(
+            "released Bead changed before finished promotion recovery could claim it",
+        ));
+    }
+    let before_claim_run = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    let before_claim_promotion = read_promotion_record(before_claim_run.dir())?
+        .ok_or_else(|| DispatchCycleError::message("finished promoted run lost its receipt"))?;
+    if before_claim_promotion != *preflight_promotion {
+        return Err(DispatchCycleError::message(
+            "promotion receipt changed before recovery claim",
+        ));
+    }
+    let before_claim_recovery = read_promotion_recovery_record(before_claim_run.dir())?
+        .ok_or_else(|| DispatchCycleError::message("promotion recovery intent disappeared"))?;
+    validate_promotion_recovery_record(
+        &before_claim_recovery,
+        &before_claim_run,
+        item,
+        cycle_id,
+        canonical_repo,
+        &before_claim_promotion,
+    )?;
+    if before_claim_recovery.phase != PromotionRecoveryPhase::Intent {
+        return Err(DispatchCycleError::message(
+            "promotion recovery intent changed before claim",
+        ));
+    }
+    validate_finished_promotion_recovery_authority(
+        cfg,
+        commits,
+        item,
+        selected_roster,
+        cycle_id,
+        repo_path,
+        canonical_repo,
+        &before_claim,
+        &before_claim_run,
+        &before_claim_promotion,
+    )?;
+
+    let claimed = bd
+        .claim(repo_path, &item.issue_id, "conductor")
+        .map_err(|error| {
+            DispatchCycleError::message(format!(
+                "atomically reclaim released promoted Bead: {error}"
+            ))
+        })?;
+    if claimed.status != "in_progress" || claimed.assignee.as_deref() != Some("conductor") {
+        return Err(DispatchCycleError::message(
+            "atomic promotion recovery claim did not return a Conductor-owned Bead",
+        ));
+    }
+
+    let post_claim = (|| {
+        let current = bd.show(repo_path, &item.issue_id).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "promotion recovery post-claim Bead re-fetch: {error}"
+            ))
+        })?;
+        if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
+            return Err(DispatchCycleError::message(
+                "promotion recovery claim changed immediately after reclaim",
+            ));
+        }
+        let run_artifacts = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+        let promotion = read_promotion_record(run_artifacts.dir())?.ok_or_else(|| {
+            DispatchCycleError::message("finished promoted run lost its receipt after claim")
+        })?;
+        if promotion != *preflight_promotion {
+            return Err(DispatchCycleError::message(
+                "promotion receipt changed after recovery claim",
+            ));
+        }
+        let recovery = read_promotion_recovery_record(run_artifacts.dir())?.ok_or_else(|| {
+            DispatchCycleError::message("promotion recovery intent disappeared after claim")
+        })?;
+        validate_promotion_recovery_record(
+            &recovery,
+            &run_artifacts,
+            item,
+            cycle_id,
+            canonical_repo,
+            &promotion,
+        )?;
+        if recovery.phase != PromotionRecoveryPhase::Intent {
+            return Err(DispatchCycleError::message(
+                "promotion recovery intent changed after claim",
+            ));
+        }
+        let (work, extracted, active_roster) = validate_finished_promotion_recovery_authority(
+            cfg,
+            commits,
+            item,
+            selected_roster,
+            cycle_id,
+            repo_path,
+            canonical_repo,
+            &current,
+            &run_artifacts,
+            &promotion,
+        )?;
+        Ok((
+            current,
+            run_artifacts,
+            promotion,
+            recovery,
+            work,
+            extracted,
+            active_roster,
+        ))
+    })();
+    let (mut current, run_artifacts, promotion, mut recovery, work, extracted, active_roster) =
+        match post_claim {
+            Ok(validated) => validated,
+            Err(error) => {
+                let latest = bd.show(repo_path, &item.issue_id).map_err(|show_error| {
+                    DispatchCycleError::recovery_required(format!(
+                        "{error}; failed to determine whether the recovery claim is still ours: {show_error}"
+                    ))
+                })?;
+                if latest.status == "in_progress" && latest.assignee.as_deref() == Some("conductor")
+                {
+                    return finish_promotion_recovery_failure(
+                        bd,
+                        repo_path,
+                        &item.issue_id,
+                        before_claim_run.dir(),
+                        &mut recovery,
+                        VerifyDecision::HardError,
+                        error.to_string(),
+                        0,
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+    recovery.phase = PromotionRecoveryPhase::Verifying;
+    recovery.outcome = None;
+    write_promotion_recovery_record(run_artifacts.dir(), &recovery).map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "promotion recovery claim is held but verifying intent could not be persisted: {error}"
+        ))
+    })?;
+
+    if let Err(error) = patch_live(
+        live,
+        report_path,
+        cycle_start,
+        format!("recover verify {}/{}", item.repo, item.issue_id),
+        progress,
+    ) {
+        return finish_promotion_recovery_failure(
+            bd,
+            repo_path,
+            &item.issue_id,
+            run_artifacts.dir(),
+            &mut recovery,
+            VerifyDecision::HardError,
+            format!("promotion recovery report update failed: {error}"),
+            0,
+        );
+    }
+
+    let verify_request = VerifyRequest {
+        repo: repo_path.to_path_buf(),
+        state_dir: state_dir.to_path_buf(),
+        cycle_id: cycle_id.to_string(),
+        issue: current.clone(),
+        verify_cmd: extracted.verify_cmd.clone(),
+        verify: cfg.verify.clone(),
+        worker_status: dispatch::DispatchStatus::Success,
+        worker_commit: Some(promotion.worker_commit.clone()),
+        before_head: work.before_head,
+        preserve_claim_on_failure: true,
+    };
+    let mechanical = match verify::run_mechanical(bd, exec, commits, &verify_request) {
+        Ok(mechanical) => mechanical,
+        Err(error) => {
+            return finish_promotion_recovery_failure(
+                bd,
+                repo_path,
+                &item.issue_id,
+                run_artifacts.dir(),
+                &mut recovery,
+                VerifyDecision::HardError,
+                format!("promotion recovery mechanical verifier failed to run: {error}"),
+                0,
+            );
+        }
+    };
+    match mechanical {
+        verify::MechanicalOutcome::Passed { worker_commit }
+            if worker_commit == promotion.worker_commit => {}
+        verify::MechanicalOutcome::Passed { .. } => {
+            return finish_promotion_recovery_failure(
+                bd,
+                repo_path,
+                &item.issue_id,
+                run_artifacts.dir(),
+                &mut recovery,
+                VerifyDecision::HardError,
+                "promotion recovery verifier returned a different commit",
+                0,
+            );
+        }
+        verify::MechanicalOutcome::Failed(outcome) => {
+            return finish_promotion_recovery_failure(
+                bd,
+                repo_path,
+                &item.issue_id,
+                run_artifacts.dir(),
+                &mut recovery,
+                outcome.decision,
+                outcome.summary,
+                outcome.review_dispatches,
+            );
+        }
+    }
+
+    let before_review = (|| {
+        current = bd.show(repo_path, &item.issue_id).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "promotion recovery pre-review claim re-fetch: {error}"
+            ))
+        })?;
+        if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
+            return Err(DispatchCycleError::message(
+                "promotion recovery claim changed after mechanical verification",
+            ));
+        }
+        let reloaded = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+        let reloaded_promotion = read_promotion_record(reloaded.dir())?.ok_or_else(|| {
+            DispatchCycleError::message("promotion receipt disappeared after mechanical verify")
+        })?;
+        if reloaded_promotion != promotion {
+            return Err(DispatchCycleError::message(
+                "promotion receipt changed after mechanical verification",
+            ));
+        }
+        validate_finished_promotion_recovery_authority(
+            cfg,
+            commits,
+            item,
+            selected_roster,
+            cycle_id,
+            repo_path,
+            canonical_repo,
+            &current,
+            &reloaded,
+            &reloaded_promotion,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = before_review {
+        return finish_promotion_recovery_failure(
+            bd,
+            repo_path,
+            &item.issue_id,
+            run_artifacts.dir(),
+            &mut recovery,
+            VerifyDecision::HardError,
+            error.to_string(),
+            0,
+        );
+    }
+
+    let review = ReviewSettings {
+        config: cfg.review.clone(),
+        roster: cfg.roster.clone(),
+        dispatched_model: active_roster,
+        item_tier_floor: extracted.routing.tier_floor,
+    };
+    let deferred_close = DeferredCloseBd { inner: bd };
+    let outcome = match verify::run_review_stage(
+        &deferred_close,
+        exec,
+        &verify_request,
+        &review,
+        options.item_timeout,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return finish_promotion_recovery_failure(
+                bd,
+                repo_path,
+                &item.issue_id,
+                run_artifacts.dir(),
+                &mut recovery,
+                VerifyDecision::HardError,
+                format!("promotion recovery qualitative review failed to run: {error}"),
+                0,
+            );
+        }
+    };
+    if outcome.decision != VerifyDecision::Passed {
+        return finish_promotion_recovery_failure(
+            bd,
+            repo_path,
+            &item.issue_id,
+            run_artifacts.dir(),
+            &mut recovery,
+            outcome.decision,
+            outcome.summary,
+            outcome.review_dispatches,
+        );
+    }
+
+    let after_review = (|| {
+        let current = bd.show(repo_path, &item.issue_id).map_err(|error| {
+            DispatchCycleError::message(format!(
+                "promotion recovery pre-close claim re-fetch: {error}"
+            ))
+        })?;
+        if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
+            return Err(DispatchCycleError::message(
+                "promotion recovery claim changed during qualitative review",
+            ));
+        }
+        let reloaded = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+        let reloaded_promotion = read_promotion_record(reloaded.dir())?.ok_or_else(|| {
+            DispatchCycleError::message("promotion receipt disappeared during qualitative review")
+        })?;
+        if reloaded_promotion != promotion {
+            return Err(DispatchCycleError::message(
+                "promotion receipt changed during qualitative review",
+            ));
+        }
+        validate_finished_promotion_recovery_authority(
+            cfg,
+            commits,
+            item,
+            selected_roster,
+            cycle_id,
+            repo_path,
+            canonical_repo,
+            &current,
+            &reloaded,
+            &reloaded_promotion,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = after_review {
+        return finish_promotion_recovery_failure(
+            bd,
+            repo_path,
+            &item.issue_id,
+            run_artifacts.dir(),
+            &mut recovery,
+            VerifyDecision::HardError,
+            error.to_string(),
+            outcome.review_dispatches,
+        );
+    }
+
+    bd.close(repo_path, &item.issue_id, &outcome.summary)
+        .map_err(|error| {
+            DispatchCycleError::recovery_required(format!(
+                "all promotion recovery gates passed but Bead close failed: {error}"
+            ))
+        })?;
+    recovery.phase = PromotionRecoveryPhase::Verified;
+    recovery.outcome = Some(outcome.summary);
+    write_promotion_recovery_record(run_artifacts.dir(), &recovery).map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "promoted recovery closed the Bead but could not persist terminal evidence: {error}"
+        ))
+    })?;
+    Ok(DispatchOneResult {
+        decision: Some(VerifyDecision::Passed),
+        dispatches: outcome.review_dispatches,
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2176,13 +3148,36 @@ fn resume_promoted_work<
             "promoted worker recovery requires explicit dispatch --resume",
         ));
     }
+    let preflight_run = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
+    if preflight_run.manifest().lifecycle == crate::run::RunLifecycle::Finished {
+        drop(preflight_run);
+        return resume_finished_promoted_work(
+            cfg,
+            bd,
+            exec,
+            commits,
+            state_dir,
+            cycle_id,
+            options,
+            live,
+            report_path,
+            cycle_start,
+            item,
+            progress,
+            selected_roster,
+            repo_path,
+            canonical_repo,
+            current,
+            run_id,
+            preflight_promotion,
+        );
+    }
     if current.status != "in_progress" || current.assignee.as_deref() != Some("conductor") {
         return Err(DispatchCycleError::message(
             "promoted worker claim is no longer held by conductor",
         ));
     }
 
-    let preflight_run = RunHandle::open(state_dir, run_id).map_err(run_artifact_error)?;
     validate_promoted_work(
         &preflight_run,
         item,
@@ -7033,6 +8028,527 @@ print("worker committed without its authenticated receipt")
             PromotionInterruption::HeadConfirmationProbeFails,
             "promoted",
             true,
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exact released-promotion recovery gate keeps terminal evidence and no-worker assertions together"
+    )]
+    fn resume_promoted_failed_verifier_reclaims_and_reverifies_without_worker() {
+        struct FailedThenPassingVerifierExec {
+            worker_spawns: RefCell<usize>,
+            verify_spawns: RefCell<usize>,
+            review_spawns: RefCell<usize>,
+            fail_all_verifiers: bool,
+        }
+
+        impl FailedThenPassingVerifierExec {
+            fn new(fail_all_verifiers: bool) -> Self {
+                Self {
+                    worker_spawns: RefCell::new(0),
+                    verify_spawns: RefCell::new(0),
+                    review_spawns: RefCell::new(0),
+                    fail_all_verifiers,
+                }
+            }
+        }
+
+        impl Exec for FailedThenPassingVerifierExec {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                if request.argv.iter().any(|arg| arg == "senior-reviewer") {
+                    *self.review_spawns.borrow_mut() += 1;
+                    std::fs::write(&request.stdout_path, br#"{"verdict":"ship","findings":[]}"#)
+                        .expect("write recovery review stdout");
+                    std::fs::write(&request.stderr_path, b"")
+                        .expect("write recovery review stderr");
+                    return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(0))));
+                }
+                if request.argv.first().map(String::as_str) == Some("pi") {
+                    let worker = *self.worker_spawns.borrow();
+                    *self.worker_spawns.borrow_mut() += 1;
+                    assert_eq!(worker, 0, "resume launched a replacement worker");
+                    std::fs::write(&request.stderr_path, b"")
+                        .expect("write recovery worker stderr");
+                    std::fs::write(request.cwd.join("worker.txt"), b"promoted\n")
+                        .expect("write recovery worker file");
+                    run_as_worker(request, &["add", "worker.txt"]);
+                    run_as_worker(
+                        request,
+                        &["commit", "-m", "worker: promoted verifier recovery fixture"],
+                    );
+                    write_worker_stdout(request, "worker ran");
+                    return Ok(Box::new(FakeChild::delayed_success()));
+                }
+                if request.argv.first().map(String::as_str) == Some("sh") {
+                    let verify = *self.verify_spawns.borrow();
+                    *self.verify_spawns.borrow_mut() += 1;
+                    if verify == 0 || self.fail_all_verifiers {
+                        std::fs::write(&request.stdout_path, b"")
+                            .expect("write initial verifier stdout");
+                        std::fs::write(&request.stderr_path, b"simulated environment failure\n")
+                            .expect("write initial verifier stderr");
+                        return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(1))));
+                    }
+                    let output = Command::new(&request.argv[0])
+                        .args(&request.argv[1..])
+                        .current_dir(&request.cwd)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("spawn recovery verifier shell");
+                    std::fs::write(&request.stdout_path, &output.stdout)
+                        .expect("write recovery verifier stdout");
+                    std::fs::write(&request.stderr_path, &output.stderr)
+                        .expect("write recovery verifier stderr");
+                    return Ok(Box::new(FakeChild::immediate(ProcessStatus::code(
+                        output.status.code().unwrap_or(1),
+                    ))));
+                }
+                panic!("unexpected recovery spawn argv: {:?}", request.argv)
+            }
+        }
+
+        struct ReentrantPromotedRecoveryExec<'a> {
+            fixture: &'a ResumeFixture,
+            winner: &'a FailedThenPassingVerifierExec,
+            loser: PendingReviewExec,
+            losing_result:
+                RefCell<Option<std::result::Result<DispatchCycleResult, DispatchCycleError>>>,
+        }
+
+        impl Exec for ReentrantPromotedRecoveryExec<'_> {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                if request.argv.first().map(String::as_str) == Some("sh")
+                    && self.losing_result.borrow().is_none()
+                {
+                    let result = self.fixture.dispatch(
+                        &self.loser,
+                        &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+                    );
+                    *self.losing_result.borrow_mut() = Some(result);
+                }
+                self.winner.spawn(request)
+            }
+        }
+
+        let prepare_terminal_failure = |label: &str| {
+            let fixture = ResumeFixture::new(label);
+            let exec = FailedThenPassingVerifierExec::new(false);
+            let initial = fixture
+                .dispatch(
+                    &exec,
+                    &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+                )
+                .expect("prepare terminal promoted verifier failure");
+            assert_eq!(initial.failed, 1);
+            let run_dir = fixture.pending_run_dir();
+            let run_id = run_dir
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("prepared run id");
+            let mut run =
+                RunHandle::open(&fixture.state, run_id).expect("open prepared promoted run");
+            run.finish("failed")
+                .expect("finish prepared verifier failure");
+            fixture
+                .bd
+                .release(&fixture.repo, "sandbox-1")
+                .expect("release prepared verifier failure");
+            set_pending_review_owner(
+                &fixture.state,
+                spawn_dead_pid(),
+                Utc::now() - ChronoDuration::seconds(120),
+            );
+            (fixture, exec, run_dir)
+        };
+
+        let fixture = ResumeFixture::new("promoted-failed-verifier-recovery");
+        let exec = FailedThenPassingVerifierExec::new(false);
+        let initial = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("initial promoted verifier failure is isolated to the item");
+        assert_eq!(initial.verified, 0);
+        assert_eq!(initial.failed, 1);
+        assert_eq!(*exec.worker_spawns.borrow(), 1);
+        assert_eq!(*exec.verify_spawns.borrow(), 1);
+        assert_eq!(*exec.review_spawns.borrow(), 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+
+        let run_dir = fixture.pending_run_dir();
+        let run_id = run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("promoted run id");
+        let receipt =
+            std::fs::read(run_dir.join("promotion.json")).expect("read exact promoted receipt");
+        let promotion: PromotionRecord =
+            serde_json::from_slice(&receipt).expect("parse exact promoted receipt");
+        assert_eq!(promotion.phase, PromotionPhase::Promoted);
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            promotion.worker_commit
+        );
+
+        let mut failed_run =
+            RunHandle::open(&fixture.state, run_id).expect("open failed promoted run");
+        failed_run
+            .finish("failed")
+            .expect("simulate the historical terminal verifier failure");
+        fixture
+            .bd
+            .release(&fixture.repo, "sandbox-1")
+            .expect("simulate Conductor's historical claim release");
+        set_pending_review_owner(
+            &fixture.state,
+            spawn_dead_pid(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+
+        let terminal = RunHandle::open(&fixture.state, run_id)
+            .expect("terminal promoted verifier failure remains valid");
+        assert_eq!(
+            terminal.manifest().lifecycle,
+            crate::run::RunLifecycle::Finished
+        );
+        assert_eq!(
+            terminal.work().map(|work| work.stage),
+            Some(WorkStage::Completed)
+        );
+        assert_eq!(terminal.manifest().outcome.as_deref(), Some("failed"));
+        drop(terminal);
+
+        let concurrent = ReentrantPromotedRecoveryExec {
+            fixture: &fixture,
+            winner: &exec,
+            loser: PendingReviewExec::ship_immediately(),
+            losing_result: RefCell::new(None),
+        };
+        let recovered = fixture
+            .dispatch(
+                &concurrent,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("explicit resume reclaims and re-verifies the promoted commit");
+
+        assert_eq!(recovered.verified, 1);
+        assert_eq!(recovered.failed, 0);
+        assert_eq!(
+            *exec.worker_spawns.borrow(),
+            1,
+            "resume must not reimplement"
+        );
+        assert_eq!(*exec.verify_spawns.borrow(), 2, "resume runs one verifier");
+        assert_eq!(
+            *exec.review_spawns.borrow(),
+            1,
+            "resume runs configured review"
+        );
+        assert_eq!(
+            fixture.bd.claim_count(),
+            2,
+            "original claim plus recovery claim"
+        );
+        assert_eq!(
+            fixture.bd.release_count(),
+            1,
+            "successful recovery does not release"
+        );
+        assert_eq!(
+            fixture.bd.close_count(),
+            1,
+            "all recovery gates close exactly once"
+        );
+        let losing = concurrent
+            .losing_result
+            .borrow()
+            .clone()
+            .expect("concurrent resume attempted while the verifier was running");
+        assert!(
+            losing
+                .expect_err("the concurrent resume must lose the dispatch lease")
+                .to_string()
+                .contains("dispatch lease")
+        );
+        assert_eq!(concurrent.loser.worker_spawns(), 0);
+        assert_eq!(concurrent.loser.review_spawns(), 0);
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            promotion.worker_commit,
+            "resume must retain the exact promoted commit"
+        );
+        assert!(
+            GitCommitProbe
+                .is_clean(&fixture.repo)
+                .expect("clean recovered repo")
+        );
+        assert_eq!(
+            std::fs::read(run_dir.join("promotion.json")).expect("receipt remains readable"),
+            receipt,
+            "recovery must not change the exact promotion receipt"
+        );
+        let recovery: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run_dir.join("promotion-recovery.json"))
+                .expect("durable promotion recovery evidence"),
+        )
+        .expect("parse promotion recovery evidence");
+        assert_eq!(recovery["phase"], "verified");
+
+        let repeated = fixture
+            .dispatch(
+                &exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("repeating successful recovery is idempotent");
+        assert_eq!(repeated.dispatched, 0);
+        assert_eq!(repeated.verified, 0);
+        assert_eq!(*exec.worker_spawns.borrow(), 1);
+        assert_eq!(*exec.verify_spawns.borrow(), 2);
+        assert_eq!(*exec.review_spawns.borrow(), 1);
+        assert_eq!(fixture.bd.claim_count(), 2);
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(fixture.bd.close_count(), 1);
+
+        let failed_fixture = ResumeFixture::new("promoted-recovery-verifier-fails-again");
+        let failed_exec = FailedThenPassingVerifierExec::new(true);
+        let initial_failure = failed_fixture
+            .dispatch(
+                &failed_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            )
+            .expect("initial repeated-failure fixture is isolated to the item");
+        assert_eq!(initial_failure.failed, 1);
+        let failed_run_dir = failed_fixture.pending_run_dir();
+        let failed_run_id = failed_run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("repeated-failure run id");
+        let failed_receipt = std::fs::read(failed_run_dir.join("promotion.json"))
+            .expect("read repeated-failure receipt");
+        let mut failed_run = RunHandle::open(&failed_fixture.state, failed_run_id)
+            .expect("open repeated-failure run");
+        failed_run
+            .finish("failed")
+            .expect("finish historical repeated-failure run");
+        failed_fixture
+            .bd
+            .release(&failed_fixture.repo, "sandbox-1")
+            .expect("release historical repeated-failure claim");
+        set_pending_review_owner(
+            &failed_fixture.state,
+            spawn_dead_pid(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+
+        let failed_recovery = failed_fixture
+            .dispatch(
+                &failed_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("a repeated verifier failure is a durable terminal recovery outcome");
+        assert_eq!(failed_recovery.verified, 0);
+        assert_eq!(failed_recovery.failed, 1);
+        assert_eq!(*failed_exec.worker_spawns.borrow(), 1);
+        assert_eq!(*failed_exec.verify_spawns.borrow(), 2);
+        assert_eq!(*failed_exec.review_spawns.borrow(), 0);
+        assert_eq!(failed_fixture.bd.claim_count(), 2);
+        assert_eq!(
+            failed_fixture.bd.release_count(),
+            2,
+            "historical release plus exactly one recovery release"
+        );
+        assert_eq!(failed_fixture.bd.close_count(), 0);
+        assert_eq!(
+            std::fs::read(failed_run_dir.join("promotion.json"))
+                .expect("failed recovery receipt remains"),
+            failed_receipt
+        );
+        let failed_recovery_evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(failed_run_dir.join("promotion-recovery.json"))
+                .expect("failed recovery evidence"),
+        )
+        .expect("parse failed recovery evidence");
+        assert_eq!(failed_recovery_evidence["phase"], "failed");
+        assert!(
+            failed_recovery_evidence["outcome"]
+                .as_str()
+                .is_some_and(|outcome| outcome.contains("verify_cmd failed"))
+        );
+
+        let repeated_failure = failed_fixture
+            .dispatch(
+                &failed_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("repeating a recorded recovery failure is idempotent");
+        assert_eq!(repeated_failure.dispatched, 0);
+        assert_eq!(*failed_exec.worker_spawns.borrow(), 1);
+        assert_eq!(*failed_exec.verify_spawns.borrow(), 2);
+        assert_eq!(failed_fixture.bd.claim_count(), 2);
+        assert_eq!(failed_fixture.bd.release_count(), 2);
+        assert_eq!(failed_fixture.bd.close_count(), 0);
+
+        let assert_preclaim_refusal =
+            |fixture: &ResumeFixture, exec: &FailedThenPassingVerifierExec| {
+                let refused = fixture
+                    .dispatch(
+                        exec,
+                        &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+                    )
+                    .expect("invalid finished recovery is isolated to the item");
+                assert_eq!(refused.verified, 0);
+                assert_eq!(refused.failed, 1);
+                assert_eq!(*exec.worker_spawns.borrow(), 1);
+                assert_eq!(*exec.verify_spawns.borrow(), 1);
+                assert_eq!(*exec.review_spawns.borrow(), 0);
+                assert_eq!(
+                    fixture.bd.claim_count(),
+                    1,
+                    "recovery must not steal a claim"
+                );
+                assert_eq!(fixture.bd.release_count(), 1);
+                assert_eq!(fixture.bd.close_count(), 0);
+                assert!(
+                    !fixture
+                        .pending_run_dir()
+                        .join("promotion-recovery.json")
+                        .exists()
+                );
+            };
+
+        let (claimed_fixture, claimed_exec, _) =
+            prepare_terminal_failure("promoted-recovery-already-claimed");
+        {
+            let mut issues = claimed_fixture.bd.issues.borrow_mut();
+            let issue = issues.get_mut("sandbox-1").expect("claimed fixture issue");
+            issue.status = "in_progress".to_string();
+            issue.assignee = Some("another-owner".to_string());
+        }
+        assert_preclaim_refusal(&claimed_fixture, &claimed_exec);
+
+        let (head_fixture, head_exec, _) =
+            prepare_terminal_failure("promoted-recovery-head-changed");
+        std::fs::write(head_fixture.repo.join("foreign.txt"), b"foreign\n")
+            .expect("write foreign recovery commit");
+        run(&head_fixture.repo, "git", &["add", "foreign.txt"]);
+        run(
+            &head_fixture.repo,
+            "git",
+            &["commit", "-m", "foreign: move promoted recovery head"],
+        );
+        assert_preclaim_refusal(&head_fixture, &head_exec);
+
+        let (dirty_fixture, dirty_exec, _) =
+            prepare_terminal_failure("promoted-recovery-dirty-tree");
+        std::fs::write(dirty_fixture.repo.join("dirty.txt"), b"dirty\n")
+            .expect("write recovery dirt");
+        assert_preclaim_refusal(&dirty_fixture, &dirty_exec);
+
+        let (authorization_fixture, authorization_exec, _) =
+            prepare_terminal_failure("promoted-recovery-authorization-changed");
+        authorization_fixture
+            .bd
+            .set_title("changed after exact approval");
+        assert_preclaim_refusal(&authorization_fixture, &authorization_exec);
+
+        let (owner_fixture, owner_exec, _) =
+            prepare_terminal_failure("promoted-recovery-owner-ambiguous");
+        set_pending_review_owner(
+            &owner_fixture.state,
+            std::process::id(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+        assert_preclaim_refusal(&owner_fixture, &owner_exec);
+
+        let (receipt_fixture, receipt_exec, receipt_run_dir) =
+            prepare_terminal_failure("promoted-recovery-receipt-changed");
+        let receipt_path = receipt_run_dir.join("promotion.json");
+        let mut changed_receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&receipt_path).expect("read receipt before tamper"),
+        )
+        .expect("parse receipt before tamper");
+        changed_receipt["attempt_id"] = serde_json::json!("changed-attempt");
+        let mut changed_receipt_bytes =
+            serde_json::to_vec_pretty(&changed_receipt).expect("serialize changed receipt");
+        changed_receipt_bytes.push(b'\n');
+        std::fs::write(&receipt_path, &changed_receipt_bytes).expect("write changed receipt");
+        assert_preclaim_refusal(&receipt_fixture, &receipt_exec);
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("changed receipt remains evidence"),
+            changed_receipt_bytes
+        );
+
+        let (history_fixture, history_exec, history_run_dir) =
+            prepare_terminal_failure("promoted-recovery-history-changed");
+        let events_path = history_run_dir.join("events.jsonl");
+        let mut event_values = std::fs::read_to_string(&events_path)
+            .expect("read failure history")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("parse failure event")
+            })
+            .collect::<Vec<_>>();
+        let verify_event = event_values
+            .iter_mut()
+            .find(|event| event["kind"] == "verify_finished")
+            .expect("failed verifier event");
+        verify_event["outcome"] = serde_json::json!("passed");
+        let changed_events = event_values
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("serialize changed event"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&events_path, &changed_events).expect("write changed failure history");
+        assert_preclaim_refusal(&history_fixture, &history_exec);
+        assert_eq!(
+            std::fs::read_to_string(&events_path).expect("failure history remains evidence"),
+            changed_events
+        );
+
+        let (post_claim_fixture, post_claim_exec, post_claim_run_dir) =
+            prepare_terminal_failure("promoted-recovery-post-claim-authorization");
+        *post_claim_fixture.bd.claim_title.borrow_mut() =
+            Some("changed during atomic recovery claim".to_string());
+        let post_claim_refusal = post_claim_fixture
+            .dispatch(
+                &post_claim_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("post-claim authorization change is durably rejected");
+        assert_eq!(post_claim_refusal.verified, 0);
+        assert_eq!(post_claim_refusal.failed, 1);
+        assert_eq!(*post_claim_exec.worker_spawns.borrow(), 1);
+        assert_eq!(*post_claim_exec.verify_spawns.borrow(), 1);
+        assert_eq!(*post_claim_exec.review_spawns.borrow(), 0);
+        assert_eq!(post_claim_fixture.bd.claim_count(), 2);
+        assert_eq!(
+            post_claim_fixture.bd.release_count(),
+            2,
+            "the recovery claim is rolled back exactly once"
+        );
+        assert_eq!(post_claim_fixture.bd.close_count(), 0);
+        let post_claim_evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(post_claim_run_dir.join("promotion-recovery.json"))
+                .expect("post-claim refusal evidence"),
+        )
+        .expect("parse post-claim refusal evidence");
+        assert_eq!(post_claim_evidence["phase"], "failed");
+        assert!(
+            post_claim_evidence["outcome"]
+                .as_str()
+                .is_some_and(|outcome| outcome.contains("authorization"))
         );
     }
 
