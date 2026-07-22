@@ -447,6 +447,115 @@ where
     })
 }
 
+/// Captures the exact tree delta of a clean, single-commit isolated checkout
+/// whose commit was observed but never authenticated. Unlike
+/// [`quarantine_dirty_attempt`], this never resets or otherwise mutates the
+/// checkout: its caller must first prove worker quiescence and may remove the
+/// checkout only after the returned hash-addressed artifact is durably pinned
+/// into the run journal.
+pub(crate) fn capture_unauthenticated_commit<C>(
+    repo: &Path,
+    commits: &C,
+    run_artifacts: &RunHandle,
+    before_head: &str,
+    artifact_label: &str,
+) -> Result<QuarantineCapture>
+where
+    C: CommitProbe + ?Sized,
+{
+    let retained_head = commits
+        .head(repo)
+        .map_err(|error| QuarantineError::CaptureFailed(format!("git head: {error}")))?
+        .ok_or_else(|| {
+            QuarantineError::CaptureFailed(
+                "retained attempt checkout has no committed HEAD".to_string(),
+            )
+        })?;
+    if retained_head == before_head {
+        return Err(QuarantineError::CaptureFailed(
+            "retained attempt checkout has no commit beyond before_head".to_string(),
+        ));
+    }
+    if !commits
+        .is_direct_child(repo, Some(before_head), &retained_head)
+        .map_err(|error| {
+            QuarantineError::CaptureFailed(format!("git direct-child check: {error}"))
+        })?
+    {
+        return Err(QuarantineError::CaptureFailed(format!(
+            "retained attempt HEAD {retained_head} is not the direct child of {before_head}"
+        )));
+    }
+    if !commits
+        .is_clean(repo)
+        .map_err(|error| QuarantineError::CaptureFailed(format!("git status: {error}")))?
+    {
+        return Err(QuarantineError::CaptureFailed(
+            "retained committed attempt checkout is dirty".to_string(),
+        ));
+    }
+
+    let full_changed_paths = git_bytes(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            before_head,
+            &retained_head,
+            "--",
+        ],
+    )
+    .and_then(|raw| split_nul_paths(&raw))
+    .map_err(QuarantineError::CaptureFailed)?;
+    if full_changed_paths.is_empty() {
+        return Err(QuarantineError::CaptureFailed(
+            "retained commit changes no paths".to_string(),
+        ));
+    }
+    let patch = git_bytes(
+        repo,
+        &["diff", "--binary", before_head, &retained_head, "--"],
+    )
+    .map_err(QuarantineError::CaptureFailed)?;
+    if patch.is_empty() {
+        return Err(QuarantineError::CaptureFailed(
+            "retained commit produced no quarantine patch".to_string(),
+        ));
+    }
+    let artifact = write_patch_artifact(run_artifacts, artifact_label, &patch)
+        .map_err(QuarantineError::CaptureFailed)?;
+
+    let confirmed_head = commits.head(repo).map_err(|error| {
+        QuarantineError::CaptureFailed(format!("git head after capture: {error}"))
+    })?;
+    let confirmed_clean = commits.is_clean(repo).map_err(|error| {
+        QuarantineError::CaptureFailed(format!("git status after capture: {error}"))
+    })?;
+    let confirmed_patch = git_bytes(
+        repo,
+        &["diff", "--binary", before_head, &retained_head, "--"],
+    )
+    .map_err(QuarantineError::CaptureFailed)?;
+    if confirmed_head.as_deref() != Some(retained_head.as_str())
+        || !confirmed_clean
+        || patch_hash(&confirmed_patch) != patch_hash(&patch)
+    {
+        return Err(QuarantineError::CaptureFailed(
+            "retained attempt changed while its quarantine evidence was captured".to_string(),
+        ));
+    }
+
+    let truncated = full_changed_paths.len() > MAX_RECORDED_PATHS;
+    let mut changed_paths = full_changed_paths;
+    changed_paths.truncate(MAX_RECORDED_PATHS);
+    Ok(QuarantineCapture {
+        artifact: Some(artifact),
+        changed_paths,
+        truncated,
+    })
+}
+
 /// Holds an exclusive, repo-scoped advisory lease for the duration of a
 /// capture/restore. A stable guard file in the repository's common Git
 /// directory (or under `<state_dir>/leases/` for synthetic identities) carries
@@ -1171,10 +1280,46 @@ fn write_patch_artifact(
     artifact_label: &str,
     patch: &[u8],
 ) -> std::result::Result<ArtifactRef, String> {
-    let tmp = stage_private_patch_file(artifact_label, patch)
-        .map_err(|error| format!("failed to stage quarantine patch: {error}"))?;
     let destination =
         PathBuf::from("artifacts").join(format!("{}.patch", sanitize(artifact_label)));
+    let existing = run_artifacts.dir().join(&destination);
+    let patch_sha256 = patch_hash(patch);
+    match std::fs::symlink_metadata(&existing) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(format!(
+                "existing quarantine artifact {} is not a real file",
+                existing.display()
+            ));
+        }
+        Ok(_) => {
+            let bytes = std::fs::read(&existing).map_err(|error| {
+                format!(
+                    "failed to read existing quarantine artifact {}: {error}",
+                    existing.display()
+                )
+            })?;
+            if patch_hash(&bytes) != patch_sha256 {
+                return Err(format!(
+                    "existing quarantine artifact {} does not match the retained state",
+                    existing.display()
+                ));
+            }
+            return Ok(ArtifactRef {
+                path: destination.to_string_lossy().replace('\\', "/"),
+                sha256: patch_sha256,
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to read existing quarantine artifact {}: {error}",
+                existing.display()
+            ));
+        }
+    }
+
+    let tmp = stage_private_patch_file(artifact_label, patch)
+        .map_err(|error| format!("failed to stage quarantine patch: {error}"))?;
     let result = run_artifacts
         .capture_artifact(&tmp, &destination)
         .map_err(|error| {

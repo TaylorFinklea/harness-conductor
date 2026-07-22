@@ -550,6 +550,8 @@ struct WorkerIsolationRecord {
 }
 
 const PROMOTION_SCHEMA: &str = "conductor/promotion@1";
+const UNAUTHENTICATED_QUARANTINE_OUTCOME: &str = "unauthenticated_commit_quarantined_recoverable";
+const UNAUTHENTICATED_QUARANTINE_EVENT_PREFIX: &str = "unauthenticated_commit_quarantined:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1337,6 +1339,47 @@ fn find_promoted_work_run<C: CommitProbe + ?Sized>(
     Ok(Some((run_id, promotion)))
 }
 
+fn find_unauthenticated_recovery_run(
+    state_dir: &Path,
+    cycle_id: &str,
+    canonical_repo: &str,
+    bead: &str,
+) -> std::result::Result<Option<String>, DispatchCycleError> {
+    let Some(candidate) =
+        crate::run::find_reclaimable_work_run(state_dir, cycle_id, canonical_repo, bead).map_err(
+            |error| {
+                DispatchCycleError::recovery_required(format!(
+                    "unauthenticated recovery run discovery failed: {}",
+                    error.into_message()
+                ))
+            },
+        )?
+    else {
+        return Ok(None);
+    };
+    let run_id = match candidate {
+        crate::run::ReclaimCandidate::Unfinished(run_id) => run_id,
+        crate::run::ReclaimCandidate::FinishedLatest(run_id) => {
+            let run = RunHandle::open(state_dir, &run_id).map_err(|error| {
+                DispatchCycleError::recovery_required(format!(
+                    "open terminal unauthenticated recovery run: {}",
+                    error.into_message()
+                ))
+            })?;
+            return Ok((run.manifest().outcome.as_deref()
+                == Some(UNAUTHENTICATED_QUARANTINE_OUTCOME))
+            .then_some(run_id));
+        }
+    };
+    let run = RunHandle::open(state_dir, &run_id).map_err(|error| {
+        DispatchCycleError::recovery_required(format!(
+            "open implementing unauthenticated recovery run: {}",
+            error.into_message()
+        ))
+    })?;
+    Ok(unauthenticated_attempt_evidence(&run)?.map(|_| run_id))
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1393,6 +1436,28 @@ fn dispatch_one<
             });
         }
     };
+    if let Some(run_id) =
+        find_unauthenticated_recovery_run(state_dir, cycle_id, &canonical_repo, &item.issue_id)?
+    {
+        if !options.resume {
+            return Err(DispatchCycleError::message(
+                "unauthenticated implementing recovery requires explicit dispatch --resume",
+            ));
+        }
+        return resume_unauthenticated_implementing_work(
+            cfg,
+            bd,
+            commits,
+            state_dir,
+            cycle_id,
+            item,
+            roster,
+            &repo_path,
+            &canonical_repo,
+            &current,
+            &run_id,
+        );
+    }
     if let Some((run_id, promotion)) = find_promoted_work_run(
         commits,
         state_dir,
@@ -2333,6 +2398,619 @@ fn validate_promoted_work(
         ));
     }
     Ok(work)
+}
+
+#[derive(Debug, Clone)]
+struct UnauthenticatedAttemptEvidence {
+    attempt_id: String,
+    retained_head: Option<String>,
+    artifact: Option<crate::run::ArtifactRef>,
+}
+
+fn unauthenticated_recovery_failure(message: impl Into<String>) -> DispatchCycleError {
+    DispatchCycleError::recovery_required(format!(
+        "unauthenticated implementing recovery required: {}",
+        message.into()
+    ))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "journal evidence is validated as one ordered recovery state machine"
+)]
+fn unauthenticated_attempt_evidence(
+    run_artifacts: &RunHandle,
+) -> std::result::Result<Option<UnauthenticatedAttemptEvidence>, DispatchCycleError> {
+    let events = crate::run::read_events(&run_artifacts.events_path()).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "read retained run journal: {}",
+            error.into_message()
+        ))
+    })?;
+    let unauthenticated = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.kind == EventKind::AttemptFinished
+                && event.outcome.as_deref().is_some_and(|outcome| {
+                    outcome.contains("unauthenticated_commit")
+                        && outcome.ends_with("unauthenticated commit requires recovery")
+                })
+        })
+        .collect::<Vec<_>>();
+    if unauthenticated.is_empty() {
+        return Ok(None);
+    }
+    if unauthenticated.len() != 1 {
+        return Err(unauthenticated_recovery_failure(
+            "retained run has ambiguous unauthenticated-attempt events",
+        ));
+    }
+    let (finished_index, finished) = unauthenticated[0];
+    let profile = finished.profile_id.as_deref().ok_or_else(|| {
+        unauthenticated_recovery_failure(
+            "unauthenticated attempt-finished event has no worker profile",
+        )
+    })?;
+    let started = events[..finished_index]
+        .iter()
+        .rfind(|event| {
+            event.kind == EventKind::AttemptStarted && event.profile_id.as_deref() == Some(profile)
+        })
+        .ok_or_else(|| {
+            unauthenticated_recovery_failure(
+                "unauthenticated attempt has no matching attempt-started event",
+            )
+        })?;
+    let attempt_id = started
+        .outcome
+        .as_deref()
+        .and_then(|outcome| outcome.strip_prefix("running:"))
+        .filter(|attempt_id| !attempt_id.is_empty())
+        .ok_or_else(|| {
+            unauthenticated_recovery_failure(
+                "unauthenticated attempt-started event has no exact attempt id",
+            )
+        })?
+        .to_string();
+    if events[finished_index + 1..].iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::AttemptStarted | EventKind::AttemptFinished | EventKind::VerifyFinished
+        )
+    }) {
+        return Err(unauthenticated_recovery_failure(
+            "retained unauthenticated attempt is not the run's final worker attempt",
+        ));
+    }
+
+    let captures = events
+        .iter()
+        .filter_map(|event| {
+            (event.kind == EventKind::CoverageGap)
+                .then_some(event)
+                .filter(|event| {
+                    event.outcome.as_deref().is_some_and(|outcome| {
+                        outcome.starts_with(UNAUTHENTICATED_QUARANTINE_EVENT_PREFIX)
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    if captures.len() > 1 {
+        return Err(unauthenticated_recovery_failure(
+            "retained run has duplicate unauthenticated quarantine events",
+        ));
+    }
+    let Some(capture) = captures.first() else {
+        return Ok(Some(UnauthenticatedAttemptEvidence {
+            attempt_id,
+            retained_head: None,
+            artifact: None,
+        }));
+    };
+    let encoded = capture
+        .outcome
+        .as_deref()
+        .and_then(|outcome| outcome.strip_prefix(UNAUTHENTICATED_QUARANTINE_EVENT_PREFIX))
+        .ok_or_else(|| unauthenticated_recovery_failure("malformed quarantine event outcome"))?;
+    let (captured_attempt, retained_head) = encoded.split_once(':').ok_or_else(|| {
+        unauthenticated_recovery_failure("quarantine event does not bind an attempt and HEAD")
+    })?;
+    if captured_attempt != attempt_id || !valid_recovery_commit_id(retained_head) {
+        return Err(unauthenticated_recovery_failure(
+            "quarantine event does not match the retained attempt identity",
+        ));
+    }
+    if capture.artifact_refs.len() != 1 {
+        return Err(unauthenticated_recovery_failure(
+            "quarantine event must pin exactly one hashed patch artifact",
+        ));
+    }
+    Ok(Some(UnauthenticatedAttemptEvidence {
+        attempt_id,
+        retained_head: Some(retained_head.to_string()),
+        artifact: capture.artifact_refs.first().cloned(),
+    }))
+}
+
+fn valid_recovery_commit_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn validate_unauthenticated_work(
+    run_artifacts: &RunHandle,
+    item: &PlannedItem,
+    cycle_id: &str,
+    canonical_repo: &str,
+    evidence: &UnauthenticatedAttemptEvidence,
+) -> std::result::Result<WorkState, DispatchCycleError> {
+    let work = run_artifacts
+        .work()
+        .cloned()
+        .ok_or_else(|| unauthenticated_recovery_failure("retained run has no work state"))?;
+    let finished = run_artifacts.manifest().lifecycle == crate::run::RunLifecycle::Finished;
+    let lifecycle_matches = if finished {
+        work.stage == WorkStage::Completed
+            && run_artifacts.manifest().outcome.as_deref()
+                == Some(UNAUTHENTICATED_QUARANTINE_OUTCOME)
+            && evidence.artifact.is_some()
+            && evidence.retained_head.is_some()
+    } else {
+        work.stage == WorkStage::Implementing && run_artifacts.manifest().outcome.is_none()
+    };
+    if !lifecycle_matches
+        || work.cycle_id != cycle_id
+        || work.authorization_sha256 != item.authorization_sha256
+        || run_artifacts.manifest().target.repo != canonical_repo
+        || run_artifacts.manifest().target.bead.as_deref() != Some(item.issue_id.as_str())
+        || work.worker_commit.is_some()
+        || work.mechanical.is_some()
+    {
+        return Err(unauthenticated_recovery_failure(
+            "retained run does not match the exact approved cycle item",
+        ));
+    }
+    Ok(work)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "filesystem containment and isolation-record validation stay one fail-closed gate"
+)]
+fn retained_unauthenticated_checkout(
+    run_dir: &Path,
+    canonical_repo: &Path,
+    state_dir: &Path,
+    attempt_id: &str,
+    capture_is_durable: bool,
+) -> std::result::Result<Option<PathBuf>, DispatchCycleError> {
+    let mut components = Path::new(attempt_id).components();
+    if attempt_id.is_empty()
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(unauthenticated_recovery_failure(
+            "retained attempt id is not one contained path component",
+        ));
+    }
+    let run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
+        unauthenticated_recovery_failure(format!("canonicalize retained run directory: {error}"))
+    })?;
+    let canonical_repo = std::fs::canonicalize(canonical_repo).map_err(|error| {
+        unauthenticated_recovery_failure(format!("canonicalize target repository: {error}"))
+    })?;
+    let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
+        unauthenticated_recovery_failure(format!("canonicalize state directory: {error}"))
+    })?;
+    let attempt_root = run_dir.join("attempt-checkouts");
+    let root_metadata = std::fs::symlink_metadata(&attempt_root).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "inspect retained attempt root {}: {error}",
+            attempt_root.display()
+        ))
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(unauthenticated_recovery_failure(
+            "retained attempt root is not a real directory",
+        ));
+    }
+    let attempt_root = std::fs::canonicalize(&attempt_root).map_err(|error| {
+        unauthenticated_recovery_failure(format!("canonicalize retained attempt root: {error}"))
+    })?;
+    let expected_path = attempt_root.join(attempt_id);
+    let mut retained_path = None;
+    for entry in std::fs::read_dir(&attempt_root).map_err(|error| {
+        unauthenticated_recovery_failure(format!("list retained attempt root: {error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            unauthenticated_recovery_failure(format!("read retained attempt entry: {error}"))
+        })?;
+        if entry.file_name() != std::ffi::OsStr::new(attempt_id) {
+            return Err(unauthenticated_recovery_failure(format!(
+                "unexpected retained attempt entry {}",
+                entry.path().display()
+            )));
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+            unauthenticated_recovery_failure(format!("inspect retained checkout: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(unauthenticated_recovery_failure(
+                "retained attempt checkout is not a real directory",
+            ));
+        }
+        let path = std::fs::canonicalize(entry.path()).map_err(|error| {
+            unauthenticated_recovery_failure(format!("canonicalize retained checkout: {error}"))
+        })?;
+        if path != expected_path || path.parent() != Some(attempt_root.as_path()) {
+            return Err(unauthenticated_recovery_failure(
+                "retained attempt checkout escaped its run-owned root",
+            ));
+        }
+        retained_path = Some(path);
+    }
+    if retained_path.is_none() && !capture_is_durable {
+        return Err(unauthenticated_recovery_failure(
+            "retained attempt checkout disappeared before quarantine evidence was durable",
+        ));
+    }
+
+    let record_path = run_dir
+        .join("worker-isolation")
+        .join(format!("{attempt_id}.json"));
+    let record_metadata = std::fs::symlink_metadata(&record_path).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "inspect retained worker-isolation record {}: {error}",
+            record_path.display()
+        ))
+    })?;
+    if record_metadata.file_type().is_symlink() || !record_metadata.is_file() {
+        return Err(unauthenticated_recovery_failure(
+            "retained worker-isolation record is not a real file",
+        ));
+    }
+    let record: WorkerIsolationRecord =
+        serde_json::from_slice(&std::fs::read(&record_path).map_err(|error| {
+            unauthenticated_recovery_failure(format!(
+                "read retained worker-isolation record: {error}"
+            ))
+        })?)
+        .map_err(|error| {
+            unauthenticated_recovery_failure(format!(
+                "parse retained worker-isolation record: {error}"
+            ))
+        })?;
+    let sandbox_profile = PathBuf::from(&record.sandbox_profile);
+    let sandbox_metadata = std::fs::symlink_metadata(&sandbox_profile).map_err(|error| {
+        unauthenticated_recovery_failure(format!("inspect retained sandbox profile: {error}"))
+    })?;
+    let sandbox_profile = std::fs::canonicalize(&sandbox_profile).map_err(|error| {
+        unauthenticated_recovery_failure(format!("canonicalize retained sandbox profile: {error}"))
+    })?;
+    let sandbox_contents = std::fs::read_to_string(&sandbox_profile).map_err(|error| {
+        unauthenticated_recovery_failure(format!("read retained sandbox profile: {error}"))
+    })?;
+    let expected_sandbox = format!(
+        "(version 1)\n(allow default)\n\
+         (deny file-link)\n\
+         (deny file-write* (subpath \"{}\"))\n\
+         (deny file-write* (subpath \"{}\"))\n\
+         (allow file-write* (subpath \"{}\"))\n",
+        sandbox_string(&canonical_repo),
+        sandbox_string(&state_dir),
+        sandbox_string(&expected_path),
+    );
+    if record.schema != WORKER_ISOLATION_SCHEMA
+        || Path::new(&record.canonical_repo) != canonical_repo
+        || Path::new(&record.state_dir) != state_dir
+        || Path::new(&record.attempt_path) != expected_path
+        || sandbox_metadata.file_type().is_symlink()
+        || !sandbox_metadata.is_file()
+        || !sandbox_profile.starts_with(run_dir.join("worker-sandboxes"))
+        || sandbox_contents != expected_sandbox
+    {
+        return Err(unauthenticated_recovery_failure(
+            "retained checkout does not match its parent-authored isolation record",
+        ));
+    }
+    Ok(retained_path)
+}
+
+fn remove_retained_unauthenticated_checkout(
+    checkout: &Path,
+) -> std::result::Result<(), DispatchCycleError> {
+    let metadata = std::fs::symlink_metadata(checkout).map_err(|error| {
+        unauthenticated_recovery_failure(format!("reinspect retained checkout: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(unauthenticated_recovery_failure(
+            "retained checkout changed type before cleanup",
+        ));
+    }
+    std::fs::remove_dir_all(checkout).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "remove proven-safe retained checkout {}: {error}",
+            checkout.display()
+        ))
+    })?;
+    if checkout.exists() {
+        return Err(unauthenticated_recovery_failure(
+            "retained checkout still exists after cleanup",
+        ));
+    }
+    let parent = checkout.parent().ok_or_else(|| {
+        unauthenticated_recovery_failure("retained checkout has no parent directory")
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            unauthenticated_recovery_failure(format!(
+                "sync retained checkout cleanup {}: {error}",
+                parent.display()
+            ))
+        })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "unauthenticated recovery revalidates every authority before its one safe cleanup"
+)]
+fn resume_unauthenticated_implementing_work<B: BdClient + ?Sized, C: CommitProbe + ?Sized>(
+    cfg: &Config,
+    bd: &B,
+    commits: &C,
+    state_dir: &Path,
+    cycle_id: &str,
+    item: &PlannedItem,
+    selected_roster: &RosterEntry,
+    repo_path: &Path,
+    canonical_repo: &str,
+    current: &Issue,
+    run_id: &str,
+) -> std::result::Result<DispatchOneResult, DispatchCycleError> {
+    let preflight_run = RunHandle::open(state_dir, run_id).map_err(|error| {
+        unauthenticated_recovery_failure(format!("open retained run: {}", error.into_message()))
+    })?;
+    let preflight_evidence = unauthenticated_attempt_evidence(&preflight_run)?
+        .ok_or_else(|| unauthenticated_recovery_failure("retained run lost its rejection event"))?;
+    validate_unauthenticated_work(
+        &preflight_run,
+        item,
+        cycle_id,
+        canonical_repo,
+        &preflight_evidence,
+    )?;
+    let preflight_finished =
+        preflight_run.manifest().lifecycle == crate::run::RunLifecycle::Finished;
+    let held_claim =
+        current.status == "in_progress" && current.assignee.as_deref() == Some("conductor");
+    let already_released = current.status == "open" && current.assignee.is_none();
+    if !(held_claim || preflight_finished && already_released) {
+        return Err(unauthenticated_recovery_failure(
+            "the exact Conductor claim is no longer in a recoverable state",
+        ));
+    }
+    drop(preflight_run);
+
+    let _recovery_lease = quarantine::RepoLease::acquire(state_dir, canonical_repo, run_id)
+        .map_err(|error| {
+            unauthenticated_recovery_failure(format!(
+                "retained checkout repository lease unavailable: {error}"
+            ))
+        })?;
+    let current = bd.show(repo_path, &item.issue_id).map_err(|error| {
+        unauthenticated_recovery_failure(format!("re-fetch exact Conductor claim: {error}"))
+    })?;
+    let held_claim =
+        current.status == "in_progress" && current.assignee.as_deref() == Some("conductor");
+    let already_released = current.status == "open" && current.assignee.is_none();
+
+    let extracted =
+        validate_item_authorization(cfg, item, selected_roster, canonical_repo, &current).map_err(
+            |reason| {
+                unauthenticated_recovery_failure(format!(
+                    "approved item authorization changed: {reason}"
+                ))
+            },
+        )?;
+    let mut run_artifacts = RunHandle::open(state_dir, run_id).map_err(|error| {
+        unauthenticated_recovery_failure(format!(
+            "reopen retained run under lease: {}",
+            error.into_message()
+        ))
+    })?;
+    let mut evidence = unauthenticated_attempt_evidence(&run_artifacts)?
+        .ok_or_else(|| unauthenticated_recovery_failure("retained run lost its rejection event"))?;
+    let work =
+        validate_unauthenticated_work(&run_artifacts, item, cycle_id, canonical_repo, &evidence)?;
+    let finished = run_artifacts.manifest().lifecycle == crate::run::RunLifecycle::Finished;
+    if !(held_claim || finished && already_released) {
+        return Err(unauthenticated_recovery_failure(
+            "the exact Conductor claim changed while recovery acquired its lease",
+        ));
+    }
+    if run_artifacts.manifest().verifier.mechanical.as_deref()
+        != Some(extracted.verify_cmd.as_str())
+        || run_artifacts.manifest().verifier.qualitative != qualitative_verifier_label(cfg)
+    {
+        return Err(unauthenticated_recovery_failure(
+            "retained run verifier configuration no longer matches the approval",
+        ));
+    }
+    validate_pending_approval(
+        &run_artifacts.approval().map_err(|error| {
+            unauthenticated_recovery_failure(format!(
+                "read exact approval artifact: {}",
+                error.into_message()
+            ))
+        })?,
+        item,
+        cycle_id,
+        canonical_repo,
+    )
+    .map_err(|error| unauthenticated_recovery_failure(error.to_string()))?;
+    if read_promotion_record(run_artifacts.dir())
+        .map_err(|error| unauthenticated_recovery_failure(error.to_string()))?
+        .is_some()
+    {
+        return Err(unauthenticated_recovery_failure(
+            "retained unauthenticated run unexpectedly has promotion authority",
+        ));
+    }
+
+    let before_head = work.before_head.as_deref().ok_or_else(|| {
+        unauthenticated_recovery_failure("retained run has no exact canonical before_head")
+    })?;
+    if !head_matches_clean(commits, repo_path, before_head)
+        .map_err(|error| unauthenticated_recovery_failure(error.to_string()))?
+    {
+        return Err(unauthenticated_recovery_failure(format!(
+            "canonical repository is not clean and unchanged at before_head {before_head}"
+        )));
+    }
+
+    if !finished {
+        let last_seen = run_artifacts.last_seen().map_err(|error| {
+            unauthenticated_recovery_failure(format!(
+                "read retained owner heartbeat: {}",
+                error.into_message()
+            ))
+        })?;
+        if Utc::now().signed_duration_since(last_seen) < STALE_CLAIM_THRESHOLD {
+            return Err(unauthenticated_recovery_failure(format!(
+                "retained owner is not stale (last seen {last_seen})"
+            )));
+        }
+        let owner_pid = work.owner_pid.ok_or_else(|| {
+            unauthenticated_recovery_failure("retained owner identity is missing")
+        })?;
+        if quarantine::process_alive(owner_pid) {
+            return Err(unauthenticated_recovery_failure(format!(
+                "retained owner pid {owner_pid} is still alive or ambiguous"
+            )));
+        }
+        let worker_pgid = work.worker_pgid.ok_or_else(|| {
+            unauthenticated_recovery_failure("retained worker process-group identity is missing")
+        })?;
+        if quarantine::process_group_alive(worker_pgid) {
+            return Err(unauthenticated_recovery_failure(format!(
+                "retained worker group {worker_pgid} is still alive or ambiguous"
+            )));
+        }
+    }
+
+    let checkout = retained_unauthenticated_checkout(
+        run_artifacts.dir(),
+        repo_path,
+        state_dir,
+        &evidence.attempt_id,
+        evidence.artifact.is_some(),
+    )?;
+    let artifact_label = format!("{}-unauthenticated-quarantine", evidence.attempt_id);
+    if let Some(checkout) = checkout.as_deref() {
+        let retained_head = commits
+            .head(checkout)
+            .map_err(|error| {
+                unauthenticated_recovery_failure(format!("read retained attempt HEAD: {error}"))
+            })?
+            .ok_or_else(|| {
+                unauthenticated_recovery_failure("retained attempt checkout has no HEAD")
+            })?;
+        if let Some(expected) = evidence.retained_head.as_deref()
+            && retained_head != expected
+        {
+            return Err(unauthenticated_recovery_failure(format!(
+                "retained attempt HEAD changed: expected {expected}, found {retained_head}"
+            )));
+        }
+        let capture = quarantine::capture_unauthenticated_commit(
+            checkout,
+            commits,
+            &run_artifacts,
+            before_head,
+            &artifact_label,
+        )
+        .map_err(|error| unauthenticated_recovery_failure(error.to_string()))?;
+        let artifact = capture.artifact.ok_or_else(|| {
+            unauthenticated_recovery_failure("retained commit capture produced no artifact")
+        })?;
+        if let Some(expected) = evidence.artifact.as_ref()
+            && expected != &artifact
+        {
+            return Err(unauthenticated_recovery_failure(
+                "retained checkout no longer matches its hashed quarantine artifact",
+            ));
+        }
+        if evidence.artifact.is_none() {
+            run_artifacts
+                .append_event(
+                    EventKind::CoverageGap,
+                    EventInput {
+                        artifact_refs: vec![artifact.clone()],
+                        outcome: Some(format!(
+                            "{UNAUTHENTICATED_QUARANTINE_EVENT_PREFIX}{}:{retained_head}",
+                            evidence.attempt_id
+                        )),
+                        ..EventInput::default()
+                    },
+                )
+                .map_err(|error| {
+                    unauthenticated_recovery_failure(format!(
+                        "pin retained checkout quarantine evidence: {}",
+                        error.into_message()
+                    ))
+                })?;
+            evidence.retained_head = Some(retained_head);
+            evidence.artifact = Some(artifact);
+        }
+        remove_retained_unauthenticated_checkout(checkout)?;
+    }
+
+    let artifact = evidence.artifact.clone().ok_or_else(|| {
+        unauthenticated_recovery_failure("retained checkout has no durable quarantine artifact")
+    })?;
+    let expected_path = format!("artifacts/{artifact_label}.patch");
+    if artifact.path != expected_path || evidence.retained_head.is_none() {
+        return Err(unauthenticated_recovery_failure(
+            "retained checkout quarantine artifact identity is ambiguous",
+        ));
+    }
+    if !finished {
+        run_artifacts
+            .finish_with_artifacts(UNAUTHENTICATED_QUARANTINE_OUTCOME, vec![artifact.clone()])
+            .map_err(|error| {
+                unauthenticated_recovery_failure(format!(
+                    "finish quarantined retained run: {}",
+                    error.into_message()
+                ))
+            })?;
+    }
+    if already_released {
+        return Ok(DispatchOneResult {
+            decision: None,
+            dispatches: 0,
+        });
+    }
+    bd.release(repo_path, &item.issue_id).map_err(|error| {
+        unauthenticated_recovery_failure(format!("release quarantined Conductor claim: {error}"))
+    })?;
+    let _ = bd.comment(
+        repo_path,
+        &item.issue_id,
+        &format!(
+            "conductor: {cycle_id} {} quarantined retained unauthenticated attempt {} as {}#{}; \
+             claim released for a separately approved future cycle",
+            item.issue_id, evidence.attempt_id, artifact.path, artifact.sha256
+        ),
+    );
+    Ok(DispatchOneResult {
+        decision: None,
+        dispatches: 0,
+    })
 }
 
 #[expect(
@@ -6033,6 +6711,241 @@ dispatch_id = "senior-reviewer"
             before_head,
             "canonical HEAD must not advance on a forged attempt commit"
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exact recovery gate keeps rejection, quarantine, idempotency, and fresh-cycle assertions together"
+    )]
+    fn resume_unauthenticated_implementing_run_quarantines_and_releases_once() {
+        struct UnauthenticatedCommitExec {
+            worker_spawns: RefCell<usize>,
+        }
+
+        impl Exec for UnauthenticatedCommitExec {
+            fn spawn(
+                &self,
+                request: &SpawnRequest,
+            ) -> crate::dispatch::Result<Box<dyn ChildProcess>> {
+                assert_eq!(request.argv.first().map(String::as_str), Some("pi"));
+                *self.worker_spawns.borrow_mut() += 1;
+                let script = r#"
+import subprocess, sys
+
+with open("worker.txt", "w") as fh:
+    fh.write("retained unauthenticated work\n")
+for args in (
+    ["git", "add", "worker.txt"],
+    ["git", "commit", "-m", "worker: retained but unauthenticated"],
+):
+    result = subprocess.run(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(result.returncode)
+print("worker committed without its authenticated receipt")
+"#;
+                let mut worker = request.clone();
+                worker.argv = vec![
+                    "/usr/bin/python3".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                ];
+                worker.env.retain(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "GIT_CONFIG_COUNT" | "GIT_CONFIG_KEY_0" | "GIT_CONFIG_VALUE_0"
+                    )
+                });
+                // The recovery behavior is platform-independent; the
+                // dedicated macOS sandbox regression owns Seatbelt execution.
+                worker.sandbox_profile = None;
+                crate::dispatch::CommandExec.spawn(&worker)
+            }
+        }
+
+        let fixture = ResumeFixture::new("unauthenticated-implementing-recovery");
+        let before_head = git(&fixture.repo, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let rejected_exec = UnauthenticatedCommitExec {
+            worker_spawns: RefCell::new(0),
+        };
+
+        let rejected = fixture
+            .dispatch(
+                &rejected_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(10)),
+            )
+            .expect("unauthenticated commit refusal is isolated to the item");
+        assert_eq!(rejected.failed, 1);
+        assert_eq!(*rejected_exec.worker_spawns.borrow(), 1);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            before_head,
+            "the rejected commit must never reach canonical HEAD"
+        );
+
+        let run_dir = fixture.pending_run_dir();
+        let retained_checkout = run_dir.join("attempt-checkouts/001-fake-worker");
+        let retained_head = git(&retained_checkout, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert_ne!(retained_head, before_head);
+        let implementing = RunHandle::open(
+            &fixture.state,
+            run_dir.file_name().unwrap().to_str().unwrap(),
+        )
+        .expect("open retained implementing run");
+        assert_eq!(
+            implementing.work().map(|work| work.stage),
+            Some(WorkStage::Implementing)
+        );
+        assert!(implementing.worker_pgid().is_some());
+        drop(implementing);
+        set_pending_review_owner(
+            &fixture.state,
+            spawn_dead_pid(),
+            Utc::now() - ChronoDuration::seconds(120),
+        );
+
+        let canonical_repo = std::fs::canonicalize(&fixture.repo)
+            .expect("canonical repository")
+            .display()
+            .to_string();
+        let resume_exec = PendingReviewExec::ship_immediately();
+        let concurrent_lease = quarantine::RepoLease::acquire(
+            &fixture.state,
+            &canonical_repo,
+            "concurrent-unauthenticated-resume",
+        )
+        .expect("hold the recovery lease as a concurrent resume");
+        let blocked = fixture
+            .dispatch(
+                &resume_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("the concurrent loser fails closed at item scope");
+        assert_eq!(blocked.verified, 0);
+        assert_eq!(fixture.bd.release_count(), 0);
+        assert_eq!(resume_exec.worker_spawns(), 0);
+        assert!(retained_checkout.is_dir());
+        drop(concurrent_lease);
+
+        let recovered = fixture
+            .dispatch(
+                &resume_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("explicit resume quarantines and releases the retained attempt");
+        assert_eq!(recovered.dispatched, 0);
+        assert_eq!(recovered.verified, 0);
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(fixture.bd.close_count(), 0);
+        assert_eq!(resume_exec.worker_spawns(), 0);
+        assert!(!retained_checkout.exists());
+        assert_eq!(
+            git(&fixture.repo, &["rev-parse", "HEAD"]).trim(),
+            before_head,
+            "recovery must never authenticate or promote the retained commit"
+        );
+
+        let manifest = crate::run::read_manifest(&run_dir.join("manifest.json"))
+            .expect("recovered run manifest");
+        assert_eq!(manifest.lifecycle, crate::run::RunLifecycle::Finished);
+        assert_eq!(
+            manifest.outcome.as_deref(),
+            Some("unauthenticated_commit_quarantined_recoverable")
+        );
+        let events =
+            crate::run::read_events(&run_dir.join("events.jsonl")).expect("recovered run events");
+        let quarantine_event = events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::CoverageGap
+                    && event.outcome.as_deref().is_some_and(|outcome| {
+                        outcome.starts_with("unauthenticated_commit_quarantined:")
+                    })
+            })
+            .expect("canonical quarantine event");
+        assert_eq!(quarantine_event.artifact_refs.len(), 1);
+        let artifact = &quarantine_event.artifact_refs[0];
+        assert_eq!(artifact.sha256.len(), 64);
+        assert_eq!(
+            Path::new(&artifact.path).extension(),
+            Some(std::ffi::OsStr::new("patch"))
+        );
+        let patch =
+            std::fs::read_to_string(run_dir.join(&artifact.path)).expect("hashed quarantine patch");
+        assert!(patch.contains("worker.txt"));
+        assert!(
+            quarantine_event
+                .outcome
+                .as_deref()
+                .unwrap()
+                .ends_with(&retained_head),
+            "quarantine evidence must bind the exact retained HEAD"
+        );
+
+        let repeated = fixture
+            .dispatch(
+                &resume_exec,
+                &DispatchCycleOptions::for_tests(Duration::from_millis(1)).resume(),
+            )
+            .expect("repeating the exact recovery is a no-op");
+        assert_eq!(repeated.dispatched, 0);
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(resume_exec.worker_spawns(), 0);
+
+        let future_cycle = "cycle-fresh-after-unauthenticated-quarantine";
+        let reopened = fixture
+            .bd
+            .show(&fixture.repo, "sandbox-1")
+            .expect("released bead is open for a future approval");
+        assert_eq!(reopened.status, "open");
+        write_plan_with_proposal(
+            &fixture.state,
+            &fixture.repo,
+            future_cycle,
+            "sandbox-repo",
+            "sandbox-1",
+            "fake-worker",
+            &["fake-worker"],
+            &fixture.cfg.roster,
+            &reopened,
+        );
+        write_report(&fixture.reports, future_cycle);
+        write_response(&fixture.reports, future_cycle, "approved");
+        let future_exec = PendingReviewExec::ship_immediately();
+        let future = run_dispatch_cycle(
+            &fixture.cfg,
+            &fixture.bd,
+            &future_exec,
+            &GitCommitProbe,
+            &fixture.reports,
+            &fixture.state,
+            &fixture.ledger,
+            future_cycle,
+            &DispatchCycleOptions::for_tests(Duration::from_millis(1)),
+            &RecordingLiveSink::new(true),
+            &FakeBursarClient::unavailable(),
+        )
+        .expect("a separately approved future cycle may dispatch");
+        assert_eq!(future.verified, 1);
+        assert_eq!(future_exec.worker_spawns(), 1);
+        assert_eq!(fixture.bd.release_count(), 1);
+        assert_eq!(fixture.bd.close_count(), 1);
     }
 
     #[test]
